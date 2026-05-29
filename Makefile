@@ -13,8 +13,8 @@ release:  ## Build the optimized release binary
 	$(CARGO) build --release
 
 .PHONY: run
-run:  ## Run strix against the current directory
-	$(CARGO) run
+run:  ## Run strix; pass a repo path or flags via ARGS, e.g. make run ARGS="../roost --theme dark"
+	$(CARGO) run -- $(ARGS)
 
 .PHONY: dump
 dump:  ## Render one frame to stdout (text) for quick visual inspection
