@@ -216,28 +216,16 @@ fn cell(
     let Some(line) = line else {
         return vec![Span::styled(" ".repeat(width), Style::new().bg(theme.bg))];
     };
-    let (number, bg) = match side {
-        Side::Old => (
-            line.old_no,
-            if line.kind == LineKind::Deletion {
-                theme.del_bg
-            } else {
-                theme.bg
-            },
-        ),
-        Side::New => (
-            line.new_no,
-            if line.kind == LineKind::Addition {
-                theme.add_bg
-            } else {
-                theme.bg
-            },
-        ),
+    let (number, active_kind, active_bg) = match side {
+        Side::Old => (line.old_no, LineKind::Deletion, theme.del_bg),
+        Side::New => (line.new_no, LineKind::Addition, theme.add_bg),
     };
-    let gutter = match number {
-        Some(n) => format!("{n:>4} "),
-        None => "     ".to_string(),
+    let bg = if line.kind == active_kind {
+        active_bg
+    } else {
+        theme.bg
     };
+    let gutter = format!("{} ", gutter_num(number));
     let mut spans = vec![Span::styled(gutter, Style::new().fg(theme.line_no))];
     spans.extend(highlighted_content(
         syntax,
