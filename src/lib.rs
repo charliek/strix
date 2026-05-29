@@ -6,6 +6,7 @@
 
 pub mod app;
 pub mod cli;
+pub mod git;
 pub mod logging;
 pub mod terminal;
 pub mod ui;
