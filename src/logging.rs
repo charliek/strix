@@ -1,26 +1,25 @@
 use std::path::PathBuf;
 
+use directories::{BaseDirs, ProjectDirs};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 
-#[cfg(target_os = "macos")]
-fn platform_log_dir() -> Option<PathBuf> {
-    directories::BaseDirs::new().map(|base| base.home_dir().join("Library/Logs/strix"))
-}
-
-#[cfg(not(target_os = "macos"))]
-fn platform_log_dir() -> Option<PathBuf> {
-    directories::ProjectDirs::from("", "", "strix").map(|proj| {
-        proj.state_dir()
-            .unwrap_or_else(|| proj.cache_dir())
-            .to_path_buf()
-    })
-}
-
 /// Directory where strix writes its log file (`~/Library/Logs/strix` on macOS,
-/// `$XDG_STATE_HOME/strix` on Linux).
+/// `$XDG_STATE_HOME/strix` on Linux). Both branches compile on every platform —
+/// `cfg!` selects at runtime rather than `#[cfg]` excluding code — so neither
+/// path can silently rot.
 pub fn log_dir() -> PathBuf {
-    platform_log_dir().unwrap_or_else(|| std::env::temp_dir().join("strix"))
+    if cfg!(target_os = "macos") {
+        if let Some(base) = BaseDirs::new() {
+            return base.home_dir().join("Library/Logs/strix");
+        }
+    } else if let Some(proj) = ProjectDirs::from("", "", "strix") {
+        return proj
+            .state_dir()
+            .unwrap_or_else(|| proj.cache_dir())
+            .to_path_buf();
+    }
+    std::env::temp_dir().join("strix")
 }
 
 /// Initialise file-based logging. The returned guard must outlive the process;

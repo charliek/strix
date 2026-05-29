@@ -4,17 +4,17 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::app::{App, Focus};
-use crate::ui::{centered_line, panel_block};
+use crate::ui::{panel_block, vertical_center};
 
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
     let focused = app.focus == Focus::Diff;
-    let block = panel_block(" Diff ", focused, app);
+    let block = panel_block(" Diff ", focused, theme);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let hint = Paragraph::new("Select a file to view its diff")
         .style(Style::new().fg(theme.dim))
         .alignment(Alignment::Center);
-    frame.render_widget(hint, centered_line(inner));
+    frame.render_widget(hint, vertical_center(inner, 1));
 }
