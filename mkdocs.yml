@@ -1,0 +1,98 @@
+# =============================================================================
+# Documentation style
+# =============================================================================
+# - Professional, direct tone (no marketing language)
+# - Tables for CLI options, config fields, keybindings
+# - Code blocks with language hints (bash, toml, rust)
+# - Admonitions sparingly (important notes / warnings only)
+# - Examples should be copy-pasteable
+# - One topic per page; keep pages focused
+# =============================================================================
+
+site_name: strix
+site_description: 'A focused, polished TUI for staging changes and viewing diffs'
+site_author: 'strix Contributors'
+site_url: 'https://charliek.github.io/strix/'
+
+repo_name: charliek/strix
+repo_url: https://github.com/charliek/strix
+edit_uri: edit/main/docs/
+
+docs_dir: docs
+site_dir: site-build
+
+dev_addr: '127.0.0.1:7071'
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.expand
+    - search.highlight
+    - search.share
+    - content.code.copy
+    - content.code.annotate
+    - navigation.footer
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  font:
+    text: Roboto
+    code: Roboto Mono
+  icon:
+    logo: material/eye-outline
+
+plugins:
+  - search
+
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.details
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - admonition
+  - attr_list
+  - md_in_html
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Getting Started:
+      - Installation: getting-started/installation.md
+      - Usage: getting-started/usage.md
+      - Keybindings: getting-started/keybindings.md
+  - Guides:
+      - Theming: guides/theming.md
+      - Configuration: guides/configuration.md
+  - Reference:
+      - CLI: reference/cli.md
+      - Architecture: reference/architecture.md
+  - Development:
+      - Setup: development/setup.md
+      - Project Spec: spec.md
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/charliek/strix

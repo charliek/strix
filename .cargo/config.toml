@@ -1,0 +1,7 @@
+# Pin the toolchain at 1.85.0 (rust-toolchain.toml) but let cargo pick
+# dependency versions that actually support it: prefer rust-version-compatible
+# releases, falling back to newer ones only when nothing else satisfies the
+# graph. Without this, the edition-2021 (v2) resolver grabs the latest transitive
+# crates, several of which now require rustc 1.88+.
+[resolver]
+incompatible-rust-versions = "fallback"
