@@ -1,7 +1,11 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::{Position, Rect};
+use ratatui::widgets::ListState;
 
 use crate::git::{Change, FileDiff, FileEntry, Repo, Section, Status};
 use crate::ui::theme::Theme;
@@ -9,6 +13,12 @@ use crate::ui::theme::Theme;
 /// A path-based git mutation (stage / unstage); lets the select → run → refresh
 /// flow be shared via `run_on_selected`.
 type GitOp = fn(&Repo, &str) -> anyhow::Result<()>;
+
+/// Columns at the start of a staging row (the change marker) where a click
+/// toggles staging rather than only selecting.
+const MARKER_ZONE: u16 = 4;
+/// Lines scrolled per mouse-wheel notch in the diff pane.
+const SCROLL_STEP: u16 = 3;
 
 /// Which pane currently receives keyboard input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,6 +69,13 @@ pub struct App {
     /// because rendering takes `&App`.
     diff_viewport: Cell<u16>,
     diff_content_rows: Cell<u16>,
+
+    /// Persisted so the staging list's scroll offset survives between frames
+    /// and can be read for mouse hit-testing. The pane rects are recorded
+    /// during rendering for the same reason.
+    staging_state: RefCell<ListState>,
+    staging_area: Cell<Rect>,
+    diff_area: Cell<Rect>,
 }
 
 impl App {
@@ -79,6 +96,9 @@ impl App {
             diff_scroll: 0,
             diff_viewport: Cell::new(0),
             diff_content_rows: Cell::new(0),
+            staging_state: RefCell::new(ListState::default()),
+            staging_area: Cell::new(Rect::default()),
+            diff_area: Cell::new(Rect::default()),
         };
         app.clamp_selection();
         app.sync_diff();
@@ -148,6 +168,64 @@ impl App {
         // A handled key may have moved the selection or changed status; keep the
         // cached diff in sync.
         self.sync_diff();
+    }
+
+    pub fn on_mouse(&mut self, event: MouseEvent) {
+        let pos = Position {
+            x: event.column,
+            y: event.row,
+        };
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => self.on_click(pos),
+            MouseEventKind::ScrollDown => self.on_scroll(pos, true),
+            MouseEventKind::ScrollUp => self.on_scroll(pos, false),
+            _ => {}
+        }
+        self.sync_diff();
+    }
+
+    fn on_click(&mut self, pos: Position) {
+        if self.diff_area.get().contains(pos) {
+            self.focus = Focus::Diff;
+        } else if self.staging_area.get().contains(pos) {
+            self.focus = Focus::Staging;
+            if let Some(selection) = self.file_at(pos) {
+                self.selected = selection;
+                // Clicking the change marker (not just the name) toggles staging.
+                if pos.x < self.staging_area.get().x + MARKER_ZONE {
+                    self.toggle_stage();
+                }
+            }
+        }
+    }
+
+    fn on_scroll(&mut self, pos: Position, down: bool) {
+        if self.diff_area.get().contains(pos) {
+            self.diff_scroll = if down {
+                (self.diff_scroll + SCROLL_STEP).min(self.diff_max_scroll())
+            } else {
+                self.diff_scroll.saturating_sub(SCROLL_STEP)
+            };
+        } else if self.staging_area.get().contains(pos) {
+            if down {
+                self.select_next();
+            } else {
+                self.select_prev();
+            }
+        }
+    }
+
+    /// The selection index of the file at a screen position in the staging pane,
+    /// using the list's last-rendered scroll offset.
+    fn file_at(&self, pos: Position) -> Option<usize> {
+        let area = self.staging_area.get();
+        if !area.contains(pos) {
+            return None;
+        }
+        let item = self.staging_state.borrow().offset() + (pos.y - area.y) as usize;
+        crate::ui::staging::file_item_rows(&self.status)
+            .iter()
+            .position(|&row| row == item)
     }
 
     fn on_key_staging(&mut self, key: KeyEvent) {
@@ -304,6 +382,28 @@ impl App {
     pub fn set_diff_metrics(&self, viewport: u16, content_rows: u16) {
         self.diff_viewport.set(viewport);
         self.diff_content_rows.set(content_rows);
+    }
+
+    /// The persisted staging list state; rendering borrows it so the scroll
+    /// offset is available for mouse hit-testing.
+    pub fn staging_state(&self) -> std::cell::RefMut<'_, ListState> {
+        self.staging_state.borrow_mut()
+    }
+
+    pub fn set_staging_area(&self, area: Rect) {
+        self.staging_area.set(area);
+    }
+
+    pub fn set_diff_area(&self, area: Rect) {
+        self.diff_area.set(area);
+    }
+
+    pub fn staging_area(&self) -> Rect {
+        self.staging_area.get()
+    }
+
+    pub fn diff_area(&self) -> Rect {
+        self.diff_area.get()
     }
 
     fn toggle_diff_mode(&mut self) {

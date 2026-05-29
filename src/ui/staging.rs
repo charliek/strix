@@ -1,11 +1,11 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{List, ListItem, ListState};
+use ratatui::widgets::{List, ListItem};
 use ratatui::Frame;
 
 use crate::app::{App, Focus};
-use crate::git::{Change, FileEntry, Section};
+use crate::git::{Change, FileEntry, Section, Status};
 use crate::ui::theme::Theme;
 use crate::ui::{centered_hint, panel_block};
 
@@ -15,6 +15,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let block = panel_block(" Changes ", focused, theme);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    app.set_staging_area(inner);
 
     if app.status.is_clean() {
         centered_hint(
@@ -26,28 +27,8 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    // Build the list with section headers interleaved, tracking which item
-    // index each selectable file lands on so the cursor never sits on a header.
-    let mut items: Vec<ListItem> = Vec::new();
-    let mut file_rows: Vec<usize> = Vec::new();
-
-    if !app.status.staged.is_empty() {
-        items.push(section_header("Staged", app.status.staged.len(), theme));
-        for entry in &app.status.staged {
-            file_rows.push(items.len());
-            items.push(file_item(entry, Section::Staged, theme));
-        }
-    }
-    if !app.status.unstaged.is_empty() {
-        items.push(section_header("Changes", app.status.unstaged.len(), theme));
-        for entry in &app.status.unstaged {
-            file_rows.push(items.len());
-            items.push(file_item(entry, Section::Unstaged, theme));
-        }
-    }
-
-    let mut state = ListState::default();
-    state.select(file_rows.get(app.selected).copied());
+    let items = build_items(&app.status, theme);
+    let selected_item = file_item_rows(&app.status).get(app.selected).copied();
 
     let highlight = if focused {
         Style::new()
@@ -58,7 +39,50 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         Style::new().bg(theme.selection_bg)
     };
     let list = List::new(items).highlight_style(highlight);
+
+    let mut state = app.staging_state();
+    state.select(selected_item);
     frame.render_stateful_widget(list, inner, &mut state);
+}
+
+/// The list rows: a section header followed by its files, staged then unstaged.
+fn build_items(status: &Status, theme: &Theme) -> Vec<ListItem<'static>> {
+    let mut items = Vec::new();
+    if !status.staged.is_empty() {
+        items.push(section_header("Staged", status.staged.len(), theme));
+        for entry in &status.staged {
+            items.push(file_item(entry, Section::Staged, theme));
+        }
+    }
+    if !status.unstaged.is_empty() {
+        items.push(section_header("Changes", status.unstaged.len(), theme));
+        for entry in &status.unstaged {
+            items.push(file_item(entry, Section::Unstaged, theme));
+        }
+    }
+    items
+}
+
+/// The list-item index of each selectable file, by selection index. Mirrors the
+/// row order produced by [`build_items`] so mouse clicks map to the right file.
+pub fn file_item_rows(status: &Status) -> Vec<usize> {
+    let mut rows = Vec::new();
+    let mut item = 0;
+    if !status.staged.is_empty() {
+        item += 1; // "Staged" header
+        for _ in &status.staged {
+            rows.push(item);
+            item += 1;
+        }
+    }
+    if !status.unstaged.is_empty() {
+        item += 1; // "Changes" header
+        for _ in &status.unstaged {
+            rows.push(item);
+            item += 1;
+        }
+    }
+    rows
 }
 
 fn section_header(label: &str, count: usize, theme: &Theme) -> ListItem<'static> {

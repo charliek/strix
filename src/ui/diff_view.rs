@@ -31,6 +31,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let block = panel_block(&title, focused, theme);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    app.set_diff_area(inner);
 
     let lines = match &app.current_diff {
         Some(FileDiff::Text(lines)) if !lines.is_empty() => lines,

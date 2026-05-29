@@ -43,10 +43,10 @@ fn restore() -> Result<()> {
 fn event_loop(terminal: &mut Tui, app: &mut App) -> Result<()> {
     while !app.should_quit {
         terminal.draw(|frame| ui::draw(frame, app))?;
-        if let Event::Key(key) = event::read()? {
-            if key.kind == KeyEventKind::Press {
-                app.on_key(key);
-            }
+        match event::read()? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => app.on_key(key),
+            Event::Mouse(mouse) => app.on_mouse(mouse),
+            _ => {}
         }
     }
     Ok(())
