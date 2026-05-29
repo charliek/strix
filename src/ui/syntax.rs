@@ -42,16 +42,17 @@ pub fn syntax_for(path: &str) -> &'static SyntaxReference {
         .unwrap_or_else(|| assets.syntaxes.find_syntax_plain_text())
 }
 
-/// Highlight one line into `(foreground colour, text)` segments.
-pub fn highlight_line(syntax: &SyntaxReference, line: &str) -> Vec<(Color, String)> {
+/// Highlight one line into `(foreground colour, text)` segments. The text
+/// slices borrow `line` — the caller owns whatever it keeps.
+pub fn highlight_line<'a>(syntax: &SyntaxReference, line: &'a str) -> Vec<(Color, &'a str)> {
     let assets = assets();
     let mut highlighter = HighlightLines::new(syntax, &assets.theme);
     match highlighter.highlight_line(line, &assets.syntaxes) {
         Ok(ranges) => ranges
             .into_iter()
-            .map(|(style, text)| (to_color(style.foreground), text.to_string()))
+            .map(|(style, text)| (to_color(style.foreground), text))
             .collect(),
-        Err(_) => vec![(Color::Reset, line.to_string())],
+        Err(_) => vec![(Color::Reset, line)],
     }
 }
 

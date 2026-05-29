@@ -134,11 +134,18 @@ fn highlighted_content(
     spans
 }
 
+/// Normalise a line for display in one pass: expand tabs and drop control
+/// characters so file content can't inject terminal escape sequences.
 fn sanitize(text: &str) -> String {
-    text.replace('\t', "    ")
-        .chars()
-        .filter(|ch| !ch.is_control())
-        .collect()
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '\t' => out.push_str("    "),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn gutter_num(no: Option<usize>) -> String {
