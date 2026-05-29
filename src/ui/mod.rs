@@ -125,9 +125,7 @@ pub fn vertical_center(area: Rect, height: u16) -> Rect {
 /// A `width`×`height` rect centred within `area` (clamped to `area`), for modal
 /// popups.
 pub fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
-    let [row] = Layout::vertical([Constraint::Length(height.min(area.height))])
-        .flex(Flex::Center)
-        .areas(area);
+    let row = vertical_center(area, height.min(area.height));
     let [cell] = Layout::horizontal([Constraint::Length(width.min(area.width))])
         .flex(Flex::Center)
         .areas(row);

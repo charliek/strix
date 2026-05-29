@@ -5,6 +5,10 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::git::{Change, FileEntry, Repo, Section, Status};
 use crate::ui::theme::Theme;
 
+/// A path-based git mutation (stage / unstage); lets the select → run → refresh
+/// flow be shared via `run_on_selected`.
+type GitOp = fn(&Repo, &str) -> anyhow::Result<()>;
+
 /// Which pane currently receives keyboard input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Focus {
@@ -154,30 +158,30 @@ impl App {
 
     /// Stage an unstaged file, or unstage a staged one.
     fn toggle_stage(&mut self) {
-        let Some((section, path)) = self.selected_section_path() else {
+        let Some((section, _)) = self.selected_section_path() else {
             return;
         };
-        let result = match section {
-            Section::Staged => self.repo.unstage(&path),
-            Section::Unstaged => self.repo.stage(&path),
+        let op: GitOp = match section {
+            Section::Staged => Repo::unstage,
+            Section::Unstaged => Repo::stage,
         };
-        self.after_mutation("toggle stage", result);
+        self.run_on_selected("toggle stage", op);
     }
 
     fn stage_selected(&mut self) {
-        let Some((_, path)) = self.selected_section_path() else {
-            return;
-        };
-        let result = self.repo.stage(&path);
-        self.after_mutation("stage", result);
+        self.run_on_selected("stage", Repo::stage);
     }
 
     fn unstage_selected(&mut self) {
+        self.run_on_selected("unstage", Repo::unstage);
+    }
+
+    /// Run a path-based git op on the selected file, then refresh.
+    fn run_on_selected(&mut self, action: &str, op: GitOp) {
         let Some((_, path)) = self.selected_section_path() else {
             return;
         };
-        let result = self.repo.unstage(&path);
-        self.after_mutation("unstage", result);
+        self.after_mutation(action, op(&self.repo, &path));
     }
 
     /// Open the discard confirmation for the selected file.

@@ -30,7 +30,12 @@ impl Repo {
             Change::Added => {
                 self.run(&["rm", "-f", "--", path])?;
             }
-            _ => {
+            Change::Modified
+            | Change::Deleted
+            | Change::Renamed
+            | Change::Copied
+            | Change::TypeChange
+            | Change::Conflicted => {
                 self.run(&[
                     "restore",
                     "--source=HEAD",
