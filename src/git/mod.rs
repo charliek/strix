@@ -1,3 +1,4 @@
+pub mod ops;
 pub mod status;
 
 use std::path::{Path, PathBuf};

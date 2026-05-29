@@ -1,4 +1,5 @@
 pub mod diff_view;
+pub mod modal;
 pub mod staging;
 pub mod theme;
 
@@ -37,6 +38,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     diff_view::render(frame, right, app);
 
     render_footer(frame, footer, app);
+
+    // Overlays draw last, on top of everything.
+    modal::render(frame, app);
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
@@ -75,8 +79,9 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     let mut spans = Vec::new();
     for (key, label) in [
         (" j/k ", "move  "),
+        (" space ", "stage  "),
+        (" x ", "discard  "),
         (" Tab ", "pane  "),
-        (" r ", "refresh  "),
         (" q ", "quit"),
     ] {
         spans.push(Span::styled(key, key_style));
@@ -115,4 +120,16 @@ pub fn vertical_center(area: Rect, height: u16) -> Rect {
         .flex(Flex::Center)
         .areas(area);
     rect
+}
+
+/// A `width`×`height` rect centred within `area` (clamped to `area`), for modal
+/// popups.
+pub fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let [row] = Layout::vertical([Constraint::Length(height.min(area.height))])
+        .flex(Flex::Center)
+        .areas(area);
+    let [cell] = Layout::horizontal([Constraint::Length(width.min(area.width))])
+        .flex(Flex::Center)
+        .areas(row);
+    cell
 }
