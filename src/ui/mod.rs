@@ -1,6 +1,7 @@
 pub mod diff_view;
 pub mod modal;
 pub mod staging;
+pub mod syntax;
 pub mod theme;
 
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};

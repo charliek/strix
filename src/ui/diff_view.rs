@@ -1,25 +1,28 @@
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
+use syntect::parsing::SyntaxReference;
 use unicode_width::UnicodeWidthChar;
 
 use crate::app::{App, Focus};
 use crate::git::{DiffLine, FileDiff, LineKind};
+use crate::ui::syntax::{highlight_line, syntax_for};
 use crate::ui::theme::Theme;
 use crate::ui::{centered_hint, panel_block};
 
 /// Width of the line-number gutter: `oldd nnnn ` → 4 + 1 + 4 + 1.
 const GUTTER_WIDTH: usize = 10;
-/// Width of the change sign column: `+ ` / `- ` / `  `.
+/// Width of the change-sign column: `+ ` / `- ` / `  `.
 const SIGN_WIDTH: usize = 2;
 
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
     let focused = app.focus == Focus::Diff;
+    let selected = app.selected_file();
 
-    let title = match app.selected_file() {
+    let title = match selected {
         Some((_, entry)) => format!(" Diff · {} ", entry.path),
         None => " Diff ".to_string(),
     };
@@ -35,11 +38,20 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         Some(FileDiff::Text(lines)) if lines.is_empty() => {
             centered_hint(frame, inner, "No changes to show", dim)
         }
-        Some(FileDiff::Text(lines)) => render_lines(frame, inner, app, lines),
+        Some(FileDiff::Text(lines)) => {
+            let path = selected.map(|(_, entry)| entry.path.as_str()).unwrap_or("");
+            render_lines(frame, inner, app, lines, syntax_for(path));
+        }
     }
 }
 
-fn render_lines(frame: &mut Frame, inner: Rect, app: &App, lines: &[DiffLine]) {
+fn render_lines(
+    frame: &mut Frame,
+    inner: Rect,
+    app: &App,
+    lines: &[DiffLine],
+    syntax: &SyntaxReference,
+) {
     let theme = &app.theme;
     let offset = app.diff_scroll.min(app.diff_max_scroll()) as usize;
     let body_width = (inner.width as usize).saturating_sub(GUTTER_WIDTH);
@@ -48,13 +60,18 @@ fn render_lines(frame: &mut Frame, inner: Rect, app: &App, lines: &[DiffLine]) {
         .iter()
         .skip(offset)
         .take(inner.height as usize)
-        .map(|line| render_line(line, theme, body_width))
+        .map(|line| render_line(line, theme, syntax, body_width))
         .collect();
 
     frame.render_widget(Paragraph::new(rows), inner);
 }
 
-fn render_line(line: &DiffLine, theme: &Theme, body_width: usize) -> Line<'static> {
+fn render_line(
+    line: &DiffLine,
+    theme: &Theme,
+    syntax: &SyntaxReference,
+    body_width: usize,
+) -> Line<'static> {
     if line.kind == LineKind::Hunk {
         return Line::from(Span::styled(
             line.text.clone(),
@@ -62,22 +79,73 @@ fn render_line(line: &DiffLine, theme: &Theme, body_width: usize) -> Line<'stati
         ));
     }
 
-    let (sign, fg, bg) = match line.kind {
+    let (sign, sign_fg, bg) = match line.kind {
         LineKind::Addition => ("+ ", theme.add, theme.add_bg),
         LineKind::Deletion => ("- ", theme.del, theme.del_bg),
         _ => ("  ", theme.fg, theme.bg),
     };
     let gutter = format!("{} {} ", gutter_num(line.old_no), gutter_num(line.new_no));
-    // The sign and content are separate spans so syntax highlighting (M4) can
-    // replace the content span with per-token spans while keeping the same
-    // background.
-    let content = fit_to_width(&line.text, body_width.saturating_sub(SIGN_WIDTH));
 
-    Line::from(vec![
+    let mut spans = vec![
         Span::styled(gutter, Style::new().fg(theme.line_no)),
-        Span::styled(sign, Style::new().fg(fg).bg(bg)),
-        Span::styled(content, Style::new().fg(fg).bg(bg)),
-    ])
+        Span::styled(sign, Style::new().fg(sign_fg).bg(bg)),
+    ];
+    spans.extend(highlighted_content(
+        syntax,
+        &line.text,
+        body_width.saturating_sub(SIGN_WIDTH),
+        bg,
+    ));
+    Line::from(spans)
+}
+
+/// Syntax-highlight `text` into spans (each token's colour over the line's
+/// background), expanding tabs, dropping control chars, and padding to `width`
+/// so the background fills the row.
+fn highlighted_content(
+    syntax: &SyntaxReference,
+    text: &str,
+    width: usize,
+    bg: Color,
+) -> Vec<Span<'static>> {
+    let clean = sanitize(text);
+    let mut spans = Vec::new();
+    let mut used = 0;
+    for (color, piece) in highlight_line(syntax, &clean) {
+        if used >= width {
+            break;
+        }
+        let mut chunk = String::new();
+        for ch in piece.chars() {
+            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if used + ch_width > width {
+                break;
+            }
+            chunk.push(ch);
+            used += ch_width;
+        }
+        if !chunk.is_empty() {
+            spans.push(Span::styled(chunk, Style::new().fg(color).bg(bg)));
+        }
+    }
+    if used < width {
+        spans.push(Span::styled(" ".repeat(width - used), Style::new().bg(bg)));
+    }
+    spans
+}
+
+/// Normalise a line for display in one pass: expand tabs and drop control
+/// characters so file content can't inject terminal escape sequences.
+fn sanitize(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '\t' => out.push_str("    "),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn gutter_num(no: Option<usize>) -> String {
@@ -85,28 +153,4 @@ fn gutter_num(no: Option<usize>) -> String {
         Some(n) => format!("{n:>4}"),
         None => "    ".to_string(),
     }
-}
-
-/// Expand tabs, drop control characters (so file content can't inject escape
-/// sequences), truncate to `width` display columns, and pad to fill the width so
-/// the line's background spans the full row.
-fn fit_to_width(text: &str, width: usize) -> String {
-    let expanded = text.replace('\t', "    ");
-    let mut out = String::with_capacity(width);
-    let mut used = 0;
-    for ch in expanded.chars() {
-        if ch.is_control() {
-            continue;
-        }
-        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if used + ch_width > width {
-            break;
-        }
-        out.push(ch);
-        used += ch_width;
-    }
-    for _ in used..width {
-        out.push(' ');
-    }
-    out
 }
