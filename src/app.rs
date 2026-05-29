@@ -17,6 +17,13 @@ pub enum Focus {
     Diff,
 }
 
+/// How the diff pane renders a change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiffMode {
+    Unified,
+    SideBySide,
+}
+
 /// A blocking overlay that captures input until dismissed.
 #[derive(Clone, Debug)]
 pub enum Modal {
@@ -45,10 +52,13 @@ pub struct App {
     /// changes (see `sync_diff`).
     pub current_diff: Option<FileDiff>,
     diff_key: Option<(Section, String)>,
+    pub diff_mode: DiffMode,
     pub diff_scroll: u16,
-    /// Inner height of the diff pane from the last render, so scrolling can
-    /// clamp to the content. Interior-mutable because rendering takes `&App`.
+    /// Inner height + total content rows of the diff pane from the last render,
+    /// so scrolling can clamp to the content in either mode. Interior-mutable
+    /// because rendering takes `&App`.
     diff_viewport: Cell<u16>,
+    diff_content_rows: Cell<u16>,
 }
 
 impl App {
@@ -65,8 +75,10 @@ impl App {
             should_quit: false,
             current_diff: None,
             diff_key: None,
+            diff_mode: DiffMode::Unified,
             diff_scroll: 0,
             diff_viewport: Cell::new(0),
+            diff_content_rows: Cell::new(0),
         };
         app.clamp_selection();
         app.sync_diff();
@@ -123,6 +135,9 @@ impl App {
                 }
                 KeyCode::Tab | KeyCode::BackTab => self.toggle_focus(),
                 KeyCode::Char('r') => self.refresh(),
+                KeyCode::Char('d') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.toggle_diff_mode()
+                }
                 _ => match self.focus {
                     Focus::Staging => self.on_key_staging(key),
                     Focus::Diff => self.on_key_diff(key),
@@ -276,20 +291,26 @@ impl App {
         self.diff_scroll = 0;
     }
 
-    fn diff_len(&self) -> u16 {
-        match &self.current_diff {
-            Some(FileDiff::Text(lines)) => lines.len().try_into().unwrap_or(u16::MAX),
-            _ => 0,
-        }
-    }
-
-    /// Largest valid diff scroll offset, given the last-rendered viewport height.
+    /// Largest valid diff scroll offset, from the last render's content rows
+    /// and viewport height.
     pub fn diff_max_scroll(&self) -> u16 {
-        self.diff_len().saturating_sub(self.diff_viewport.get())
+        self.diff_content_rows
+            .get()
+            .saturating_sub(self.diff_viewport.get())
     }
 
-    /// Record the diff pane's inner height (called while rendering).
-    pub fn set_diff_viewport(&self, height: u16) {
-        self.diff_viewport.set(height);
+    /// Record the diff pane's inner height and the total rows the current mode
+    /// renders (called while rendering), so scrolling clamps to the content.
+    pub fn set_diff_metrics(&self, viewport: u16, content_rows: u16) {
+        self.diff_viewport.set(viewport);
+        self.diff_content_rows.set(content_rows);
+    }
+
+    fn toggle_diff_mode(&mut self) {
+        self.diff_mode = match self.diff_mode {
+            DiffMode::Unified => DiffMode::SideBySide,
+            DiffMode::SideBySide => DiffMode::Unified,
+        };
+        self.diff_scroll = 0;
     }
 }

@@ -6,16 +6,18 @@ use ratatui::Frame;
 use syntect::parsing::SyntaxReference;
 use unicode_width::UnicodeWidthChar;
 
-use crate::app::{App, Focus};
+use crate::app::{App, DiffMode, Focus};
 use crate::git::{DiffLine, FileDiff, LineKind};
 use crate::ui::syntax::{highlight_line, syntax_for};
 use crate::ui::theme::Theme;
 use crate::ui::{centered_hint, panel_block};
 
-/// Width of the line-number gutter: `oldd nnnn ` → 4 + 1 + 4 + 1.
+/// Unified gutter: `oldd nnnn ` → 4 + 1 + 4 + 1.
 const GUTTER_WIDTH: usize = 10;
-/// Width of the change-sign column: `+ ` / `- ` / `  `.
+/// Unified change-sign column: `+ ` / `- ` / `  `.
 const SIGN_WIDTH: usize = 2;
+/// Side-by-side per-column gutter: `nnnn ` → 4 + 1.
+const SBS_GUTTER: usize = 5;
 
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
@@ -29,29 +31,37 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let block = panel_block(&title, focused, theme);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    app.set_diff_viewport(inner.height);
 
-    let dim = Style::new().fg(theme.dim);
-    match &app.current_diff {
-        None => centered_hint(frame, inner, "Select a file to view its diff", dim),
-        Some(FileDiff::Binary) => centered_hint(frame, inner, "Binary file — no preview", dim),
-        Some(FileDiff::Text(lines)) if lines.is_empty() => {
-            centered_hint(frame, inner, "No changes to show", dim)
+    let lines = match &app.current_diff {
+        Some(FileDiff::Text(lines)) if !lines.is_empty() => lines,
+        other => {
+            let message = match other {
+                Some(FileDiff::Binary) => "Binary file — no preview",
+                Some(_) => "No changes to show",
+                None => "Select a file to view its diff",
+            };
+            app.set_diff_metrics(inner.height, 0);
+            centered_hint(frame, inner, message, Style::new().fg(theme.dim));
+            return;
         }
-        Some(FileDiff::Text(lines)) => {
-            let path = selected.map(|(_, entry)| entry.path.as_str()).unwrap_or("");
-            render_lines(frame, inner, app, lines, syntax_for(path));
-        }
+    };
+
+    let path = selected.map(|(_, entry)| entry.path.as_str()).unwrap_or("");
+    let syntax = syntax_for(path);
+    match app.diff_mode {
+        DiffMode::Unified => render_unified(frame, inner, app, lines, syntax),
+        DiffMode::SideBySide => render_side_by_side(frame, inner, app, lines, syntax),
     }
 }
 
-fn render_lines(
+fn render_unified(
     frame: &mut Frame,
     inner: Rect,
     app: &App,
     lines: &[DiffLine],
     syntax: &SyntaxReference,
 ) {
+    app.set_diff_metrics(inner.height, clamp_u16(lines.len()));
     let theme = &app.theme;
     let offset = app.diff_scroll.min(app.diff_max_scroll()) as usize;
     let body_width = (inner.width as usize).saturating_sub(GUTTER_WIDTH);
@@ -60,23 +70,19 @@ fn render_lines(
         .iter()
         .skip(offset)
         .take(inner.height as usize)
-        .map(|line| render_line(line, theme, syntax, body_width))
+        .map(|line| unified_line(line, theme, syntax, body_width))
         .collect();
-
     frame.render_widget(Paragraph::new(rows), inner);
 }
 
-fn render_line(
+fn unified_line(
     line: &DiffLine,
     theme: &Theme,
     syntax: &SyntaxReference,
     body_width: usize,
 ) -> Line<'static> {
     if line.kind == LineKind::Hunk {
-        return Line::from(Span::styled(
-            line.text.clone(),
-            Style::new().fg(theme.hunk).add_modifier(Modifier::BOLD),
-        ));
+        return hunk_line(line, theme);
     }
 
     let (sign, sign_fg, bg) = match line.kind {
@@ -97,6 +103,156 @@ fn render_line(
         bg,
     ));
     Line::from(spans)
+}
+
+fn render_side_by_side(
+    frame: &mut Frame,
+    inner: Rect,
+    app: &App,
+    lines: &[DiffLine],
+    syntax: &SyntaxReference,
+) {
+    let rows = side_by_side_rows(lines);
+    app.set_diff_metrics(inner.height, clamp_u16(rows.len()));
+    let theme = &app.theme;
+    let offset = app.diff_scroll.min(app.diff_max_scroll()) as usize;
+    // left column │ right column, the divider taking one cell.
+    let left_w = inner.width.saturating_sub(1) / 2;
+    let right_w = inner.width.saturating_sub(left_w + 1);
+
+    let out: Vec<Line> = rows
+        .iter()
+        .skip(offset)
+        .take(inner.height as usize)
+        .map(|row| side_by_side_line(row, theme, syntax, left_w as usize, right_w as usize))
+        .collect();
+    frame.render_widget(Paragraph::new(out), inner);
+}
+
+/// A side-by-side row: a full-width hunk header, or an aligned old/new pair.
+enum SbsRow<'a> {
+    Hunk(&'a DiffLine),
+    Pair {
+        left: Option<&'a DiffLine>,
+        right: Option<&'a DiffLine>,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum Side {
+    Old,
+    New,
+}
+
+/// Pair the unified diff lines into side-by-side rows: context lines appear on
+/// both sides; a run of deletions is zipped against the following run of
+/// additions, padding the shorter side with blanks.
+fn side_by_side_rows(lines: &[DiffLine]) -> Vec<SbsRow<'_>> {
+    let mut rows = Vec::new();
+    let mut deletions: Vec<&DiffLine> = Vec::new();
+    let mut additions: Vec<&DiffLine> = Vec::new();
+
+    for line in lines {
+        match line.kind {
+            LineKind::Deletion => deletions.push(line),
+            LineKind::Addition => additions.push(line),
+            LineKind::Context => {
+                flush_pairs(&mut rows, &mut deletions, &mut additions);
+                rows.push(SbsRow::Pair {
+                    left: Some(line),
+                    right: Some(line),
+                });
+            }
+            LineKind::Hunk => {
+                flush_pairs(&mut rows, &mut deletions, &mut additions);
+                rows.push(SbsRow::Hunk(line));
+            }
+        }
+    }
+    flush_pairs(&mut rows, &mut deletions, &mut additions);
+    rows
+}
+
+fn flush_pairs<'a>(
+    rows: &mut Vec<SbsRow<'a>>,
+    deletions: &mut Vec<&'a DiffLine>,
+    additions: &mut Vec<&'a DiffLine>,
+) {
+    for i in 0..deletions.len().max(additions.len()) {
+        rows.push(SbsRow::Pair {
+            left: deletions.get(i).copied(),
+            right: additions.get(i).copied(),
+        });
+    }
+    deletions.clear();
+    additions.clear();
+}
+
+fn side_by_side_line(
+    row: &SbsRow,
+    theme: &Theme,
+    syntax: &SyntaxReference,
+    left_w: usize,
+    right_w: usize,
+) -> Line<'static> {
+    match row {
+        SbsRow::Hunk(line) => hunk_line(line, theme),
+        SbsRow::Pair { left, right } => {
+            let mut spans = cell(*left, Side::Old, theme, syntax, left_w);
+            spans.push(Span::styled("│", Style::new().fg(theme.border)));
+            spans.extend(cell(*right, Side::New, theme, syntax, right_w));
+            Line::from(spans)
+        }
+    }
+}
+
+fn cell(
+    line: Option<&DiffLine>,
+    side: Side,
+    theme: &Theme,
+    syntax: &SyntaxReference,
+    width: usize,
+) -> Vec<Span<'static>> {
+    let Some(line) = line else {
+        return vec![Span::styled(" ".repeat(width), Style::new().bg(theme.bg))];
+    };
+    let (number, bg) = match side {
+        Side::Old => (
+            line.old_no,
+            if line.kind == LineKind::Deletion {
+                theme.del_bg
+            } else {
+                theme.bg
+            },
+        ),
+        Side::New => (
+            line.new_no,
+            if line.kind == LineKind::Addition {
+                theme.add_bg
+            } else {
+                theme.bg
+            },
+        ),
+    };
+    let gutter = match number {
+        Some(n) => format!("{n:>4} "),
+        None => "     ".to_string(),
+    };
+    let mut spans = vec![Span::styled(gutter, Style::new().fg(theme.line_no))];
+    spans.extend(highlighted_content(
+        syntax,
+        &line.text,
+        width.saturating_sub(SBS_GUTTER),
+        bg,
+    ));
+    spans
+}
+
+fn hunk_line(line: &DiffLine, theme: &Theme) -> Line<'static> {
+    Line::from(Span::styled(
+        line.text.clone(),
+        Style::new().fg(theme.hunk).add_modifier(Modifier::BOLD),
+    ))
 }
 
 /// Syntax-highlight `text` into spans (each token's colour over the line's
@@ -153,4 +309,8 @@ fn gutter_num(no: Option<usize>) -> String {
         Some(n) => format!("{n:>4}"),
         None => "    ".to_string(),
     }
+}
+
+fn clamp_u16(value: usize) -> u16 {
+    value.min(u16::MAX as usize) as u16
 }
