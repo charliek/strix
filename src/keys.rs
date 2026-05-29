@@ -7,6 +7,8 @@ use std::collections::HashMap;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use crate::util::normalize;
+
 /// A semantic action a key triggers. Context (focused pane) decides the effect.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -122,10 +124,6 @@ const DEFAULTS: &[(&str, Action)] = &[
     ("u", Action::Unstage),
     ("x", Action::Discard),
 ];
-
-fn normalize(name: &str) -> String {
-    name.trim().to_lowercase().replace('_', "-")
-}
 
 fn parse_action(name: &str) -> Option<Action> {
     Some(match normalize(name).as_str() {

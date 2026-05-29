@@ -12,6 +12,7 @@ pub mod keys;
 pub mod logging;
 pub mod terminal;
 pub mod ui;
+pub mod util;
 
 // Re-exported so consumers (and integration tests) can build input events and
 // reference styles against the exact ratatui/crossterm version strix renders with.
@@ -32,9 +33,7 @@ pub fn run() -> Result<()> {
     };
 
     let mut config = config::load();
-    if cli.theme.is_some() {
-        config.theme = cli.theme;
-    }
+    config.theme = cli.theme.or(config.theme);
     let app = app::App::with_config(repo_path, &config)?;
 
     if cli.dump_frame {

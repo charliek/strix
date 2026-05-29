@@ -196,6 +196,7 @@ impl App {
                 Focus::Staging => self.selected = self.status.total().saturating_sub(1),
                 Focus::Diff => self.diff_scroll = self.diff_max_scroll(),
             },
+            // Ctrl-D/U page the diff pane regardless of which pane is focused.
             Action::HalfPageDown => self.scroll_diff(true, self.half_page()),
             Action::HalfPageUp => self.scroll_diff(false, self.half_page()),
             Action::ToggleStage => self.toggle_stage(),

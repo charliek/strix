@@ -2,6 +2,8 @@ use std::path::Path;
 
 use ratatui::style::Color;
 
+use crate::util::normalize;
+
 /// Colour palette for the whole UI. Every colour the renderer uses comes from
 /// here so themes can be swapped wholesale. `syntax_theme` names the bundled
 /// syntect theme used for code highlighting. Values are truecolor RGB.
@@ -241,10 +243,6 @@ impl Default for Theme {
     fn default() -> Self {
         Self::tokyo_night()
     }
-}
-
-fn normalize(name: &str) -> String {
-    name.trim().to_lowercase().replace('_', "-")
 }
 
 /// Parse `#rrggbb` / `rrggbb` into a colour.
