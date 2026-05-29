@@ -2,7 +2,7 @@ pub mod diff_view;
 pub mod staging;
 pub mod theme;
 
-use ratatui::layout::{Constraint, Flex, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
@@ -41,7 +41,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
-    let line = Line::from(vec![
+    // Fill the bar, then draw left + right text on top (transparent spans), so
+    // the right-aligned branch never clobbers the left title.
+    frame.render_widget(Block::new().style(Style::new().bg(theme.header_bg)), area);
+
+    let left = Line::from(vec![
         Span::styled(
             " strix ",
             Style::new()
@@ -50,10 +54,15 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         ),
         Span::styled(app.repo_name(), Style::new().fg(theme.dim)),
     ]);
-    frame.render_widget(
-        Paragraph::new(line).style(Style::new().bg(theme.header_bg)),
-        area,
-    );
+    frame.render_widget(Paragraph::new(left), area);
+
+    if let Some(branch) = app.status.head_label() {
+        let right = Line::from(Span::styled(
+            format!("{branch} "),
+            Style::new().fg(theme.title),
+        ));
+        frame.render_widget(Paragraph::new(right).alignment(Alignment::Right), area);
+    }
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
@@ -64,7 +73,12 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     let label_style = Style::new().fg(theme.footer_fg);
 
     let mut spans = Vec::new();
-    for (key, label) in [(" q ", "quit  "), (" Tab ", "switch pane  ")] {
+    for (key, label) in [
+        (" j/k ", "move  "),
+        (" Tab ", "pane  "),
+        (" r ", "refresh  "),
+        (" q ", "quit"),
+    ] {
         spans.push(Span::styled(key, key_style));
         spans.push(Span::styled(label, label_style));
     }

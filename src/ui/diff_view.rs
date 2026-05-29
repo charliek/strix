@@ -9,12 +9,20 @@ use crate::ui::{panel_block, vertical_center};
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
     let focused = app.focus == Focus::Diff;
-    let block = panel_block(" Diff ", focused, theme);
+
+    let title = match app.selected_file() {
+        Some((_, entry)) => format!(" Diff · {} ", entry.path),
+        None => " Diff ".to_string(),
+    };
+    let block = panel_block(&title, focused, theme);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let hint = Paragraph::new("Select a file to view its diff")
-        .style(Style::new().fg(theme.dim))
-        .alignment(Alignment::Center);
-    frame.render_widget(hint, vertical_center(inner, 1));
+    // The diff itself arrives in M3; until a file is selected, show a hint.
+    if app.selected_file().is_none() {
+        let hint = Paragraph::new("Select a file to view its diff")
+            .style(Style::new().fg(theme.dim))
+            .alignment(Alignment::Center);
+        frame.render_widget(hint, vertical_center(inner, 1));
+    }
 }
