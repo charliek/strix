@@ -72,6 +72,20 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
+
+    // A failed action shows a transient error in place of the key hints.
+    if let Some(error) = &app.last_error {
+        let line = Line::from(Span::styled(
+            format!(" ✗ {error}"),
+            Style::new().fg(theme.del).add_modifier(Modifier::BOLD),
+        ));
+        frame.render_widget(
+            Paragraph::new(line).style(Style::new().bg(theme.footer_bg)),
+            area,
+        );
+        return;
+    }
+
     let key_style = Style::new()
         .fg(theme.footer_key)
         .add_modifier(Modifier::BOLD);
@@ -82,7 +96,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         (" j/k ", "move  "),
         (" space ", "stage  "),
         (" d ", "split  "),
-        (" x ", "discard  "),
+        (" ? ", "help  "),
         (" q ", "quit"),
     ] {
         spans.push(Span::styled(key, key_style));

@@ -13,6 +13,7 @@ use crate::util::normalize;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     Quit,
+    Help,
     Refresh,
     SwitchPane,
     ToggleDiffMode,
@@ -100,6 +101,7 @@ impl Default for Keymap {
 const DEFAULTS: &[(&str, Action)] = &[
     ("q", Action::Quit),
     ("ctrl-c", Action::Quit),
+    ("?", Action::Help),
     ("r", Action::Refresh),
     ("tab", Action::SwitchPane),
     ("backtab", Action::SwitchPane),
@@ -128,6 +130,7 @@ const DEFAULTS: &[(&str, Action)] = &[
 fn parse_action(name: &str) -> Option<Action> {
     Some(match normalize(name).as_str() {
         "quit" => Action::Quit,
+        "help" => Action::Help,
         "refresh" => Action::Refresh,
         "switch-pane" => Action::SwitchPane,
         "toggle-diff-mode" | "diff-mode" | "split" => Action::ToggleDiffMode,

@@ -35,7 +35,6 @@ These are the defaults. Every binding is remappable — see
 | `Ctrl-d`, `Ctrl-u` | Scroll half a page down / up                   |
 | `g`, `G`        | Jump to top / bottom of the diff                  |
 | `d`             | Toggle unified / side-by-side mode                |
-| `[`, `]`        | Previous / next changed file                      |
 | `h`, `←`        | Focus the Changes pane                            |
 
 ## Mouse

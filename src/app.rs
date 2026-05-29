@@ -45,6 +45,8 @@ pub enum Modal {
         change: Change,
         label: String,
     },
+    /// The keybinding help overlay.
+    Help,
 }
 
 /// Global application state. A single `App` drives both rendering and input
@@ -59,6 +61,8 @@ pub struct App {
     pub modal: Option<Modal>,
     pub theme: Theme,
     pub should_quit: bool,
+    /// A transient error from the last action, shown until the next keypress.
+    pub last_error: Option<String>,
 
     /// Cached diff for the selected file; recomputed only when the selection
     /// changes (see `sync_diff`).
@@ -102,6 +106,7 @@ impl App {
             modal: None,
             theme,
             should_quit: false,
+            last_error: None,
             current_diff: None,
             diff_key: None,
             diff_mode: config.diff_mode(),
@@ -157,6 +162,7 @@ impl App {
             self.should_quit = true;
             return;
         }
+        self.last_error = None;
 
         if self.modal.is_some() {
             self.on_key_modal(key);
@@ -175,6 +181,7 @@ impl App {
     fn dispatch(&mut self, action: Action) {
         match action {
             Action::Quit => self.should_quit = true,
+            Action::Help => self.modal = Some(Modal::Help),
             Action::Refresh => self.refresh(),
             Action::SwitchPane => self.toggle_focus(),
             Action::ToggleDiffMode => self.toggle_diff_mode(),
@@ -215,6 +222,7 @@ impl App {
         if self.modal.is_some() {
             return;
         }
+        self.last_error = None;
         let pos = Position {
             x: event.column,
             y: event.row,
@@ -285,6 +293,10 @@ impl App {
     }
 
     fn on_key_modal(&mut self, key: KeyEvent) {
+        if matches!(self.modal, Some(Modal::Help)) {
+            self.modal = None; // any key dismisses the help overlay
+            return;
+        }
         match key.code {
             KeyCode::Char('y') | KeyCode::Enter => self.confirm_modal(),
             KeyCode::Char('n') | KeyCode::Esc => self.modal = None,
@@ -342,6 +354,7 @@ impl App {
     fn after_mutation(&mut self, action: &str, result: anyhow::Result<()>) {
         if let Err(err) = result {
             tracing::warn!("{action} failed: {err:#}");
+            self.last_error = Some(format!("{action} failed: {err}"));
         }
         self.refresh();
     }

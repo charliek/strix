@@ -478,7 +478,7 @@ docs = [
 
 [package.metadata.requires-dev]
 docs = [
-    { name = "mkdocs", specifier = ">=1.6.1" },
+    { name = "mkdocs", specifier = ">=1.6.1,<2.0" },
     { name = "mkdocs-material", specifier = ">=9.6" },
     { name = "pymdown-extensions", specifier = ">=10.15" },
 ]

@@ -34,8 +34,8 @@ Drop a `.toml` file in `~/.config/strix/themes/` and reference it by file stem
 (`my-theme.toml` → `theme = "my-theme"`). Colours are hex strings:
 
 ```toml
-name = "My Theme"
-syntax = "base16-ocean.dark"   # bundled syntect theme used for code
+base = "tokyo-night"            # preset to start from (default: tokyo-night)
+syntax = "base16-ocean.dark"    # bundled syntect theme for code highlighting
 
 [colors]
 bg = "#1a1b26"
@@ -54,7 +54,7 @@ del_bg = "#312027"
 hunk = "#7dcfff"
 ```
 
-Any colour you omit falls back to the default theme's value, so a partial theme
+Any colour you omit falls back to the `base` preset's value, so a partial theme
 is fine.
 
 !!! note
