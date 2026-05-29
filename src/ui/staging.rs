@@ -9,6 +9,56 @@ use crate::git::{Change, FileEntry, Section, Status};
 use crate::ui::theme::Theme;
 use crate::ui::{centered_hint, panel_block};
 
+/// One row of the staging list, in display order.
+enum Row<'a> {
+    Header {
+        label: &'static str,
+        count: usize,
+    },
+    File {
+        selection: usize,
+        section: Section,
+        entry: &'a FileEntry,
+    },
+}
+
+/// The staging list rows in order: each section header followed by its files,
+/// staged then unstaged. The single source of truth for the list layout, shared
+/// by rendering and mouse hit-testing so the two can't disagree on row order.
+fn rows(status: &Status) -> Vec<Row<'_>> {
+    let mut rows = Vec::new();
+    let mut selection = 0;
+    for (label, section, entries) in [
+        ("Staged", Section::Staged, &status.staged),
+        ("Changes", Section::Unstaged, &status.unstaged),
+    ] {
+        if entries.is_empty() {
+            continue;
+        }
+        rows.push(Row::Header {
+            label,
+            count: entries.len(),
+        });
+        for entry in entries {
+            rows.push(Row::File {
+                selection,
+                section,
+                entry,
+            });
+            selection += 1;
+        }
+    }
+    rows
+}
+
+/// The file selection index at a list-item position (None for a header row).
+pub fn selection_at(status: &Status, item: usize) -> Option<usize> {
+    match rows(status).get(item) {
+        Some(Row::File { selection, .. }) => Some(*selection),
+        _ => None,
+    }
+}
+
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
     let focused = app.focus == Focus::Staging;
@@ -27,8 +77,23 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let items = build_items(&app.status, theme);
-    let selected_item = file_item_rows(&app.status).get(app.selected).copied();
+    let mut items = Vec::new();
+    let mut selected_item = None;
+    for (index, row) in rows(&app.status).into_iter().enumerate() {
+        match row {
+            Row::Header { label, count } => items.push(section_header(label, count, theme)),
+            Row::File {
+                selection,
+                section,
+                entry,
+            } => {
+                if selection == app.selected {
+                    selected_item = Some(index);
+                }
+                items.push(file_item(entry, section, theme));
+            }
+        }
+    }
 
     let highlight = if focused {
         Style::new()
@@ -40,49 +105,9 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     };
     let list = List::new(items).highlight_style(highlight);
 
-    let mut state = app.staging_state();
+    let mut state = app.staging_state_mut();
     state.select(selected_item);
     frame.render_stateful_widget(list, inner, &mut state);
-}
-
-/// The list rows: a section header followed by its files, staged then unstaged.
-fn build_items(status: &Status, theme: &Theme) -> Vec<ListItem<'static>> {
-    let mut items = Vec::new();
-    if !status.staged.is_empty() {
-        items.push(section_header("Staged", status.staged.len(), theme));
-        for entry in &status.staged {
-            items.push(file_item(entry, Section::Staged, theme));
-        }
-    }
-    if !status.unstaged.is_empty() {
-        items.push(section_header("Changes", status.unstaged.len(), theme));
-        for entry in &status.unstaged {
-            items.push(file_item(entry, Section::Unstaged, theme));
-        }
-    }
-    items
-}
-
-/// The list-item index of each selectable file, by selection index. Mirrors the
-/// row order produced by [`build_items`] so mouse clicks map to the right file.
-pub fn file_item_rows(status: &Status) -> Vec<usize> {
-    let mut rows = Vec::new();
-    let mut item = 0;
-    if !status.staged.is_empty() {
-        item += 1; // "Staged" header
-        for _ in &status.staged {
-            rows.push(item);
-            item += 1;
-        }
-    }
-    if !status.unstaged.is_empty() {
-        item += 1; // "Changes" header
-        for _ in &status.unstaged {
-            rows.push(item);
-            item += 1;
-        }
-    }
-    rows
 }
 
 fn section_header(label: &str, count: usize, theme: &Theme) -> ListItem<'static> {

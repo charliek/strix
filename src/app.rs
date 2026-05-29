@@ -171,6 +171,10 @@ impl App {
     }
 
     pub fn on_mouse(&mut self, event: MouseEvent) {
+        // A modal captures all input, including the mouse.
+        if self.modal.is_some() {
+            return;
+        }
         let pos = Position {
             x: event.column,
             y: event.row,
@@ -184,35 +188,49 @@ impl App {
         self.sync_diff();
     }
 
-    fn on_click(&mut self, pos: Position) {
+    /// Which pane (if any) a screen position falls in.
+    fn pane_at(&self, pos: Position) -> Option<Focus> {
         if self.diff_area.get().contains(pos) {
-            self.focus = Focus::Diff;
+            Some(Focus::Diff)
         } else if self.staging_area.get().contains(pos) {
-            self.focus = Focus::Staging;
-            if let Some(selection) = self.file_at(pos) {
-                self.selected = selection;
-                // Clicking the change marker (not just the name) toggles staging.
-                if pos.x < self.staging_area.get().x + MARKER_ZONE {
-                    self.toggle_stage();
+            Some(Focus::Staging)
+        } else {
+            None
+        }
+    }
+
+    fn on_click(&mut self, pos: Position) {
+        match self.pane_at(pos) {
+            Some(Focus::Diff) => self.focus = Focus::Diff,
+            Some(Focus::Staging) => {
+                self.focus = Focus::Staging;
+                if let Some(selection) = self.file_at(pos) {
+                    self.selected = selection;
+                    // Clicking the change marker (not just the name) toggles staging.
+                    if pos.x < self.staging_area.get().x + MARKER_ZONE {
+                        self.toggle_stage();
+                    }
                 }
             }
+            None => {}
         }
     }
 
     fn on_scroll(&mut self, pos: Position, down: bool) {
-        if self.diff_area.get().contains(pos) {
-            self.diff_scroll = if down {
-                (self.diff_scroll + SCROLL_STEP).min(self.diff_max_scroll())
-            } else {
-                self.diff_scroll.saturating_sub(SCROLL_STEP)
-            };
-        } else if self.staging_area.get().contains(pos) {
-            if down {
-                self.select_next();
-            } else {
-                self.select_prev();
-            }
+        match self.pane_at(pos) {
+            Some(Focus::Diff) => self.scroll_diff(down, SCROLL_STEP),
+            Some(Focus::Staging) if down => self.select_next(),
+            Some(Focus::Staging) => self.select_prev(),
+            None => {}
         }
+    }
+
+    fn scroll_diff(&mut self, down: bool, step: u16) {
+        self.diff_scroll = if down {
+            (self.diff_scroll + step).min(self.diff_max_scroll())
+        } else {
+            self.diff_scroll.saturating_sub(step)
+        };
     }
 
     /// The selection index of the file at a screen position in the staging pane,
@@ -223,9 +241,7 @@ impl App {
             return None;
         }
         let item = self.staging_state.borrow().offset() + (pos.y - area.y) as usize;
-        crate::ui::staging::file_item_rows(&self.status)
-            .iter()
-            .position(|&row| row == item)
+        crate::ui::staging::selection_at(&self.status, item)
     }
 
     fn on_key_staging(&mut self, key: KeyEvent) {
@@ -246,20 +262,15 @@ impl App {
     }
 
     fn on_key_diff(&mut self, key: KeyEvent) {
-        let max = self.diff_max_scroll();
         let page = (self.diff_viewport.get() / 2).max(1);
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Char('d') if ctrl => self.diff_scroll = (self.diff_scroll + page).min(max),
-            KeyCode::Char('u') if ctrl => self.diff_scroll = self.diff_scroll.saturating_sub(page),
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.diff_scroll = (self.diff_scroll + 1).min(max)
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.diff_scroll = self.diff_scroll.saturating_sub(1)
-            }
+            KeyCode::Char('d') if ctrl => self.scroll_diff(true, page),
+            KeyCode::Char('u') if ctrl => self.scroll_diff(false, page),
+            KeyCode::Char('j') | KeyCode::Down => self.scroll_diff(true, 1),
+            KeyCode::Char('k') | KeyCode::Up => self.scroll_diff(false, 1),
             KeyCode::Char('g') | KeyCode::Home => self.diff_scroll = 0,
-            KeyCode::Char('G') | KeyCode::End => self.diff_scroll = max,
+            KeyCode::Char('G') | KeyCode::End => self.diff_scroll = self.diff_max_scroll(),
             KeyCode::Char('h') | KeyCode::Left => self.focus = Focus::Staging,
             _ => {}
         }
@@ -386,7 +397,7 @@ impl App {
 
     /// The persisted staging list state; rendering borrows it so the scroll
     /// offset is available for mouse hit-testing.
-    pub fn staging_state(&self) -> std::cell::RefMut<'_, ListState> {
+    pub fn staging_state_mut(&self) -> std::cell::RefMut<'_, ListState> {
         self.staging_state.borrow_mut()
     }
 

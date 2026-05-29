@@ -29,11 +29,13 @@ fn app_with_two_files() -> (tempfile::TempDir, App) {
     (repo, app)
 }
 
-/// Screen row of the file at selection `index`, using the rendered layout.
-fn file_row(app: &App, index: usize) -> u16 {
+/// Screen row of the file at selection `target`, using the rendered layout.
+fn file_row(app: &App, target: usize) -> u16 {
     let area = app.staging_area();
-    let offset = app.staging_state().offset();
-    let item = strix::ui::staging::file_item_rows(&app.status)[index];
+    let offset = app.staging_state_mut().offset();
+    let item = (0usize..)
+        .find(|&i| strix::ui::staging::selection_at(&app.status, i) == Some(target))
+        .unwrap();
     area.y + (item - offset) as u16
 }
 
