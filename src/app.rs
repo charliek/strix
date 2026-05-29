@@ -266,10 +266,11 @@ impl App {
         if key == self.diff_key {
             return;
         }
-        let target = self
+        // Compute into a local first so the immutable borrow of the file list
+        // (and repo) is released before assigning the cached fields.
+        let diff = self
             .selected_file()
-            .map(|(section, entry)| (section, entry.clone()));
-        let diff = target.map(|(section, entry)| self.repo.diff(section, &entry));
+            .map(|(section, entry)| self.repo.diff(section, entry));
         self.current_diff = diff;
         self.diff_key = key;
         self.diff_scroll = 0;

@@ -34,13 +34,6 @@ pub enum FileDiff {
     Binary,
 }
 
-impl FileDiff {
-    /// True when the file is text but has no differences to show.
-    pub fn is_empty(&self) -> bool {
-        matches!(self, FileDiff::Text(lines) if lines.is_empty())
-    }
-}
-
 impl Repo {
     /// Compute the diff for `entry` as shown in `section`: staged files diff
     /// HEAD against the index; unstaged files diff the index (or nothing, for
@@ -82,7 +75,7 @@ impl Repo {
             .rev_parse_single(BStr::new(spec))
             .ok()
             .and_then(|id| id.object().ok())
-            .map(|object| object.data.clone())
+            .map(|object| object.detach().data)
             .unwrap_or_default()
     }
 
@@ -136,9 +129,11 @@ fn hunk_header(group: &[DiffOp]) -> DiffLine {
     }
 }
 
-/// The combined start..end range of a hunk on one side.
+/// The combined start..end range of a hunk on one side, in a single pass.
 fn span(group: &[DiffOp], side: fn(&DiffOp) -> std::ops::Range<usize>) -> std::ops::Range<usize> {
-    let start = group.iter().map(|op| side(op).start).min().unwrap_or(0);
-    let end = group.iter().map(|op| side(op).end).max().unwrap_or(0);
-    start..end
+    group
+        .iter()
+        .map(side)
+        .reduce(|acc, r| acc.start.min(r.start)..acc.end.max(r.end))
+        .unwrap_or(0..0)
 }

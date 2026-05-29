@@ -1,4 +1,4 @@
-use ratatui::layout::{Alignment, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -8,10 +8,12 @@ use unicode_width::UnicodeWidthChar;
 use crate::app::{App, Focus};
 use crate::git::{DiffLine, FileDiff, LineKind};
 use crate::ui::theme::Theme;
-use crate::ui::{panel_block, vertical_center};
+use crate::ui::{centered_hint, panel_block};
 
 /// Width of the line-number gutter: `oldd nnnn ` → 4 + 1 + 4 + 1.
 const GUTTER_WIDTH: usize = 10;
+/// Width of the change sign column: `+ ` / `- ` / `  `.
+const SIGN_WIDTH: usize = 2;
 
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
@@ -26,21 +28,15 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(block, area);
     app.set_diff_viewport(inner.height);
 
+    let dim = Style::new().fg(theme.dim);
     match &app.current_diff {
-        None => hint(frame, inner, theme, "Select a file to view its diff"),
-        Some(FileDiff::Binary) => hint(frame, inner, theme, "Binary file — no preview"),
+        None => centered_hint(frame, inner, "Select a file to view its diff", dim),
+        Some(FileDiff::Binary) => centered_hint(frame, inner, "Binary file — no preview", dim),
         Some(FileDiff::Text(lines)) if lines.is_empty() => {
-            hint(frame, inner, theme, "No changes to show")
+            centered_hint(frame, inner, "No changes to show", dim)
         }
         Some(FileDiff::Text(lines)) => render_lines(frame, inner, app, lines),
     }
-}
-
-fn hint(frame: &mut Frame, inner: Rect, theme: &Theme, text: &str) {
-    let hint = Paragraph::new(text)
-        .style(Style::new().fg(theme.dim))
-        .alignment(Alignment::Center);
-    frame.render_widget(hint, vertical_center(inner, 1));
 }
 
 fn render_lines(frame: &mut Frame, inner: Rect, app: &App, lines: &[DiffLine]) {
@@ -67,16 +63,20 @@ fn render_line(line: &DiffLine, theme: &Theme, body_width: usize) -> Line<'stati
     }
 
     let (sign, fg, bg) = match line.kind {
-        LineKind::Addition => ('+', theme.add, theme.add_bg),
-        LineKind::Deletion => ('-', theme.del, theme.del_bg),
-        _ => (' ', theme.fg, theme.bg),
+        LineKind::Addition => ("+ ", theme.add, theme.add_bg),
+        LineKind::Deletion => ("- ", theme.del, theme.del_bg),
+        _ => ("  ", theme.fg, theme.bg),
     };
     let gutter = format!("{} {} ", gutter_num(line.old_no), gutter_num(line.new_no));
-    let body = fit_to_width(&format!("{sign} {}", line.text), body_width);
+    // The sign and content are separate spans so syntax highlighting (M4) can
+    // replace the content span with per-token spans while keeping the same
+    // background.
+    let content = fit_to_width(&line.text, body_width.saturating_sub(SIGN_WIDTH));
 
     Line::from(vec![
         Span::styled(gutter, Style::new().fg(theme.line_no)),
-        Span::styled(body, Style::new().fg(fg).bg(bg)),
+        Span::styled(sign, Style::new().fg(fg).bg(bg)),
+        Span::styled(content, Style::new().fg(fg).bg(bg)),
     ])
 }
 
@@ -88,8 +88,8 @@ fn gutter_num(no: Option<usize>) -> String {
 }
 
 /// Expand tabs, drop control characters (so file content can't inject escape
-/// sequences), truncate to `width` display columns, and pad to fill the row so
-/// the line's background spans the full width.
+/// sequences), truncate to `width` display columns, and pad to fill the width so
+/// the line's background spans the full row.
 fn fit_to_width(text: &str, width: usize) -> String {
     let expanded = text.replace('\t', "    ");
     let mut out = String::with_capacity(width);
