@@ -81,8 +81,8 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     for (key, label) in [
         (" j/k ", "move  "),
         (" space ", "stage  "),
+        (" d ", "split  "),
         (" x ", "discard  "),
-        (" Tab ", "pane  "),
         (" q ", "quit"),
     ] {
         spans.push(Span::styled(key, key_style));

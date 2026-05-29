@@ -107,3 +107,24 @@ fn diff_renders_in_the_pane() {
     assert!(out.contains("ADDED_LINE"), "diff body shows the added line");
     assert!(out.contains("@@"), "hunk header shown");
 }
+
+#[test]
+fn side_by_side_pairs_old_and_new() {
+    use strix::app::{App, DiffMode};
+    use strix::crossterm::event::{KeyCode, KeyEvent};
+
+    let repo = init_repo();
+    let path = repo.path();
+    write(path, "README.md", "# changed\n"); // was "# test\n": one deletion + one addition
+
+    let mut app = App::new(path.to_path_buf()).unwrap();
+    app.on_key(KeyEvent::from(KeyCode::Char('d')));
+    assert_eq!(app.diff_mode, DiffMode::SideBySide);
+
+    let out = strix::terminal::dump_frame(&app, 120, 20).unwrap();
+    assert!(
+        out.lines()
+            .any(|line| line.contains("# test") && line.contains("# changed")),
+        "deletion (old) and addition (new) render on the same row"
+    );
+}
