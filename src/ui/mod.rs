@@ -122,6 +122,16 @@ pub fn vertical_center(area: Rect, height: u16) -> Rect {
     rect
 }
 
+/// Draw a centred single-line hint in the middle of `area`, for empty states.
+pub fn centered_hint(frame: &mut Frame, area: Rect, text: &str, style: Style) {
+    frame.render_widget(
+        Paragraph::new(text)
+            .style(style)
+            .alignment(Alignment::Center),
+        vertical_center(area, 1),
+    );
+}
+
 /// A `width`×`height` rect centred within `area` (clamped to `area`), for modal
 /// popups.
 pub fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {

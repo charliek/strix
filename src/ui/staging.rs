@@ -1,13 +1,13 @@
-use ratatui::layout::{Alignment, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{List, ListItem, ListState};
 use ratatui::Frame;
 
 use crate::app::{App, Focus};
 use crate::git::{Change, FileEntry, Section};
 use crate::ui::theme::Theme;
-use crate::ui::{panel_block, vertical_center};
+use crate::ui::{centered_hint, panel_block};
 
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
@@ -17,10 +17,12 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(block, area);
 
     if app.status.is_clean() {
-        let hint = Paragraph::new("✓ working tree clean")
-            .style(Style::new().fg(theme.staged))
-            .alignment(Alignment::Center);
-        frame.render_widget(hint, vertical_center(inner, 1));
+        centered_hint(
+            frame,
+            inner,
+            "✓ working tree clean",
+            Style::new().fg(theme.staged),
+        );
         return;
     }
 

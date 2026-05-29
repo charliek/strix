@@ -19,7 +19,6 @@ gix = { version = "0.84.0", default-features = false, features = [
     "sha1",
     "max-performance-safe",
     "status",
-    "blob-diff",
     "revision",
 ] }
 
