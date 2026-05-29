@@ -1,0 +1,24 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# mkdocs build output
+/site-build/
+
+# Python / uv (docs tooling)
+.venv/
+__pycache__/
+.pytest_cache/
+
+# Logs
+*.log
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Claude Code local state
+.claude/
