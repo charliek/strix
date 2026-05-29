@@ -99,6 +99,7 @@ fn unified_line(
     ];
     spans.extend(highlighted_content(
         syntax,
+        &theme.syntax_theme,
         &line.text,
         body_width.saturating_sub(SIGN_WIDTH),
         bg,
@@ -230,6 +231,7 @@ fn cell(
     let mut spans = vec![Span::styled(gutter, Style::new().fg(theme.line_no))];
     spans.extend(highlighted_content(
         syntax,
+        &theme.syntax_theme,
         &line.text,
         width.saturating_sub(SBS_GUTTER),
         bg,
@@ -249,6 +251,7 @@ fn hunk_line(line: &DiffLine, theme: &Theme) -> Line<'static> {
 /// so the background fills the row.
 fn highlighted_content(
     syntax: &SyntaxReference,
+    theme_name: &str,
     text: &str,
     width: usize,
     bg: Color,
@@ -256,7 +259,7 @@ fn highlighted_content(
     let clean = sanitize(text);
     let mut spans = Vec::new();
     let mut used = 0;
-    for (color, piece) in highlight_line(syntax, &clean) {
+    for (color, piece) in highlight_line(syntax, theme_name, &clean) {
         if used >= width {
             break;
         }

@@ -7,7 +7,9 @@ use ratatui::crossterm::event::{
 use ratatui::layout::{Position, Rect};
 use ratatui::widgets::ListState;
 
+use crate::config::Config;
 use crate::git::{Change, FileDiff, FileEntry, Repo, Section, Status};
+use crate::keys::{Action, Keymap};
 use crate::ui::theme::Theme;
 
 /// A path-based git mutation (stage / unstage); lets the select → run → refresh
@@ -76,29 +78,40 @@ pub struct App {
     staging_state: RefCell<ListState>,
     staging_area: Cell<Rect>,
     diff_area: Cell<Rect>,
+
+    keymap: Keymap,
 }
 
 impl App {
     pub fn new(repo_path: PathBuf) -> anyhow::Result<Self> {
+        Self::with_config(repo_path, &Config::default())
+    }
+
+    pub fn with_config(repo_path: PathBuf, config: &Config) -> anyhow::Result<Self> {
         let repo = Repo::open(&repo_path)?;
         let status = repo.status()?;
+        let theme = Theme::load(
+            config.theme.as_deref().unwrap_or("tokyo-night"),
+            crate::config::config_dir().as_deref(),
+        );
         let mut app = App {
             repo,
             status,
             selected: 0,
             focus: Focus::Staging,
             modal: None,
-            theme: Theme::default(),
+            theme,
             should_quit: false,
             current_diff: None,
             diff_key: None,
-            diff_mode: DiffMode::Unified,
+            diff_mode: config.diff_mode(),
             diff_scroll: 0,
             diff_viewport: Cell::new(0),
             diff_content_rows: Cell::new(0),
             staging_state: RefCell::new(ListState::default()),
             staging_area: Cell::new(Rect::default()),
             diff_area: Cell::new(Rect::default()),
+            keymap: Keymap::from_config(config.keys.as_ref()),
         };
         app.clamp_selection();
         app.sync_diff();
@@ -147,27 +160,54 @@ impl App {
 
         if self.modal.is_some() {
             self.on_key_modal(key);
-        } else {
-            match key.code {
-                KeyCode::Char('q') => {
-                    self.should_quit = true;
-                    return;
-                }
-                KeyCode::Tab | KeyCode::BackTab => self.toggle_focus(),
-                KeyCode::Char('r') => self.refresh(),
-                KeyCode::Char('d') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.toggle_diff_mode()
-                }
-                _ => match self.focus {
-                    Focus::Staging => self.on_key_staging(key),
-                    Focus::Diff => self.on_key_diff(key),
-                },
-            }
+        } else if let Some(action) = self.keymap.action(key) {
+            self.dispatch(action);
         }
 
         // A handled key may have moved the selection or changed status; keep the
         // cached diff in sync.
         self.sync_diff();
+    }
+
+    /// Interpret an action in context: navigation keys move the file cursor in
+    /// the staging pane but scroll the diff pane; staging ops act on the
+    /// selected file regardless of focus.
+    fn dispatch(&mut self, action: Action) {
+        match action {
+            Action::Quit => self.should_quit = true,
+            Action::Refresh => self.refresh(),
+            Action::SwitchPane => self.toggle_focus(),
+            Action::ToggleDiffMode => self.toggle_diff_mode(),
+            Action::FocusStaging => self.focus = Focus::Staging,
+            Action::FocusDiff => self.focus = Focus::Diff,
+            Action::Down => match self.focus {
+                Focus::Staging => self.select_next(),
+                Focus::Diff => self.scroll_diff(true, 1),
+            },
+            Action::Up => match self.focus {
+                Focus::Staging => self.select_prev(),
+                Focus::Diff => self.scroll_diff(false, 1),
+            },
+            Action::Top => match self.focus {
+                Focus::Staging => self.selected = 0,
+                Focus::Diff => self.diff_scroll = 0,
+            },
+            Action::Bottom => match self.focus {
+                Focus::Staging => self.selected = self.status.total().saturating_sub(1),
+                Focus::Diff => self.diff_scroll = self.diff_max_scroll(),
+            },
+            // Ctrl-D/U page the diff pane regardless of which pane is focused.
+            Action::HalfPageDown => self.scroll_diff(true, self.half_page()),
+            Action::HalfPageUp => self.scroll_diff(false, self.half_page()),
+            Action::ToggleStage => self.toggle_stage(),
+            Action::Stage => self.stage_selected(),
+            Action::Unstage => self.unstage_selected(),
+            Action::Discard => self.request_discard(),
+        }
+    }
+
+    fn half_page(&self) -> u16 {
+        (self.diff_viewport.get() / 2).max(1)
     }
 
     pub fn on_mouse(&mut self, event: MouseEvent) {
@@ -242,38 +282,6 @@ impl App {
         }
         let item = self.staging_state.borrow().offset() + (pos.y - area.y) as usize;
         crate::ui::staging::selection_at(&self.status, item)
-    }
-
-    fn on_key_staging(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Char('j') | KeyCode::Down => self.select_next(),
-            KeyCode::Char('k') | KeyCode::Up => self.select_prev(),
-            KeyCode::Char('g') | KeyCode::Home => self.selected = 0,
-            KeyCode::Char('G') | KeyCode::End => {
-                self.selected = self.status.total().saturating_sub(1)
-            }
-            KeyCode::Char(' ') | KeyCode::Enter => self.toggle_stage(),
-            KeyCode::Char('s') => self.stage_selected(),
-            KeyCode::Char('u') => self.unstage_selected(),
-            KeyCode::Char('x') => self.request_discard(),
-            KeyCode::Char('l') | KeyCode::Right => self.focus = Focus::Diff,
-            _ => {}
-        }
-    }
-
-    fn on_key_diff(&mut self, key: KeyEvent) {
-        let page = (self.diff_viewport.get() / 2).max(1);
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        match key.code {
-            KeyCode::Char('d') if ctrl => self.scroll_diff(true, page),
-            KeyCode::Char('u') if ctrl => self.scroll_diff(false, page),
-            KeyCode::Char('j') | KeyCode::Down => self.scroll_diff(true, 1),
-            KeyCode::Char('k') | KeyCode::Up => self.scroll_diff(false, 1),
-            KeyCode::Char('g') | KeyCode::Home => self.diff_scroll = 0,
-            KeyCode::Char('G') | KeyCode::End => self.diff_scroll = self.diff_max_scroll(),
-            KeyCode::Char('h') | KeyCode::Left => self.focus = Focus::Staging,
-            _ => {}
-        }
     }
 
     fn on_key_modal(&mut self, key: KeyEvent) {
