@@ -1,0 +1,104 @@
+pub mod diff_view;
+pub mod staging;
+pub mod theme;
+
+use ratatui::layout::{Constraint, Flex, Layout, Rect};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
+use ratatui::Frame;
+
+use crate::app::App;
+use crate::ui::theme::Theme;
+
+/// Top-level render: header / body / footer, with the body split into the
+/// staging pane (left) and diff pane (right).
+pub fn draw(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    let theme = &app.theme;
+
+    frame.render_widget(
+        Block::new().style(Style::new().bg(theme.bg).fg(theme.fg)),
+        area,
+    );
+
+    let [header, body, footer] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .areas(area);
+
+    render_header(frame, header, app);
+
+    let [left, right] =
+        Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)]).areas(body);
+    staging::render(frame, left, app);
+    diff_view::render(frame, right, app);
+
+    render_footer(frame, footer, app);
+}
+
+fn render_header(frame: &mut Frame, area: Rect, app: &App) {
+    let theme = &app.theme;
+    let line = Line::from(vec![
+        Span::styled(
+            " strix ",
+            Style::new()
+                .fg(theme.header_fg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(app.repo_name(), Style::new().fg(theme.dim)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(line).style(Style::new().bg(theme.header_bg)),
+        area,
+    );
+}
+
+fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
+    let theme = &app.theme;
+    let key_style = Style::new()
+        .fg(theme.footer_key)
+        .add_modifier(Modifier::BOLD);
+    let label_style = Style::new().fg(theme.footer_fg);
+
+    let mut spans = Vec::new();
+    for (key, label) in [(" q ", "quit  "), (" Tab ", "switch pane  ")] {
+        spans.push(Span::styled(key, key_style));
+        spans.push(Span::styled(label, label_style));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::new().bg(theme.footer_bg)),
+        area,
+    );
+}
+
+/// A bordered panel with focus-aware border + title colours. Shared by the
+/// staging and diff panes (and future overlays) so focus styling stays
+/// consistent.
+pub fn panel_block<'a>(title: &'a str, focused: bool, theme: &Theme) -> Block<'a> {
+    let border_color = if focused {
+        theme.border_focused
+    } else {
+        theme.border
+    };
+    let title_color = if focused { theme.title } else { theme.dim };
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(border_color))
+        .title(Span::styled(
+            title,
+            Style::new().fg(title_color).add_modifier(Modifier::BOLD),
+        ))
+}
+
+/// A sub-rect of `area` that is `height` rows tall and vertically centred,
+/// spanning the full width. Used to place empty-state hints.
+pub fn vertical_center(area: Rect, height: u16) -> Rect {
+    let [rect] = Layout::vertical([Constraint::Length(height)])
+        .flex(Flex::Center)
+        .areas(area);
+    rect
+}
