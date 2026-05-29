@@ -9,6 +9,11 @@ pub struct Cli {
     /// Path to the git repository (defaults to the current directory).
     pub path: Option<PathBuf>,
 
+    /// Theme for this run: a built-in preset (tokyo-night, dark, light,
+    /// catppuccin, gruvbox) or a file in ~/.config/strix/themes/.
+    #[arg(long)]
+    pub theme: Option<String>,
+
     /// Render a single frame to stdout as text, then exit (debugging aid).
     #[arg(long)]
     pub dump_frame: bool,

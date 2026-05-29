@@ -6,13 +6,16 @@
 
 pub mod app;
 pub mod cli;
+pub mod config;
 pub mod git;
+pub mod keys;
 pub mod logging;
 pub mod terminal;
 pub mod ui;
 
-// Re-exported so consumers (and integration tests) can build input events
-// against the exact crossterm version strix renders with.
+// Re-exported so consumers (and integration tests) can build input events and
+// reference styles against the exact ratatui/crossterm version strix renders with.
+pub use ratatui;
 pub use ratatui::crossterm;
 
 use anyhow::Result;
@@ -27,7 +30,12 @@ pub fn run() -> Result<()> {
         Some(path) => path,
         None => std::env::current_dir()?,
     };
-    let app = app::App::new(repo_path)?;
+
+    let mut config = config::load();
+    if cli.theme.is_some() {
+        config.theme = cli.theme;
+    }
+    let app = app::App::with_config(repo_path, &config)?;
 
     if cli.dump_frame {
         print!("{}", terminal::dump_frame(&app, cli.width, cli.height)?);
