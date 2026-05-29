@@ -1,4 +1,5 @@
 use std::io::{self, Stdout};
+use std::time::Duration;
 
 use anyhow::Result;
 use ratatui::backend::{CrosstermBackend, TestBackend};
@@ -43,13 +44,25 @@ fn restore() -> Result<()> {
 fn event_loop(terminal: &mut Tui, app: &mut App) -> Result<()> {
     while !app.should_quit {
         terminal.draw(|frame| ui::draw(frame, app))?;
-        match event::read()? {
-            Event::Key(key) if key.kind == KeyEventKind::Press => app.on_key(key),
-            Event::Mouse(mouse) => app.on_mouse(mouse),
-            _ => {}
+        // Block for the next event, then drain everything already queued before
+        // redrawing. A mouse wheel emits a burst of scroll events; handling them
+        // one-redraw-each lets rendering fall behind the input buffer, which
+        // reads as lag and "keeps scrolling after I stop". Coalescing a burst
+        // into a single redraw keeps scrolling responsive.
+        handle_event(app, event::read()?);
+        while !app.should_quit && event::poll(Duration::ZERO)? {
+            handle_event(app, event::read()?);
         }
     }
     Ok(())
+}
+
+fn handle_event(app: &mut App, event: Event) {
+    match event {
+        Event::Key(key) if key.kind == KeyEventKind::Press => app.on_key(key),
+        Event::Mouse(mouse) => app.on_mouse(mouse),
+        _ => {}
+    }
 }
 
 /// Restore the terminal before the default panic handler prints, so a panic

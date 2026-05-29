@@ -6,9 +6,9 @@ use ratatui::Frame;
 use syntect::parsing::SyntaxReference;
 use unicode_width::UnicodeWidthChar;
 
-use crate::app::{App, DiffMode, Focus};
+use crate::app::{App, DiffMode, Focus, SbsRow};
 use crate::git::{DiffLine, FileDiff, LineKind};
-use crate::ui::syntax::{highlight_line, syntax_for};
+use crate::ui::syntax::syntax_for;
 use crate::ui::theme::Theme;
 use crate::ui::{centered_hint, panel_block};
 
@@ -71,12 +71,13 @@ fn render_unified(
         .iter()
         .skip(offset)
         .take(inner.height as usize)
-        .map(|line| unified_line(line, theme, syntax, body_width))
+        .map(|line| unified_line(app, line, theme, syntax, body_width))
         .collect();
     frame.render_widget(Paragraph::new(rows), inner);
 }
 
 fn unified_line(
+    app: &App,
     line: &DiffLine,
     theme: &Theme,
     syntax: &SyntaxReference,
@@ -98,6 +99,7 @@ fn unified_line(
         Span::styled(sign, Style::new().fg(sign_fg).bg(bg)),
     ];
     spans.extend(highlighted_content(
+        app,
         syntax,
         &theme.syntax_theme,
         &line.text,
@@ -114,7 +116,7 @@ fn render_side_by_side(
     lines: &[DiffLine],
     syntax: &SyntaxReference,
 ) {
-    let rows = side_by_side_rows(lines);
+    let rows = app.sbs_rows(lines);
     app.set_diff_metrics(inner.height, clamp_u16(rows.len()));
     let theme = &app.theme;
     let offset = app.diff_scroll.min(app.diff_max_scroll()) as usize;
@@ -126,18 +128,19 @@ fn render_side_by_side(
         .iter()
         .skip(offset)
         .take(inner.height as usize)
-        .map(|row| side_by_side_line(row, theme, syntax, left_w as usize, right_w as usize))
+        .map(|row| {
+            side_by_side_line(
+                app,
+                row,
+                lines,
+                theme,
+                syntax,
+                left_w as usize,
+                right_w as usize,
+            )
+        })
         .collect();
     frame.render_widget(Paragraph::new(out), inner);
-}
-
-/// A side-by-side row: a full-width hunk header, or an aligned old/new pair.
-enum SbsRow<'a> {
-    Hunk(&'a DiffLine),
-    Pair {
-        left: Option<&'a DiffLine>,
-        right: Option<&'a DiffLine>,
-    },
 }
 
 #[derive(Clone, Copy)]
@@ -146,69 +149,42 @@ enum Side {
     New,
 }
 
-/// Pair the unified diff lines into side-by-side rows: context lines appear on
-/// both sides; a run of deletions is zipped against the following run of
-/// additions, padding the shorter side with blanks.
-fn side_by_side_rows(lines: &[DiffLine]) -> Vec<SbsRow<'_>> {
-    let mut rows = Vec::new();
-    let mut deletions: Vec<&DiffLine> = Vec::new();
-    let mut additions: Vec<&DiffLine> = Vec::new();
-
-    for line in lines {
-        match line.kind {
-            LineKind::Deletion => deletions.push(line),
-            LineKind::Addition => additions.push(line),
-            LineKind::Context => {
-                flush_pairs(&mut rows, &mut deletions, &mut additions);
-                rows.push(SbsRow::Pair {
-                    left: Some(line),
-                    right: Some(line),
-                });
-            }
-            LineKind::Hunk => {
-                flush_pairs(&mut rows, &mut deletions, &mut additions);
-                rows.push(SbsRow::Hunk(line));
-            }
-        }
-    }
-    flush_pairs(&mut rows, &mut deletions, &mut additions);
-    rows
-}
-
-fn flush_pairs<'a>(
-    rows: &mut Vec<SbsRow<'a>>,
-    deletions: &mut Vec<&'a DiffLine>,
-    additions: &mut Vec<&'a DiffLine>,
-) {
-    for i in 0..deletions.len().max(additions.len()) {
-        rows.push(SbsRow::Pair {
-            left: deletions.get(i).copied(),
-            right: additions.get(i).copied(),
-        });
-    }
-    deletions.clear();
-    additions.clear();
-}
-
 fn side_by_side_line(
+    app: &App,
     row: &SbsRow,
+    lines: &[DiffLine],
     theme: &Theme,
     syntax: &SyntaxReference,
     left_w: usize,
     right_w: usize,
 ) -> Line<'static> {
     match row {
-        SbsRow::Hunk(line) => hunk_line(line, theme),
+        SbsRow::Hunk(i) => hunk_line(&lines[*i], theme),
         SbsRow::Pair { left, right } => {
-            let mut spans = cell(*left, Side::Old, theme, syntax, left_w);
+            let mut spans = cell(
+                app,
+                left.map(|i| &lines[i]),
+                Side::Old,
+                theme,
+                syntax,
+                left_w,
+            );
             spans.push(Span::styled("│", Style::new().fg(theme.border)));
-            spans.extend(cell(*right, Side::New, theme, syntax, right_w));
+            spans.extend(cell(
+                app,
+                right.map(|i| &lines[i]),
+                Side::New,
+                theme,
+                syntax,
+                right_w,
+            ));
             Line::from(spans)
         }
     }
 }
 
 fn cell(
+    app: &App,
     line: Option<&DiffLine>,
     side: Side,
     theme: &Theme,
@@ -230,6 +206,7 @@ fn cell(
     let gutter = format!("{} ", gutter_num(number));
     let mut spans = vec![Span::styled(gutter, Style::new().fg(theme.line_no))];
     spans.extend(highlighted_content(
+        app,
         syntax,
         &theme.syntax_theme,
         &line.text,
@@ -250,6 +227,7 @@ fn hunk_line(line: &DiffLine, theme: &Theme) -> Line<'static> {
 /// background), expanding tabs, dropping control chars, and padding to `width`
 /// so the background fills the row.
 fn highlighted_content(
+    app: &App,
     syntax: &SyntaxReference,
     theme_name: &str,
     text: &str,
@@ -259,7 +237,7 @@ fn highlighted_content(
     let clean = sanitize(text);
     let mut spans = Vec::new();
     let mut used = 0;
-    for (color, piece) in highlight_line(syntax, theme_name, &clean) {
+    for (color, piece) in app.highlight(syntax, theme_name, &clean).iter() {
         if used >= width {
             break;
         }
@@ -273,7 +251,7 @@ fn highlighted_content(
             used += ch_width;
         }
         if !chunk.is_empty() {
-            spans.push(Span::styled(chunk, Style::new().fg(color).bg(bg)));
+            spans.push(Span::styled(chunk, Style::new().fg(*color).bg(bg)));
         }
     }
     if used < width {

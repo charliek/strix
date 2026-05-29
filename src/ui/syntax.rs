@@ -49,21 +49,22 @@ pub fn syntax_for(path: &str) -> &'static SyntaxReference {
         .unwrap_or_else(|| assets.syntaxes.find_syntax_plain_text())
 }
 
-/// Highlight one line with the named theme into `(foreground colour, text)`
-/// segments. The text slices borrow `line`.
-pub fn highlight_line<'a>(
+/// Highlight one line with the named theme into owned `(foreground colour,
+/// text)` segments. Owned (not borrowed) so callers can cache the result across
+/// frames — see [`crate::app::App::highlight`].
+pub fn highlight_line(
     syntax: &SyntaxReference,
     theme_name: &str,
-    line: &'a str,
-) -> Vec<(Color, &'a str)> {
+    line: &str,
+) -> Vec<(Color, String)> {
     let assets = assets();
     let mut highlighter = HighlightLines::new(syntax, assets.theme(theme_name));
     match highlighter.highlight_line(line, &assets.syntaxes) {
         Ok(ranges) => ranges
             .into_iter()
-            .map(|(style, text)| (to_color(style.foreground), text))
+            .map(|(style, text)| (to_color(style.foreground), text.to_string()))
             .collect(),
-        Err(_) => vec![(Color::Reset, line)],
+        Err(_) => vec![(Color::Reset, line.to_string())],
     }
 }
 

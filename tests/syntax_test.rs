@@ -8,7 +8,7 @@ fn rust_line_splits_into_multiple_tokens() {
         segments.len() > 1,
         "expected multiple highlighted tokens, got {segments:?}"
     );
-    let joined: String = segments.iter().map(|(_, text)| *text).collect();
+    let joined: String = segments.iter().map(|(_, text)| text.as_str()).collect();
     assert_eq!(joined, "let x = 5;", "highlighting preserves the text");
 }
 
@@ -16,6 +16,6 @@ fn rust_line_splits_into_multiple_tokens() {
 fn unknown_extension_falls_back_to_plain_text() {
     let syntax = syntax_for("notes.unknownext");
     let segments = highlight_line(syntax, "base16-ocean.dark", "hello world");
-    let joined: String = segments.iter().map(|(_, text)| *text).collect();
+    let joined: String = segments.iter().map(|(_, text)| text.as_str()).collect();
     assert_eq!(joined, "hello world");
 }
