@@ -1,3 +1,4 @@
+pub mod diff;
 pub mod ops;
 pub mod status;
 
@@ -6,6 +7,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 
+pub use diff::{DiffLine, FileDiff, LineKind};
 pub use status::{Change, FileEntry, Section, Status};
 
 /// A git repository. Object reads (diffs, blobs) go through the in-process

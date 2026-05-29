@@ -1,8 +1,9 @@
+use std::cell::Cell;
 use std::path::PathBuf;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::git::{Change, FileEntry, Repo, Section, Status};
+use crate::git::{Change, FileDiff, FileEntry, Repo, Section, Status};
 use crate::ui::theme::Theme;
 
 /// A path-based git mutation (stage / unstage); lets the select → run → refresh
@@ -39,6 +40,15 @@ pub struct App {
     pub modal: Option<Modal>,
     pub theme: Theme,
     pub should_quit: bool,
+
+    /// Cached diff for the selected file; recomputed only when the selection
+    /// changes (see `sync_diff`).
+    pub current_diff: Option<FileDiff>,
+    diff_key: Option<(Section, String)>,
+    pub diff_scroll: u16,
+    /// Inner height of the diff pane from the last render, so scrolling can
+    /// clamp to the content. Interior-mutable because rendering takes `&App`.
+    diff_viewport: Cell<u16>,
 }
 
 impl App {
@@ -53,8 +63,13 @@ impl App {
             modal: None,
             theme: Theme::default(),
             should_quit: false,
+            current_diff: None,
+            diff_key: None,
+            diff_scroll: 0,
+            diff_viewport: Cell::new(0),
         };
         app.clamp_selection();
+        app.sync_diff();
         Ok(app)
     }
 
@@ -97,32 +112,27 @@ impl App {
             self.should_quit = true;
             return;
         }
+
         if self.modal.is_some() {
             self.on_key_modal(key);
-            return;
+        } else {
+            match key.code {
+                KeyCode::Char('q') => {
+                    self.should_quit = true;
+                    return;
+                }
+                KeyCode::Tab | KeyCode::BackTab => self.toggle_focus(),
+                KeyCode::Char('r') => self.refresh(),
+                _ => match self.focus {
+                    Focus::Staging => self.on_key_staging(key),
+                    Focus::Diff => self.on_key_diff(key),
+                },
+            }
         }
 
-        // Global keys, regardless of focus.
-        match key.code {
-            KeyCode::Char('q') => {
-                self.should_quit = true;
-                return;
-            }
-            KeyCode::Tab | KeyCode::BackTab => {
-                self.toggle_focus();
-                return;
-            }
-            KeyCode::Char('r') => {
-                self.refresh();
-                return;
-            }
-            _ => {}
-        }
-
-        match self.focus {
-            Focus::Staging => self.on_key_staging(key),
-            Focus::Diff => self.on_key_diff(key),
-        }
+        // A handled key may have moved the selection or changed status; keep the
+        // cached diff in sync.
+        self.sync_diff();
     }
 
     fn on_key_staging(&mut self, key: KeyEvent) {
@@ -143,8 +153,22 @@ impl App {
     }
 
     fn on_key_diff(&mut self, key: KeyEvent) {
-        if matches!(key.code, KeyCode::Char('h') | KeyCode::Left) {
-            self.focus = Focus::Staging;
+        let max = self.diff_max_scroll();
+        let page = (self.diff_viewport.get() / 2).max(1);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('d') if ctrl => self.diff_scroll = (self.diff_scroll + page).min(max),
+            KeyCode::Char('u') if ctrl => self.diff_scroll = self.diff_scroll.saturating_sub(page),
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.diff_scroll = (self.diff_scroll + 1).min(max)
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.diff_scroll = self.diff_scroll.saturating_sub(1)
+            }
+            KeyCode::Char('g') | KeyCode::Home => self.diff_scroll = 0,
+            KeyCode::Char('G') | KeyCode::End => self.diff_scroll = max,
+            KeyCode::Char('h') | KeyCode::Left => self.focus = Focus::Staging,
+            _ => {}
         }
     }
 
@@ -232,5 +256,39 @@ impl App {
 
     fn clamp_selection(&mut self) {
         self.selected = self.selected.min(self.status.total().saturating_sub(1));
+    }
+
+    /// Recompute the cached diff when the selected file changes, resetting scroll.
+    fn sync_diff(&mut self) {
+        let key = self
+            .selected_file()
+            .map(|(section, entry)| (section, entry.path.clone()));
+        if key == self.diff_key {
+            return;
+        }
+        let target = self
+            .selected_file()
+            .map(|(section, entry)| (section, entry.clone()));
+        let diff = target.map(|(section, entry)| self.repo.diff(section, &entry));
+        self.current_diff = diff;
+        self.diff_key = key;
+        self.diff_scroll = 0;
+    }
+
+    fn diff_len(&self) -> u16 {
+        match &self.current_diff {
+            Some(FileDiff::Text(lines)) => lines.len().try_into().unwrap_or(u16::MAX),
+            _ => 0,
+        }
+    }
+
+    /// Largest valid diff scroll offset, given the last-rendered viewport height.
+    pub fn diff_max_scroll(&self) -> u16 {
+        self.diff_len().saturating_sub(self.diff_viewport.get())
+    }
+
+    /// Record the diff pane's inner height (called while rendering).
+    pub fn set_diff_viewport(&self, height: u16) {
+        self.diff_viewport.set(height);
     }
 }
