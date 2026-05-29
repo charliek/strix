@@ -10,7 +10,8 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
     let focused = app.focus == Focus::Diff;
 
-    let title = match app.selected_file() {
+    let selected = app.selected_file();
+    let title = match selected {
         Some((_, entry)) => format!(" Diff · {} ", entry.path),
         None => " Diff ".to_string(),
     };
@@ -19,7 +20,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(block, area);
 
     // The diff itself arrives in M3; until a file is selected, show a hint.
-    if app.selected_file().is_none() {
+    if selected.is_none() {
         let hint = Paragraph::new("Select a file to view its diff")
             .style(Style::new().fg(theme.dim))
             .alignment(Alignment::Center);

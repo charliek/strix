@@ -115,6 +115,12 @@ fn change_from_code(code: char) -> Option<Change> {
     }
 }
 
+/// Number of space-separated fields before the path in each porcelain v2 record
+/// (`1` ordinary, `2` rename/copy, `u` unmerged).
+const ORDINARY_PATH_FIELDS: usize = 8;
+const RENAME_PATH_FIELDS: usize = 9;
+const UNMERGED_PATH_FIELDS: usize = 10;
+
 /// Returns the substring after `leading` space-separated tokens — the file path,
 /// which may itself contain spaces (so we must not split it further).
 fn path_after(field: &str, leading: usize) -> String {
@@ -146,7 +152,7 @@ pub fn parse(bytes: &[u8]) -> Status {
             b'#' => parse_branch_header(field, &mut status),
             b'1' => {
                 let (x, y) = xy_codes(field);
-                let path = path_after(field, 8);
+                let path = path_after(field, ORDINARY_PATH_FIELDS);
                 push_entry(&mut status, x, y, &path, None);
             }
             b'2' => {
@@ -154,7 +160,7 @@ pub fn parse(bytes: &[u8]) -> Status {
                     .next()
                     .map(|raw| String::from_utf8_lossy(raw).into_owned());
                 let (x, y) = xy_codes(field);
-                let path = path_after(field, 9);
+                let path = path_after(field, RENAME_PATH_FIELDS);
                 push_entry(&mut status, x, y, &path, orig);
             }
             b'?' => status.unstaged.push(FileEntry::new(
@@ -163,7 +169,7 @@ pub fn parse(bytes: &[u8]) -> Status {
                 Change::Untracked,
             )),
             b'u' => {
-                let path = path_after(field, 10);
+                let path = path_after(field, UNMERGED_PATH_FIELDS);
                 status
                     .unstaged
                     .push(FileEntry::new(path, None, Change::Conflicted));

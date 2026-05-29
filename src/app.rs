@@ -107,7 +107,9 @@ impl App {
             KeyCode::Char('j') | KeyCode::Down => self.select_next(),
             KeyCode::Char('k') | KeyCode::Up => self.select_prev(),
             KeyCode::Char('g') | KeyCode::Home => self.selected = 0,
-            KeyCode::Char('G') | KeyCode::End => self.selected = last_index(self.status.total()),
+            KeyCode::Char('G') | KeyCode::End => {
+                self.selected = self.status.total().saturating_sub(1)
+            }
             KeyCode::Char('l') | KeyCode::Right => self.focus = Focus::Diff,
             _ => {}
         }
@@ -127,7 +129,7 @@ impl App {
     }
 
     fn select_next(&mut self) {
-        self.selected = (self.selected + 1).min(last_index(self.status.total()));
+        self.selected = (self.selected + 1).min(self.status.total().saturating_sub(1));
     }
 
     fn select_prev(&mut self) {
@@ -135,11 +137,6 @@ impl App {
     }
 
     fn clamp_selection(&mut self) {
-        self.selected = self.selected.min(last_index(self.status.total()));
+        self.selected = self.selected.min(self.status.total().saturating_sub(1));
     }
-}
-
-/// The largest valid selection index for `total` files (0 when empty).
-fn last_index(total: usize) -> usize {
-    total.saturating_sub(1)
 }

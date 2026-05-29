@@ -42,8 +42,15 @@ A single binary crate, split into a library (`src/lib.rs`) and a thin binary
 
 ## Git integration
 
-- **Reads** (status, refs, blob contents) use **gix** (gitoxide) — pure-Rust, no
-  subprocess on the hot path. This is the spec's primary choice.
+- **Object reads** (blob contents for diffs, refs, discovery) use **gix**
+  (gitoxide) — pure-Rust, no subprocess on the diff hot path. This is the spec's
+  primary choice and keeps per-file diff reads in-process.
+- **Status** is read via `git status --porcelain=v2 --branch -z` and parsed in
+  `git/status.rs`. gix *can* compute status, but its iterator API (threads +
+  intricate change enums) is far less ergonomic than the stable porcelain
+  format; the CLI read runs once per refresh, not on the hot path. This is the
+  spec-sanctioned CLI fallback, applied where gix's ergonomics (not capability)
+  fall short.
 - **Diffs** are computed in-process with the **`similar`** crate over the HEAD /
   index / worktree blob bytes, producing a structured model that drives both
   unified and side-by-side rendering.
