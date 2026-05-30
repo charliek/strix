@@ -22,10 +22,13 @@ type Tui = Terminal<CrosstermBackend<Stdout>>;
 /// reports motion while a button is down, so this is requested separately.
 const ENABLE_MOUSE_MOTION: &str = "\x1b[?1003h";
 const DISABLE_MOUSE_MOTION: &str = "\x1b[?1003l";
-/// OSC 22: request a mouse pointer shape by CSS cursor name. Supported by
-/// kitty, WezTerm, Alacritty, Ghostty, …; silently ignored elsewhere. An empty
-/// name resets to the terminal default.
-const POINTER_COL_RESIZE: &str = "\x1b]22;col-resize\x1b\\";
+/// OSC 22: request a mouse pointer shape by CSS cursor name; an empty name
+/// resets to the default. Supported by kitty, WezTerm, Alacritty, Ghostty, …;
+/// silently ignored elsewhere (e.g. iTerm2). We use `pointer` (the hand) rather
+/// than the more literal `col-resize`/`ew-resize`: it's the "grabbable" cue we
+/// want, and it's one of the few shapes Ghostty honours on macOS (which ignores
+/// the resize shapes), so it works on the widest set of terminals.
+const POINTER_GRAB: &str = "\x1b]22;pointer\x1b\\";
 const POINTER_DEFAULT: &str = "\x1b]22;\x1b\\";
 
 /// Set up the terminal, run the event loop, and restore the terminal on the way
@@ -50,7 +53,7 @@ fn setup() -> Result<Tui> {
 fn restore() -> Result<()> {
     let mut stdout = io::stdout();
     // Undo the motion request and any custom pointer shape before leaving, so
-    // the terminal isn't left reporting movement or showing a resize cursor.
+    // the terminal isn't left reporting movement or showing a grab cursor.
     write!(stdout, "{POINTER_DEFAULT}{DISABLE_MOUSE_MOTION}")?;
     execute!(stdout, LeaveAlternateScreen, DisableMouseCapture)?;
     disable_raw_mode()?;
@@ -59,7 +62,7 @@ fn restore() -> Result<()> {
 
 fn event_loop(terminal: &mut Tui, app: &mut App) -> Result<()> {
     terminal.draw(|frame| ui::draw(frame, app))?;
-    let mut resize_pointer = false;
+    let mut grab_pointer = false;
     while !app.should_quit {
         // Only redraw when an event changed something visible. Motion events
         // (from mouse tracking) flood in, so most produce no change.
@@ -80,21 +83,17 @@ fn event_loop(terminal: &mut Tui, app: &mut App) -> Result<()> {
         }
         // Mirror the hover/drag state in the OS pointer where the terminal
         // supports it, emitting the escape only on change.
-        if app.divider_engaged() != resize_pointer {
-            resize_pointer = !resize_pointer;
-            set_pointer(resize_pointer)?;
+        if app.divider_engaged() != grab_pointer {
+            grab_pointer = !grab_pointer;
+            set_pointer(grab_pointer)?;
         }
     }
     Ok(())
 }
 
-/// Request the split-bar resize pointer (or reset to the default) via OSC 22.
-fn set_pointer(col_resize: bool) -> Result<()> {
-    let seq = if col_resize {
-        POINTER_COL_RESIZE
-    } else {
-        POINTER_DEFAULT
-    };
+/// Request the split-bar grab pointer (or reset to the default) via OSC 22.
+fn set_pointer(grab: bool) -> Result<()> {
+    let seq = if grab { POINTER_GRAB } else { POINTER_DEFAULT };
     let mut stdout = io::stdout();
     stdout.write_all(seq.as_bytes())?;
     stdout.flush()?;
