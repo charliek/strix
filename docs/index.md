@@ -32,7 +32,7 @@ themes that match a modern editor.
 
 ## Get started
 
-- [Installation](getting-started/installation.md) — build from source
+- [Installation](getting-started/installation.md) — Homebrew, apt, or build from source
 - [Usage](getting-started/usage.md) — the two-pane workflow
 - [Keybindings](getting-started/keybindings.md) — the full key map
 - [Theming](guides/theming.md) and [Configuration](guides/configuration.md)

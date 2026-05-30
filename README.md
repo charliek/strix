@@ -26,16 +26,28 @@ on [ratatui](https://github.com/ratatui/ratatui),
 > **Status:** active development toward the MVP. See
 > [`docs/spec.md`](docs/spec.md) for scope.
 
-## Build from source
+## Installation
 
-strix needs Rust 1.96.0 (pinned in `rust-toolchain.toml`; `mise install` or
-rustup will install it automatically).
+### macOS (Homebrew)
 
 ```bash
-git clone https://github.com/charliek/strix
-cd strix
-cargo build --release      # → target/release/strix
+brew install charliek/tap/strix
 ```
+
+### Linux (apt)
+
+```bash
+sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://apt.stridelabs.ai/pubkey.gpg | \
+  sudo tee /etc/apt/keyrings/apt-charliek.gpg > /dev/null
+echo 'deb [signed-by=/etc/apt/keyrings/apt-charliek.gpg] https://apt.stridelabs.ai noble main' | \
+  sudo tee /etc/apt/sources.list.d/apt-charliek.list
+sudo apt update && sudo apt install strix
+```
+
+Direct `.deb` downloads and building from source are in the
+[installation guide](docs/getting-started/installation.md). strix shells out to
+`git`, so it needs `git` on your `PATH`.
 
 ## Usage
 
