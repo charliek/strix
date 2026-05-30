@@ -41,8 +41,18 @@ impl Repo {
     }
 
     /// Read the staged / unstaged / untracked file lists and current branch.
+    ///
+    /// `--no-optional-locks` keeps this read from refreshing/rewriting
+    /// `.git/index`, which would otherwise trip the auto-refresh file watcher
+    /// and loop (status → index write → watch event → status …).
     pub fn status(&self) -> Result<Status> {
-        let stdout = self.run(&["status", "--porcelain=v2", "--branch", "-z"])?;
+        let stdout = self.run(&[
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v2",
+            "--branch",
+            "-z",
+        ])?;
         Ok(status::parse(&stdout))
     }
 

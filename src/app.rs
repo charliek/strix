@@ -106,6 +106,10 @@ pub struct App {
     /// changes (see `sync_diff`).
     pub current_diff: Option<FileDiff>,
     diff_key: Option<(Section, String)>,
+    /// Set when an external refresh should recompute the open file's diff even
+    /// though its `(section, path)` is unchanged (its content may have changed).
+    /// Unlike navigating to a new file, this preserves the scroll position.
+    diff_dirty: bool,
     pub diff_mode: DiffMode,
     pub diff_scroll: u16,
     /// Inner height + total content rows of the diff pane from the last render,
@@ -162,6 +166,7 @@ impl App {
             last_error: None,
             current_diff: None,
             diff_key: None,
+            diff_dirty: false,
             diff_mode: config.diff_mode(),
             diff_scroll: 0,
             diff_viewport: Cell::new(0),
@@ -214,9 +219,10 @@ impl App {
                     Some(index) => self.selected = index,
                     None => self.clamp_selection(),
                 }
-                // Drop the diff key so `sync_diff` recomputes instead of
-                // short-circuiting on an unchanged (section, path).
-                self.diff_key = None;
+                // The open file's content may have changed in place; mark the
+                // diff dirty so `sync_diff` recomputes it (but, unlike a file
+                // change, keeps the scroll position).
+                self.diff_dirty = true;
             }
             Err(err) => tracing::warn!("status refresh failed: {err:#}"),
         }
@@ -404,10 +410,15 @@ impl App {
     }
 
     fn scroll_diff(&mut self, down: bool, step: u16) {
+        // Clamp to the current content first: a same-file refresh may have shrunk
+        // the diff below the preserved offset, and scrolling up must not stay
+        // stuck past the new end (metrics are fresh here, post-render).
+        let max = self.diff_max_scroll();
+        let current = self.diff_scroll.min(max);
         self.diff_scroll = if down {
-            (self.diff_scroll + step).min(self.diff_max_scroll())
+            (current + step).min(max)
         } else {
-            self.diff_scroll.saturating_sub(step)
+            current.saturating_sub(step)
         };
     }
 
@@ -550,24 +561,38 @@ impl App {
         }
     }
 
-    /// Recompute the cached diff when the selected file changes, resetting scroll.
+    /// Recompute the cached diff when the selected file changes, or when an
+    /// external refresh marked it dirty. Navigating to a different file resets
+    /// the scroll; a same-file content refresh keeps it.
     fn sync_diff(&mut self) {
         let key = self
             .selected_file()
             .map(|(section, entry)| (section, entry.path.clone()));
-        if key == self.diff_key {
+        let file_changed = key != self.diff_key;
+        if !file_changed && !self.diff_dirty {
             return;
         }
+        self.diff_dirty = false;
         // Compute into a local first so the immutable borrow of the file list
         // (and repo) is released before assigning the cached fields.
         let diff = self
             .selected_file()
             .map(|(section, entry)| self.repo.diff(section, entry));
+        // A same-file refresh that produced an identical diff is a no-op: keep
+        // the warm highlight / SBS caches and the scroll untouched, so a watcher
+        // firing on unrelated activity doesn't churn or disturb the view.
+        if !file_changed && diff == self.current_diff {
+            return;
+        }
         self.current_diff = diff;
         self.diff_key = key;
-        self.diff_scroll = 0;
+        if file_changed {
+            // Only a different file starts at the top; refreshing the open file
+            // in place must not yank the view back up while the user scrolls.
+            self.diff_scroll = 0;
+        }
         // The cached highlights / side-by-side layout describe the previous
-        // file; drop them so the new diff is recomputed lazily on next render.
+        // diff; drop them so the new one is recomputed lazily on next render.
         self.highlight_cache.borrow_mut().clear();
         *self.sbs_rows.borrow_mut() = None;
     }

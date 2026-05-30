@@ -1,8 +1,10 @@
 mod common;
 
 use common::{git, init_repo, write};
-use strix::app::App;
+use strix::app::{App, Focus};
+use strix::crossterm::event::{KeyCode, KeyEvent};
 use strix::git::FileDiff;
+use strix::terminal::dump_frame;
 
 /// The current diff's text joined into one string, for content assertions.
 fn diff_text(app: &App) -> String {
@@ -64,5 +66,41 @@ fn refresh_keeps_the_cursor_on_the_same_file_when_the_list_shifts() {
         app.selected_file().map(|(_, e)| e.path.clone()).as_deref(),
         Some("m.txt"),
         "the cursor follows the file by path, not by index"
+    );
+}
+
+#[test]
+fn reload_keeps_the_scroll_position_for_the_same_file() {
+    let repo = init_repo();
+    let path = repo.path();
+    let lines: String = (0..40).map(|i| format!("line {i}\n")).collect();
+    write(path, "big.txt", &lines);
+    git(path, &["add", "big.txt"]);
+    git(path, &["commit", "-q", "-m", "add big"]);
+    // Modify every line so the diff is taller than the viewport.
+    let edited: String = (0..40).map(|i| format!("line {i} edited\n")).collect();
+    write(path, "big.txt", &edited);
+
+    let mut app = App::new(path.to_path_buf()).expect("app");
+    app.focus = Focus::Diff;
+    // Render once to record the diff viewport, so scrolling can advance.
+    let _ = dump_frame(&app, 80, 24).expect("dump_frame");
+    for _ in 0..5 {
+        app.on_key(KeyEvent::from(KeyCode::Char('j')));
+    }
+    let scrolled = app.diff_scroll;
+    assert!(scrolled > 0, "scrolled down into the diff");
+
+    // An external in-place edit (as the watcher would trigger) reloads the same
+    // file — the scroll must not jump back to the top.
+    let edited_again: String = (0..40)
+        .map(|i| format!("line {i} edited again\n"))
+        .collect();
+    write(path, "big.txt", &edited_again);
+    app.reload();
+
+    assert_eq!(
+        app.diff_scroll, scrolled,
+        "reloading the open file keeps the scroll position"
     );
 }

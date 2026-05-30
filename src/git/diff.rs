@@ -20,7 +20,7 @@ pub enum LineKind {
 }
 
 /// One rendered diff row: a context/added/removed line, or a `@@` hunk header.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiffLine {
     pub kind: LineKind,
     pub old_no: Option<usize>,
@@ -28,7 +28,7 @@ pub struct DiffLine {
     pub text: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FileDiff {
     Text(Vec<DiffLine>),
     Binary,
