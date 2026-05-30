@@ -58,6 +58,9 @@ pub struct App {
     /// Index into the flattened file list (staged entries first, then unstaged).
     pub selected: usize,
     pub focus: Focus,
+    /// Whether the left Changes panel is visible. When hidden, the diff pane
+    /// fills the body and focus is forced to the diff (see `toggle_changes`).
+    pub show_changes: bool,
     pub modal: Option<Modal>,
     pub theme: Theme,
     pub should_quit: bool,
@@ -103,6 +106,7 @@ impl App {
             status,
             selected: 0,
             focus: Focus::Staging,
+            show_changes: true,
             modal: None,
             theme,
             should_quit: false,
@@ -183,9 +187,17 @@ impl App {
             Action::Quit => self.should_quit = true,
             Action::Help => self.modal = Some(Modal::Help),
             Action::Refresh => self.refresh(),
-            Action::SwitchPane => self.toggle_focus(),
+            Action::SwitchPane => {
+                if self.show_changes {
+                    self.toggle_focus();
+                } else {
+                    self.reveal_changes(); // Tab reveals a hidden panel and lands in it.
+                }
+            }
             Action::ToggleDiffMode => self.toggle_diff_mode(),
-            Action::FocusStaging => self.focus = Focus::Staging,
+            Action::ToggleChanges => self.toggle_changes(),
+            // Focusing a hidden panel reveals it first.
+            Action::FocusStaging => self.reveal_changes(),
             Action::FocusDiff => self.focus = Focus::Diff,
             Action::Down => match self.focus {
                 Focus::Staging => self.select_next(),
@@ -369,6 +381,24 @@ impl App {
             Focus::Staging => Focus::Diff,
             Focus::Diff => Focus::Staging,
         };
+    }
+
+    fn toggle_changes(&mut self) {
+        if self.show_changes {
+            // Hiding forces focus to the Diff, the only visible pane — this is
+            // the "hidden ⇒ focus Diff" invariant.
+            self.show_changes = false;
+            self.focus = Focus::Diff;
+        } else {
+            self.reveal_changes();
+        }
+    }
+
+    /// Reveal the Changes panel and focus it — the single home for the reveal
+    /// semantics shared by the toggle key, Tab, and `h` when the panel is hidden.
+    fn reveal_changes(&mut self) {
+        self.show_changes = true;
+        self.focus = Focus::Staging;
     }
 
     fn select_next(&mut self) {

@@ -65,3 +65,76 @@ fn jk_moves_selection() {
     app.on_key(KeyEvent::from(KeyCode::Char('k')));
     assert_eq!(app.selected, 0);
 }
+
+#[test]
+fn b_toggles_changes_panel_and_focus() {
+    let (_repo, mut app) = app_with_changes();
+    assert!(app.show_changes, "Changes panel visible by default");
+    assert_eq!(app.focus, Focus::Staging);
+
+    // Hide: focus is forced to the diff (the only visible pane).
+    app.on_key(KeyEvent::from(KeyCode::Char('b')));
+    assert!(!app.show_changes);
+    assert_eq!(app.focus, Focus::Diff);
+
+    // Show again: re-showing focuses the Changes panel.
+    app.on_key(KeyEvent::from(KeyCode::Char('b')));
+    assert!(app.show_changes);
+    assert_eq!(app.focus, Focus::Staging);
+}
+
+#[test]
+fn tab_reveals_a_hidden_changes_panel() {
+    let (_repo, mut app) = app_with_changes();
+    app.on_key(KeyEvent::from(KeyCode::Char('b'))); // hide
+    assert!(!app.show_changes);
+
+    app.on_key(KeyEvent::from(KeyCode::Tab));
+    assert!(app.show_changes, "Tab reveals the hidden panel");
+    assert_eq!(app.focus, Focus::Staging, "and lands in it");
+}
+
+#[test]
+fn focusing_staging_reveals_a_hidden_changes_panel() {
+    let (_repo, mut app) = app_with_changes();
+    app.on_key(KeyEvent::from(KeyCode::Char('b'))); // hide
+    assert!(!app.show_changes);
+
+    app.on_key(KeyEvent::from(KeyCode::Char('h'))); // FocusStaging
+    assert!(
+        app.show_changes,
+        "focusing staging reveals the hidden panel"
+    );
+    assert_eq!(app.focus, Focus::Staging);
+}
+
+#[test]
+fn b_hides_changes_so_diff_fills_the_width() {
+    let (_repo, mut app) = app_with_changes();
+
+    // Shown by default: the Diff title sits to the right of the Changes panel.
+    let shown = dump_frame(&app, 100, 30).expect("dump_frame");
+    assert!(shown.contains("Changes"), "Changes panel shown by default");
+    let shown_top = shown.lines().nth(1).expect("body top border");
+    let shown_diff_col = shown_top.find("Diff").expect("Diff title shown");
+    assert!(
+        shown_diff_col > 20,
+        "Diff title starts past the Changes panel when shown (col {shown_diff_col})"
+    );
+
+    // After `b`: Changes gone, and the Diff border opens at column 0 and runs to
+    // the last column — it owns the whole body width.
+    app.on_key(KeyEvent::from(KeyCode::Char('b')));
+    let hidden = dump_frame(&app, 100, 30).expect("dump_frame");
+    assert!(!hidden.contains("Changes"), "Changes panel hidden after b");
+    let hidden_top = hidden.lines().nth(1).expect("body top border");
+    assert!(
+        hidden_top.starts_with('╭') && hidden_top.ends_with('╮'),
+        "Diff border spans the full width: {hidden_top:?}"
+    );
+    let hidden_diff_col = hidden_top.find("Diff").expect("Diff title hidden");
+    assert!(
+        hidden_diff_col < 8,
+        "Diff title now sits at the left edge (col {hidden_diff_col})"
+    );
+}

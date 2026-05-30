@@ -33,10 +33,18 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     render_header(frame, header, app);
 
-    let [left, right] =
-        Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)]).areas(body);
-    staging::render(frame, left, app);
-    diff_view::render(frame, right, app);
+    if app.show_changes {
+        let [left, right] =
+            Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)])
+                .areas(body);
+        staging::render(frame, left, app);
+        diff_view::render(frame, right, app);
+    } else {
+        // Clear the stale staging rect so mouse hit-testing (`pane_at`) can't
+        // match where the panel used to be; give the whole body to the diff.
+        app.set_staging_area(Rect::default());
+        diff_view::render(frame, body, app);
+    }
 
     render_footer(frame, footer, app);
 
@@ -91,11 +99,18 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         .add_modifier(Modifier::BOLD);
     let label_style = Style::new().fg(theme.footer_fg);
 
+    // The toggle's label tracks what the key will do next.
+    let changes_label = if app.show_changes {
+        "hide  "
+    } else {
+        "changes  "
+    };
     let mut spans = Vec::new();
     for (key, label) in [
         (" j/k ", "move  "),
         (" space ", "stage  "),
         (" d ", "split  "),
+        (" b ", changes_label),
         (" ? ", "help  "),
         (" q ", "quit"),
     ] {

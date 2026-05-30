@@ -11,6 +11,7 @@ These are the defaults. Every binding is remappable — see
 | `?`            | Toggle the help overlay                 |
 | `r`            | Refresh status from disk                |
 | `Tab`          | Switch focus between Changes and Diff   |
+| `b`            | Show / hide the Changes panel           |
 | `Esc`          | Close an overlay / cancel a dialog      |
 
 ## Changes pane
