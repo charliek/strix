@@ -22,14 +22,14 @@ type Tui = Terminal<CrosstermBackend<Stdout>>;
 /// reports motion while a button is down, so this is requested separately.
 const ENABLE_MOUSE_MOTION: &str = "\x1b[?1003h";
 const DISABLE_MOUSE_MOTION: &str = "\x1b[?1003l";
-/// OSC 22: request a mouse pointer shape by CSS cursor name; an empty name
-/// resets to the default. Supported by kitty, WezTerm, Alacritty, Ghostty, …;
-/// silently ignored elsewhere (e.g. iTerm2). We use `pointer` (the hand) rather
-/// than the more literal `col-resize`/`ew-resize`: it's the "grabbable" cue we
-/// want, and it's one of the few shapes Ghostty honours on macOS (which ignores
-/// the resize shapes), so it works on the widest set of terminals.
+/// OSC 22: request a mouse pointer shape by CSS cursor name. Supported by
+/// kitty, WezTerm, Alacritty, Ghostty, …; silently ignored elsewhere (e.g.
+/// iTerm2). We use `pointer` (the hand) over the more literal `col-resize`: it's
+/// the "grabbable" cue we want and one of the few shapes Ghostty honours on
+/// macOS. The reset uses the explicit `default` name, not the empty-name form —
+/// Ghostty doesn't act on the latter, so the cursor would otherwise stick.
 const POINTER_GRAB: &str = "\x1b]22;pointer\x1b\\";
-const POINTER_DEFAULT: &str = "\x1b]22;\x1b\\";
+const POINTER_DEFAULT: &str = "\x1b]22;default\x1b\\";
 
 /// Set up the terminal, run the event loop, and restore the terminal on the way
 /// out (including on panic, via the installed hook).
