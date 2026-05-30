@@ -10,6 +10,10 @@ theme = "tokyo-night"
 
 # Default diff mode: "unified" or "side-by-side"
 diff_mode = "unified"
+
+# Auto-refresh: update the view live as the working tree / git state change.
+# On by default; set false to disable the file watcher and refresh only with `r`.
+auto_refresh = true
 ```
 
 ## Keybindings

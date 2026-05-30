@@ -1,4 +1,5 @@
 use std::io::{self, Stdout, Write};
+use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -31,13 +32,16 @@ const DISABLE_MOUSE_MOTION: &str = "\x1b[?1003l";
 /// Ghostty doesn't act on the latter, so the cursor would otherwise stick.
 const POINTER_GRAB: &str = "\x1b]22;pointer\x1b\\";
 const POINTER_DEFAULT: &str = "\x1b]22;default\x1b\\";
+/// How long the loop blocks for input before checking the file-watcher channel,
+/// when a watcher is active. Bounds the latency to notice a filesystem change.
+const POLL_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Set up the terminal, run the event loop, and restore the terminal on the way
 /// out (including on panic, via the installed hook).
-pub fn run(mut app: App) -> Result<()> {
+pub fn run(mut app: App, watch_rx: Option<Receiver<()>>) -> Result<()> {
     install_panic_hook();
     let mut terminal = setup()?;
-    let result = event_loop(&mut terminal, &mut app);
+    let result = event_loop(&mut terminal, &mut app, watch_rx);
     restore()?;
     result
 }
@@ -61,19 +65,37 @@ fn restore() -> Result<()> {
     Ok(())
 }
 
-fn event_loop(terminal: &mut Tui, app: &mut App) -> Result<()> {
+fn event_loop(terminal: &mut Tui, app: &mut App, watch_rx: Option<Receiver<()>>) -> Result<()> {
     terminal.draw(|frame| ui::draw(frame, app))?;
     let mut grab_pointer = false;
     while !app.should_quit {
-        // Block for one event, then drain everything already queued before
-        // redrawing. A mouse wheel emits a burst of scroll events; one redraw
-        // per event lets rendering fall behind the input buffer ("keeps
-        // scrolling after I stop"), so coalesce the burst into a single redraw.
-        // And redraw only when an event actually changed something visible —
-        // mouse-motion events flood in but mostly leave the frame unchanged.
-        let mut redraw = handle_event(app, event::read()?);
-        while !app.should_quit && event::poll(Duration::ZERO)? {
+        let mut redraw = false;
+        // With a watcher active, wake periodically so the change channel gets
+        // polled; without one, block until the next input event (no idle
+        // wakeups). Then drain any already-queued input so a burst (e.g. a
+        // wheel spin) collapses into one redraw, redrawing only when an event
+        // changed something visible — motion events flood in but mostly don't.
+        let has_input = match &watch_rx {
+            Some(_) => event::poll(POLL_TIMEOUT)?,
+            None => true,
+        };
+        if has_input {
             redraw |= handle_event(app, event::read()?);
+            while !app.should_quit && event::poll(Duration::ZERO)? {
+                redraw |= handle_event(app, event::read()?);
+            }
+        }
+        // A settled filesystem change refreshes status + the open diff once,
+        // draining any extra queued signals into the same reload.
+        if let Some(rx) = &watch_rx {
+            let mut changed = false;
+            while rx.try_recv().is_ok() {
+                changed = true;
+            }
+            if changed {
+                app.reload();
+                redraw = true;
+            }
         }
         if app.should_quit {
             break;

@@ -202,15 +202,31 @@ impl App {
         }
     }
 
-    /// Re-read status from disk, keeping the selection in bounds.
+    /// Re-read status from disk, keeping the cursor on the same file (matched by
+    /// section and path) when it survives, and forcing the open diff to
+    /// recompute — its content may have changed in place even if its path did not.
     pub fn refresh(&mut self) {
+        let previous = self.selected_section_path();
         match self.repo.status() {
             Ok(status) => {
                 self.status = status;
-                self.clamp_selection();
+                match previous.and_then(|(section, path)| self.index_of(section, &path)) {
+                    Some(index) => self.selected = index,
+                    None => self.clamp_selection(),
+                }
+                // Drop the diff key so `sync_diff` recomputes instead of
+                // short-circuiting on an unchanged (section, path).
+                self.diff_key = None;
             }
             Err(err) => tracing::warn!("status refresh failed: {err:#}"),
         }
+    }
+
+    /// Re-read status and recompute the diff in one step. Used by the file
+    /// watcher, whose path has no trailing `sync_diff` like `on_key`/`on_mouse`.
+    pub fn reload(&mut self) {
+        self.refresh();
+        self.sync_diff();
     }
 
     pub fn on_key(&mut self, key: KeyEvent) {
@@ -513,6 +529,25 @@ impl App {
 
     fn clamp_selection(&mut self) {
         self.selected = self.selected.min(self.status.total().saturating_sub(1));
+    }
+
+    /// The flattened selection index of `path`, preferring `section` but falling
+    /// back to the other one (a file can move between staged/unstaged); `None`
+    /// if it's no longer listed. Mirrors the staged-first order of `selected_file`.
+    fn index_of(&self, section: Section, path: &str) -> Option<usize> {
+        let staged = &self.status.staged;
+        let in_staged = || staged.iter().position(|e| e.path == path);
+        let in_unstaged = || {
+            self.status
+                .unstaged
+                .iter()
+                .position(|e| e.path == path)
+                .map(|i| staged.len() + i)
+        };
+        match section {
+            Section::Staged => in_staged().or_else(in_unstaged),
+            Section::Unstaged => in_unstaged().or_else(in_staged),
+        }
     }
 
     /// Recompute the cached diff when the selected file changes, resetting scroll.

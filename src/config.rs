@@ -18,6 +18,9 @@ pub struct Config {
     pub diff_mode: Option<String>,
     /// Keybinding overrides: action name → list of key chords.
     pub keys: Option<HashMap<String, Vec<String>>>,
+    /// Auto-refresh on filesystem / git changes (a background watcher). On by
+    /// default; set `false` to disable the watcher and refresh only with `r`.
+    pub auto_refresh: Option<bool>,
 }
 
 impl Config {
@@ -26,6 +29,10 @@ impl Config {
             Some("side-by-side") | Some("sidebyside") | Some("split") => DiffMode::SideBySide,
             _ => DiffMode::Unified,
         }
+    }
+
+    pub fn auto_refresh(&self) -> bool {
+        self.auto_refresh.unwrap_or(true)
     }
 }
 

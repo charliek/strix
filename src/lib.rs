@@ -13,6 +13,7 @@ pub mod logging;
 pub mod terminal;
 pub mod ui;
 pub mod util;
+pub mod watch;
 
 // Re-exported so consumers (and integration tests) can build input events and
 // reference styles against the exact ratatui/crossterm version strix renders with.
@@ -41,5 +42,19 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
 
-    terminal::run(app)
+    // Watch the true working-tree root (not a possibly-subdir CLI path) so every
+    // change is caught. A watcher that fails to start degrades to manual refresh.
+    let watch_rx = if config.auto_refresh() {
+        match watch::spawn(app.repo.workdir().to_path_buf()) {
+            Ok(rx) => Some(rx),
+            Err(err) => {
+                tracing::warn!("file watcher failed to start: {err:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    terminal::run(app, watch_rx)
 }
