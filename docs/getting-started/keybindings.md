@@ -45,4 +45,5 @@ These are the defaults. Every binding is remappable — see
 | Click a file                  | Select it (and show its diff)       |
 | Click a file's status marker  | Toggle stage / unstage              |
 | Click a pane                  | Focus that pane                     |
+| Drag the split bar            | Resize the Changes / Diff panes     |
 | Scroll wheel                  | Scroll the pane under the cursor    |

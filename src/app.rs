@@ -21,6 +21,13 @@ type GitOp = fn(&Repo, &str) -> anyhow::Result<()>;
 const MARKER_ZONE: u16 = 4;
 /// Lines scrolled per mouse-wheel notch in the diff pane.
 const SCROLL_STEP: u16 = 3;
+/// Default width (columns) of the Changes panel. It is a fixed width, not a
+/// percentage, so widening the terminal grows the diff rather than this panel.
+const DEFAULT_CHANGES_WIDTH: u16 = 32;
+/// Minimum columns each pane keeps when the split bar is dragged, so neither
+/// the Changes list nor the diff can be collapsed to nothing.
+const MIN_CHANGES_WIDTH: u16 = 16;
+const MIN_DIFF_WIDTH: u16 = 24;
 
 /// Which pane currently receives keyboard input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,6 +68,11 @@ pub struct App {
     /// Whether the left Changes panel is visible. When hidden, the diff pane
     /// fills the body and focus is forced to the diff (see `toggle_changes`).
     pub show_changes: bool,
+    /// Width (columns) of the Changes panel, adjusted by dragging the split bar.
+    /// Fixed rather than proportional, so a wider terminal feeds the diff.
+    pub changes_width: u16,
+    /// True while the split bar is held with the left mouse button.
+    dragging_divider: bool,
     pub modal: Option<Modal>,
     pub theme: Theme,
     pub should_quit: bool,
@@ -85,6 +97,10 @@ pub struct App {
     staging_state: RefCell<ListState>,
     staging_area: Cell<Rect>,
     diff_area: Cell<Rect>,
+    /// Body rect and split-bar column from the last render, for hit-testing a
+    /// drag on the divider. Recorded during rendering, like the pane rects.
+    body_area: Cell<Rect>,
+    divider_x: Cell<u16>,
 
     keymap: Keymap,
 }
@@ -107,6 +123,8 @@ impl App {
             selected: 0,
             focus: Focus::Staging,
             show_changes: true,
+            changes_width: DEFAULT_CHANGES_WIDTH,
+            dragging_divider: false,
             modal: None,
             theme,
             should_quit: false,
@@ -120,6 +138,8 @@ impl App {
             staging_state: RefCell::new(ListState::default()),
             staging_area: Cell::new(Rect::default()),
             diff_area: Cell::new(Rect::default()),
+            body_area: Cell::new(Rect::default()),
+            divider_x: Cell::new(0),
             keymap: Keymap::from_config(config.keys.as_ref()),
         };
         app.clamp_selection();
@@ -240,7 +260,18 @@ impl App {
             y: event.row,
         };
         match event.kind {
-            MouseEventKind::Down(MouseButton::Left) => self.on_click(pos),
+            MouseEventKind::Down(MouseButton::Left) => {
+                // Grabbing the split bar starts a resize instead of a pane click.
+                if self.on_divider(pos) {
+                    self.dragging_divider = true;
+                } else {
+                    self.on_click(pos);
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.dragging_divider => {
+                self.resize_changes(pos)
+            }
+            MouseEventKind::Up(MouseButton::Left) => self.dragging_divider = false,
             MouseEventKind::ScrollDown => self.on_scroll(pos, true),
             MouseEventKind::ScrollUp => self.on_scroll(pos, false),
             _ => {}
@@ -274,6 +305,26 @@ impl App {
             }
             None => {}
         }
+    }
+
+    /// Whether a position lands on the split bar — its two border columns —
+    /// while the Changes panel is shown.
+    fn on_divider(&self, pos: Position) -> bool {
+        if !self.show_changes {
+            return false;
+        }
+        let body = self.body_area.get();
+        let dx = self.divider_x.get();
+        let on_body_row = pos.y >= body.y && pos.y < body.y.saturating_add(body.height);
+        on_body_row && (pos.x == dx || pos.x.saturating_add(1) == dx)
+    }
+
+    /// Move the split bar so the Changes panel's right edge follows the cursor,
+    /// clamped so both panes keep a usable width.
+    fn resize_changes(&mut self, pos: Position) {
+        let body = self.body_area.get();
+        self.changes_width = pos.x.saturating_sub(body.x);
+        self.changes_width = self.changes_pane_width(body.width);
     }
 
     fn on_scroll(&mut self, pos: Position, down: bool) {
@@ -458,6 +509,23 @@ impl App {
 
     pub fn set_diff_area(&self, area: Rect) {
         self.diff_area.set(area);
+    }
+
+    /// Record the body rect and split-bar column for this frame, so a drag on
+    /// the divider can be hit-tested against where it was actually drawn.
+    pub fn set_split_geometry(&self, body: Rect, divider_x: u16) {
+        self.body_area.set(body);
+        self.divider_x.set(divider_x);
+    }
+
+    /// The Changes panel width clamped to a usable range for the given body
+    /// width, keeping a minimum for both panes. Shared by the layout and the
+    /// drag handler so they can't disagree on the split.
+    pub fn changes_pane_width(&self, body_width: u16) -> u16 {
+        let max = body_width
+            .saturating_sub(MIN_DIFF_WIDTH)
+            .max(MIN_CHANGES_WIDTH);
+        self.changes_width.clamp(MIN_CHANGES_WIDTH, max)
     }
 
     pub fn staging_area(&self) -> Rect {

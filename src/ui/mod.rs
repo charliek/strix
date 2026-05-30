@@ -34,11 +34,15 @@ pub fn draw(frame: &mut Frame, app: &App) {
     render_header(frame, header, app);
 
     if app.show_changes {
+        // The Changes panel is a fixed width; the diff takes the rest, so a
+        // wider terminal feeds the diff. Drag the split bar to resize (see
+        // `App::resize_changes`).
+        let width = app.changes_pane_width(body.width);
         let [left, right] =
-            Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)])
-                .areas(body);
+            Layout::horizontal([Constraint::Length(width), Constraint::Min(0)]).areas(body);
         staging::render(frame, left, app);
         diff_view::render(frame, right, app);
+        app.set_split_geometry(body, right.x);
     } else {
         // Clear the stale staging rect so mouse hit-testing (`pane_at`) can't
         // match where the panel used to be; give the whole body to the diff.

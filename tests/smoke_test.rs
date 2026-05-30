@@ -2,8 +2,20 @@ mod common;
 
 use common::{git, init_repo, write};
 use strix::app::{App, Focus};
-use strix::crossterm::event::{KeyCode, KeyEvent};
+use strix::crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use strix::terminal::dump_frame;
+
+/// A left-button mouse event at `(x, y)` of the given kind.
+fn mouse(kind: MouseEventKind, x: u16, y: u16) -> MouseEvent {
+    MouseEvent {
+        kind,
+        column: x,
+        row: y,
+        modifiers: KeyModifiers::NONE,
+    }
+}
 
 fn app_with_changes() -> (tempfile::TempDir, App) {
     let repo = init_repo();
@@ -136,5 +148,70 @@ fn b_hides_changes_so_diff_fills_the_width() {
     assert!(
         hidden_diff_col < 8,
         "Diff title now sits at the left edge (col {hidden_diff_col})"
+    );
+}
+
+#[test]
+fn dragging_the_split_bar_resizes_the_changes_panel() {
+    let (_repo, mut app) = app_with_changes();
+    // Render once so the split geometry (body + divider column) is recorded.
+    let _ = dump_frame(&app, 100, 30).expect("dump_frame");
+    let divider = app.diff_area().x - 1; // the diff's left border = the split bar
+
+    // Grab the bar and drag it right: the Changes panel widens to the cursor.
+    app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), divider, 5));
+    app.on_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 50, 5));
+    assert_eq!(app.changes_width, 50);
+
+    // The next frame reflects it: the divider follows the drag.
+    let _ = dump_frame(&app, 100, 30).expect("dump_frame");
+    assert_eq!(app.diff_area().x - 1, 50, "divider follows the drag");
+}
+
+#[test]
+fn split_bar_drag_clamps_to_usable_widths() {
+    let (_repo, mut app) = app_with_changes();
+    let _ = dump_frame(&app, 100, 30).expect("dump_frame");
+    let divider = app.diff_area().x - 1;
+
+    // Drag far left: clamped so the Changes panel keeps its minimum (16).
+    app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), divider, 5));
+    app.on_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 1, 5));
+    assert_eq!(app.changes_width, 16);
+
+    // Drag far right: clamped so the diff keeps its minimum (100 - 24 = 76).
+    app.on_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 99, 5));
+    assert_eq!(app.changes_width, 76);
+}
+
+#[test]
+fn split_bar_stops_resizing_after_mouse_up() {
+    let (_repo, mut app) = app_with_changes();
+    let _ = dump_frame(&app, 100, 30).expect("dump_frame");
+    let divider = app.diff_area().x - 1;
+    let start = app.changes_width;
+
+    app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), divider, 5));
+    app.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), divider, 5));
+    // A drag after release is not a resize — the bar was let go.
+    app.on_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 60, 5));
+    assert_eq!(app.changes_width, start);
+}
+
+#[test]
+fn grabbing_the_split_bar_leaves_selection_and_focus_untouched() {
+    let (_repo, mut app) = app_with_changes();
+    let _ = dump_frame(&app, 100, 30).expect("dump_frame");
+    let divider = app.diff_area().x - 1;
+
+    app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), divider, 5));
+    assert_eq!(
+        app.selected, 0,
+        "grabbing the bar doesn't move the selection"
+    );
+    assert_eq!(
+        app.focus,
+        Focus::Staging,
+        "grabbing the bar doesn't refocus"
     );
 }
