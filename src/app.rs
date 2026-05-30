@@ -73,6 +73,9 @@ pub struct App {
     pub changes_width: u16,
     /// True while the split bar is held with the left mouse button.
     dragging_divider: bool,
+    /// True while the mouse hovers the split bar (free movement, no button),
+    /// used to highlight it and request a resize cursor.
+    hovering_divider: bool,
     pub modal: Option<Modal>,
     pub theme: Theme,
     pub should_quit: bool,
@@ -125,6 +128,7 @@ impl App {
             show_changes: true,
             changes_width: DEFAULT_CHANGES_WIDTH,
             dragging_divider: false,
+            hovering_divider: false,
             modal: None,
             theme,
             should_quit: false,
@@ -249,16 +253,27 @@ impl App {
         (self.diff_viewport.get() / 2).max(1)
     }
 
-    pub fn on_mouse(&mut self, event: MouseEvent) {
+    /// Handle a mouse event; returns whether the frame should be redrawn.
+    pub fn on_mouse(&mut self, event: MouseEvent) -> bool {
         // A modal captures all input, including the mouse.
         if self.modal.is_some() {
-            return;
+            return false;
         }
-        self.last_error = None;
         let pos = Position {
             x: event.column,
             y: event.row,
         };
+
+        // Free movement (no button held) only updates the hover affordance: it
+        // must not clear the error toast or recompute the diff, and it redraws
+        // only when the highlighted state actually changes.
+        if let MouseEventKind::Moved = event.kind {
+            let was = self.hovering_divider;
+            self.hovering_divider = self.on_divider(pos);
+            return self.hovering_divider != was;
+        }
+
+        self.last_error = None;
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 // Grabbing the split bar starts a resize instead of a pane click.
@@ -277,6 +292,7 @@ impl App {
             _ => {}
         }
         self.sync_diff();
+        true
     }
 
     /// Which pane (if any) a screen position falls in.
@@ -317,6 +333,12 @@ impl App {
         let dx = self.divider_x.get();
         let on_body_row = pos.y >= body.y && pos.y < body.y.saturating_add(body.height);
         on_body_row && (pos.x == dx || pos.x.saturating_add(1) == dx)
+    }
+
+    /// Whether the split bar should show its active affordance (highlight +
+    /// resize pointer): the mouse hovers it, or a drag is in progress.
+    pub fn divider_engaged(&self) -> bool {
+        self.hovering_divider || self.dragging_divider
     }
 
     /// Move the split bar so the Changes panel's right edge follows the cursor,

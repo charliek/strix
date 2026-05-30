@@ -215,3 +215,44 @@ fn grabbing_the_split_bar_leaves_selection_and_focus_untouched() {
         "grabbing the bar doesn't refocus"
     );
 }
+
+#[test]
+fn hovering_the_split_bar_engages_the_resize_affordance() {
+    let (_repo, mut app) = app_with_changes();
+    let _ = dump_frame(&app, 100, 30).expect("dump_frame");
+    let divider = app.diff_area().x - 1;
+
+    assert!(!app.divider_engaged(), "idle: not engaged");
+
+    // Hover onto the bar: engages, and asks for a redraw.
+    let redraw = app.on_mouse(mouse(MouseEventKind::Moved, divider, 5));
+    assert!(app.divider_engaged(), "hover engages the affordance");
+    assert!(redraw, "the state change asks for a redraw");
+
+    // Moving while still on the bar changes nothing visible — no redraw.
+    let redraw = app.on_mouse(mouse(MouseEventKind::Moved, divider, 6));
+    assert!(app.divider_engaged());
+    assert!(!redraw, "no redraw while still hovering the bar");
+
+    // Move off the bar: disengages, and asks for a redraw.
+    let redraw = app.on_mouse(mouse(MouseEventKind::Moved, divider + 10, 5));
+    assert!(!app.divider_engaged(), "moving away disengages");
+    assert!(redraw, "leaving the bar asks for a redraw");
+}
+
+#[test]
+fn dragging_keeps_the_divider_engaged_off_the_bar() {
+    let (_repo, mut app) = app_with_changes();
+    let _ = dump_frame(&app, 100, 30).expect("dump_frame");
+    let divider = app.diff_area().x - 1;
+
+    app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), divider, 5));
+    app.on_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 70, 5));
+    assert!(
+        app.divider_engaged(),
+        "still engaged mid-drag, cursor off the bar"
+    );
+
+    app.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 70, 5));
+    assert!(!app.divider_engaged(), "releasing ends the engagement");
+}

@@ -43,6 +43,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
         staging::render(frame, left, app);
         diff_view::render(frame, right, app);
         app.set_split_geometry(body, right.x);
+        if app.divider_engaged() {
+            highlight_divider(frame, body, right.x, theme);
+        }
     } else {
         // Clear the stale staging rect so mouse hit-testing (`pane_at`) can't
         // match where the panel used to be; give the whole body to the diff.
@@ -54,6 +57,23 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     // Overlays draw last, on top of everything.
     modal::render(frame, app);
+}
+
+/// Tint the split bar — the two adjacent pane borders at `divider_x` — with the
+/// focus accent, so it reads as draggable while hovered or being dragged.
+fn highlight_divider(frame: &mut Frame, body: Rect, divider_x: u16, theme: &Theme) {
+    let style = Style::new()
+        .fg(theme.border_focused)
+        .add_modifier(Modifier::BOLD);
+    let buf = frame.buffer_mut();
+    let bottom = body.y.saturating_add(body.height);
+    for y in body.y..bottom {
+        for x in [divider_x.saturating_sub(1), divider_x] {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_style(style);
+            }
+        }
+    }
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
