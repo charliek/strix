@@ -1,14 +1,18 @@
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, Ref, RefCell};
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::{Position, Rect};
+use ratatui::style::Color;
 use ratatui::widgets::ListState;
+use syntect::parsing::SyntaxReference;
 
 use crate::config::Config;
-use crate::git::{Change, FileDiff, FileEntry, Repo, Section, Status};
+use crate::git::{Change, DiffLine, FileDiff, FileEntry, LineKind, Repo, Section, Status};
 use crate::keys::{Action, Keymap};
 use crate::ui::theme::Theme;
 
@@ -41,6 +45,22 @@ pub enum Focus {
 pub enum DiffMode {
     Unified,
     SideBySide,
+}
+
+/// One syntax-highlighted line: `(foreground colour, text)` segments, shared
+/// (`Rc`) so the per-file cache can hand out cheap clones each frame.
+type HighlightedLine = Rc<[(Color, String)]>;
+
+/// A side-by-side row, referencing diff lines by index into the file's
+/// `Vec<DiffLine>`. Indices (not borrows) let the row layout be computed once
+/// per file and cached on `App` without a self-referential borrow.
+#[derive(Clone, Copy)]
+pub enum SbsRow {
+    Hunk(usize),
+    Pair {
+        left: Option<usize>,
+        right: Option<usize>,
+    },
 }
 
 /// A blocking overlay that captures input until dismissed.
@@ -93,6 +113,13 @@ pub struct App {
     /// because rendering takes `&App`.
     diff_viewport: Cell<u16>,
     diff_content_rows: Cell<u16>,
+    /// Per-file caches that make scrolling cheap: syntax-highlighted lines keyed
+    /// by their (sanitised) text, and the side-by-side row layout. Both are
+    /// cleared whenever `sync_diff` recomputes `current_diff`, so they never
+    /// outlive the file they describe. Interior-mutable because rendering, which
+    /// fills them, takes `&App`.
+    highlight_cache: RefCell<HashMap<String, HighlightedLine>>,
+    sbs_rows: RefCell<Option<Vec<SbsRow>>>,
 
     /// Persisted so the staging list's scroll offset survives between frames
     /// and can be read for mouse hit-testing. The pane rects are recorded
@@ -139,6 +166,8 @@ impl App {
             diff_scroll: 0,
             diff_viewport: Cell::new(0),
             diff_content_rows: Cell::new(0),
+            highlight_cache: RefCell::new(HashMap::new()),
+            sbs_rows: RefCell::new(None),
             staging_state: RefCell::new(ListState::default()),
             staging_area: Cell::new(Rect::default()),
             diff_area: Cell::new(Rect::default()),
@@ -502,6 +531,43 @@ impl App {
         self.current_diff = diff;
         self.diff_key = key;
         self.diff_scroll = 0;
+        // The cached highlights / side-by-side layout describe the previous
+        // file; drop them so the new diff is recomputed lazily on next render.
+        self.highlight_cache.borrow_mut().clear();
+        *self.sbs_rows.borrow_mut() = None;
+    }
+
+    /// Syntax-highlight one already-sanitised line, memoised per file so
+    /// scrolling reuses the result instead of re-parsing through syntect on
+    /// every frame. Single-line highlighting carries no cross-line state (see
+    /// `ui::syntax`), so the line text is a sound key; the cache is cleared when
+    /// the selected file changes (`sync_diff`).
+    pub fn highlight(
+        &self,
+        syntax: &SyntaxReference,
+        theme_name: &str,
+        text: &str,
+    ) -> HighlightedLine {
+        if let Some(hit) = self.highlight_cache.borrow().get(text) {
+            return Rc::clone(hit);
+        }
+        let computed: HighlightedLine =
+            crate::ui::syntax::highlight_line(syntax, theme_name, text).into();
+        self.highlight_cache
+            .borrow_mut()
+            .insert(text.to_string(), Rc::clone(&computed));
+        computed
+    }
+
+    /// The side-by-side row layout for the current diff, computed once per file
+    /// and cached. Rows reference `lines` by index.
+    pub fn sbs_rows(&self, lines: &[DiffLine]) -> Ref<'_, Vec<SbsRow>> {
+        if self.sbs_rows.borrow().is_none() {
+            *self.sbs_rows.borrow_mut() = Some(side_by_side_rows(lines));
+        }
+        Ref::map(self.sbs_rows.borrow(), |cached| {
+            cached.as_ref().expect("filled above")
+        })
     }
 
     /// Largest valid diff scroll offset, from the last render's content rows
@@ -565,4 +631,44 @@ impl App {
         };
         self.diff_scroll = 0;
     }
+}
+
+/// Pair the unified diff lines into side-by-side rows (by index): context lines
+/// appear on both sides; a run of deletions is zipped against the following run
+/// of additions, padding the shorter side with blanks.
+fn side_by_side_rows(lines: &[DiffLine]) -> Vec<SbsRow> {
+    let mut rows = Vec::new();
+    let mut deletions: Vec<usize> = Vec::new();
+    let mut additions: Vec<usize> = Vec::new();
+
+    for (i, line) in lines.iter().enumerate() {
+        match line.kind {
+            LineKind::Deletion => deletions.push(i),
+            LineKind::Addition => additions.push(i),
+            LineKind::Context => {
+                flush_pairs(&mut rows, &mut deletions, &mut additions);
+                rows.push(SbsRow::Pair {
+                    left: Some(i),
+                    right: Some(i),
+                });
+            }
+            LineKind::Hunk => {
+                flush_pairs(&mut rows, &mut deletions, &mut additions);
+                rows.push(SbsRow::Hunk(i));
+            }
+        }
+    }
+    flush_pairs(&mut rows, &mut deletions, &mut additions);
+    rows
+}
+
+fn flush_pairs(rows: &mut Vec<SbsRow>, deletions: &mut Vec<usize>, additions: &mut Vec<usize>) {
+    for i in 0..deletions.len().max(additions.len()) {
+        rows.push(SbsRow::Pair {
+            left: deletions.get(i).copied(),
+            right: additions.get(i).copied(),
+        });
+    }
+    deletions.clear();
+    additions.clear();
 }

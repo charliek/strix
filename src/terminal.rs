@@ -1,4 +1,5 @@
 use std::io::{self, Stdout, Write};
+use std::time::Duration;
 
 use anyhow::Result;
 use ratatui::backend::{CrosstermBackend, TestBackend};
@@ -64,17 +65,16 @@ fn event_loop(terminal: &mut Tui, app: &mut App) -> Result<()> {
     terminal.draw(|frame| ui::draw(frame, app))?;
     let mut grab_pointer = false;
     while !app.should_quit {
-        // Only redraw when an event changed something visible. Motion events
-        // (from mouse tracking) flood in, so most produce no change.
-        let redraw = match event::read()? {
-            Event::Key(key) if key.kind == KeyEventKind::Press => {
-                app.on_key(key);
-                true
-            }
-            Event::Mouse(mouse) => app.on_mouse(mouse),
-            Event::Resize(_, _) => true,
-            _ => false,
-        };
+        // Block for one event, then drain everything already queued before
+        // redrawing. A mouse wheel emits a burst of scroll events; one redraw
+        // per event lets rendering fall behind the input buffer ("keeps
+        // scrolling after I stop"), so coalesce the burst into a single redraw.
+        // And redraw only when an event actually changed something visible —
+        // mouse-motion events flood in but mostly leave the frame unchanged.
+        let mut redraw = handle_event(app, event::read()?);
+        while !app.should_quit && event::poll(Duration::ZERO)? {
+            redraw |= handle_event(app, event::read()?);
+        }
         if app.should_quit {
             break;
         }
@@ -89,6 +89,19 @@ fn event_loop(terminal: &mut Tui, app: &mut App) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Handle one input event; returns whether the frame needs redrawing.
+fn handle_event(app: &mut App, event: Event) -> bool {
+    match event {
+        Event::Key(key) if key.kind == KeyEventKind::Press => {
+            app.on_key(key);
+            true
+        }
+        Event::Mouse(mouse) => app.on_mouse(mouse),
+        Event::Resize(_, _) => true,
+        _ => false,
+    }
 }
 
 /// Request the split-bar grab pointer (or reset to the default) via OSC 22.
