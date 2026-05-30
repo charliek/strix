@@ -1,6 +1,9 @@
 [package]
 name = "strix"
-version = "0.1.0"
+# 0.0.0 is a pre-release sentinel: strix has never published a release, and the
+# release-workflows flow needs the version-bump commit to be a real change. The
+# first `/release-workflows:release v0.0.1` moves this to 0.0.1.
+version = "0.0.0"
 edition = "2021"
 rust-version = "1.96"
 description = "A focused, polished TUI for staging changes and viewing diffs"
@@ -8,6 +11,17 @@ license = "MIT"
 repository = "https://github.com/charliek/strix"
 authors = ["Charlie Knudsen"]
 default-run = "strix"
+
+# Debian packaging (cargo-deb). strix shells out to `git` at runtime (status +
+# stage/unstage/reset, see src/git/ops.rs), so the package declares a hard
+# dependency on it. `revision = ""` drops the default `-1` so the artifact is
+# `strix_<version>_<arch>.deb`, matching the apt-charliek glob and README snippet.
+[package.metadata.deb]
+maintainer = "Charlie Knudsen <charlie.knudsen@gmail.com>"
+depends = "$auto, git"
+section = "utils"
+priority = "optional"
+revision = ""
 
 [dependencies]
 # TUI

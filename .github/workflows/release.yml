@@ -1,0 +1,296 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+# Serialize re-runs against the same tag — better to wait than to abort
+# half-uploaded artifacts.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+
+  # ─── assert the tag matches Cargo.toml ───
+  version-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Assert tag matches Cargo.toml
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          tag_ver="${tag#v}"
+          base_ver="${tag_ver%%-*}"   # strip any -rc1/-beta suffix
+          manifest_ver="$(grep -E '^version[[:space:]]*=' Cargo.toml | head -1 \
+            | sed -E 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')"
+          echo "tag=${tag} (base ${base_ver})  manifest version=${manifest_ver}"
+          if [ "${base_ver}" != "${manifest_ver}" ]; then
+            echo "::error::tag ${tag} does not match Cargo.toml version ${manifest_ver}. The release skill should bump the manifest before tagging — re-run /release-workflows:release if this looks wrong."
+            exit 1
+          fi
+
+  # ─── refuse to publish a release whose code didn't pass CI ───
+  ci-gate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: read
+    steps:
+      - name: Require ci-success green on the tagged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # 45 minutes. Releases aren't time-sensitive; better to wait than to
+          # fail on a slow runner.
+          deadline=$(( SECONDS + 2700 ))
+          while :; do
+            latest="$(gh api \
+              "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/check-runs?check_name=ci-success" \
+              --jq '.check_runs | sort_by(.started_at) | last')"
+            status="$(echo "${latest}" | jq -r '.status // "missing"')"
+            conclusion="$(echo "${latest}" | jq -r '.conclusion // ""')"
+            echo "ci-success @ ${GITHUB_SHA}: status=${status} conclusion=${conclusion}"
+            if [ "${status}" = "completed" ]; then
+              [ "${conclusion}" = "success" ] && { echo "CI green — releasing."; exit 0; }
+              echo "::error::ci-success concluded '${conclusion}' for ${GITHUB_SHA} — not releasing."
+              exit 1
+            fi
+            if [ "${SECONDS}" -ge "${deadline}" ]; then
+              echo "::error::timed out waiting for ci-success on ${GITHUB_SHA} (status=${status}). Push the commit to main and let CI finish before tagging."
+              exit 1
+            fi
+            sleep 20
+          done
+
+  # ─── extract the CHANGELOG section and create the GitHub Release ───
+  create-release:
+    needs: [version-check, ci-gate]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Create (or reuse) the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          pre=""
+          case "${tag}" in *-*) pre="--prerelease";; esac
+          notes="$(awk -v tag="${tag}" '
+            $1=="##" && $2==tag {flag=1; next}
+            /^## v/ {if(flag) exit}
+            flag {print}
+          ' CHANGELOG.md || true)"
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            echo "Release ${tag} already exists — reusing."
+            exit 0
+          fi
+          if [ -n "${notes}" ]; then
+            printf '%s\n' "${notes}" | gh release create "${tag}" --title "${tag}" --notes-file - ${pre}
+          else
+            gh release create "${tag}" --title "${tag}" --generate-notes ${pre}
+          fi
+
+  # ─── build each target on a native runner; upload tarballs + .debs ───
+  build:
+    needs: create-release
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Both macOS targets build on the Apple-Silicon runner: strix is pure
+          # Rust (no C deps), so x86_64 cross-compiles cleanly and we avoid the
+          # retired macos-13 Intel runner.
+          - { runner: macos-latest,     os: darwin, arch: amd64, target: x86_64-apple-darwin }
+          - { runner: macos-latest,     os: darwin, arch: arm64, target: aarch64-apple-darwin }
+          - { runner: ubuntu-24.04,     os: linux,  arch: amd64, target: x86_64-unknown-linux-gnu,  deb: true }
+          - { runner: ubuntu-24.04-arm, os: linux,  arch: arm64, target: aarch64-unknown-linux-gnu, deb: true }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain (channel from rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Package tarball
+        run: tar -C "target/${{ matrix.target }}/release" -czf "strix_${{ matrix.os }}_${{ matrix.arch }}.tar.gz" strix
+
+      - name: Install cargo-deb
+        if: ${{ matrix.deb }}
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
+
+      - name: Build .deb
+        if: ${{ matrix.deb }}
+        run: cargo deb --no-build --target ${{ matrix.target }}
+
+      - name: Upload assets to the Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=( "strix_${{ matrix.os }}_${{ matrix.arch }}.tar.gz" )
+          for d in "target/${{ matrix.target }}/debian/"strix_*.deb; do
+            assets+=( "$d" )
+          done
+          gh release upload "${GITHUB_REF_NAME}" "${assets[@]}" --clobber
+
+  # ─── render + push Formula/strix.rb to charliek/homebrew-tap ───
+  # Uses a release-bot App token scoped to homebrew-tap (no PAT). The formula's
+  # sha256s depend on built bytes, so this is a post-build CI step, not part of
+  # update-version.sh.
+  homebrew:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Skip if the release-bot App is not configured
+        id: guard
+        env:
+          APP_ID: ${{ secrets.RELEASE_BOT_APP_ID }}
+        run: |
+          if [ -z "${APP_ID}" ]; then
+            echo "::warning::RELEASE_BOT_APP_ID not set — skipping Homebrew formula update."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Mint a homebrew-tap token
+        if: steps.guard.outputs.skip == 'false'
+        id: tap
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_APP_KEY }}
+          owner: charliek
+          repositories: homebrew-tap
+
+      - name: Render and push the formula
+        if: steps.guard.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ steps.tap.outputs.token }}
+          TAP_TOKEN: ${{ steps.tap.outputs.token }}
+          BOT_SLUG: ${{ steps.tap.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          ver="${tag#v}"
+
+          # Pull the four release tarballs and hash them. strix is a public repo,
+          # so the assets download over plain HTTPS — no token needed here (the
+          # tap token in GH_TOKEN is scoped to homebrew-tap, not strix).
+          dl="$(mktemp -d)"
+          for triple in darwin_amd64 darwin_arm64 linux_amd64 linux_arm64; do
+            curl -fsSL -o "${dl}/strix_${triple}.tar.gz" \
+              "https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/strix_${triple}.tar.gz"
+          done
+          sha() { shasum -a 256 "${dl}/strix_$1.tar.gz" | awk '{print $1}'; }
+
+          # Render the formula from the in-repo template.
+          rendered="$(mktemp)"
+          sed -e "s|@VERSION@|${ver}|g" \
+              -e "s|@TAG@|${tag}|g" \
+              -e "s|@SHA_DARWIN_AMD64@|$(sha darwin_amd64)|g" \
+              -e "s|@SHA_DARWIN_ARM64@|$(sha darwin_arm64)|g" \
+              -e "s|@SHA_LINUX_AMD64@|$(sha linux_amd64)|g" \
+              -e "s|@SHA_LINUX_ARM64@|$(sha linux_arm64)|g" \
+              scripts/release/strix.rb.tmpl > "${rendered}"
+
+          # Push it to the tap.
+          work="$(mktemp -d)"
+          git clone --depth 1 "https://x-access-token:${TAP_TOKEN}@github.com/charliek/homebrew-tap.git" "${work}"
+          mkdir -p "${work}/Formula"
+          cp "${rendered}" "${work}/Formula/strix.rb"
+
+          cd "${work}"
+          # Bot committer identity per the actions/create-github-app-token recipe:
+          # app-slug from the action output + the bot's numeric id from the public
+          # /users endpoint (installation tokens can't call /user).
+          bot_id="$(gh api "/users/${BOT_SLUG}[bot]" --jq '.id')"
+          git config user.name "${BOT_SLUG}[bot]"
+          git config user.email "${bot_id}+${BOT_SLUG}[bot]@users.noreply.github.com"
+          git add Formula/strix.rb
+          if git diff --cached --quiet; then
+            echo "Formula/strix.rb unchanged — nothing to push."
+          else
+            git commit -m "strix: ${tag}"
+            git push origin HEAD:main
+            echo "::notice::Pushed Formula/strix.rb ${tag} to charliek/homebrew-tap."
+          fi
+
+  # ─── notify charliek/apt-charliek to republish its package index ───
+  # Uses a release-bot App token scoped to apt-charliek (no PAT). The
+  # repository_dispatch endpoint needs Contents:write, which the App has.
+  apt-dispatch:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Decide whether to dispatch
+        id: guard
+        env:
+          APP_ID: ${{ secrets.RELEASE_BOT_APP_ID }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          case "${tag}" in
+            *-*)
+              echo "::notice::${tag} is a prerelease — skipping apt-charliek dispatch."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+          if [ -z "${APP_ID}" ]; then
+            echo "::warning::RELEASE_BOT_APP_ID not set — skipping dispatch. apt-charliek can self-heal on its next scheduled re-scan."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Mint an apt-charliek token
+        if: steps.guard.outputs.skip == 'false'
+        id: apt
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_APP_KEY }}
+          owner: charliek
+          repositories: apt-charliek
+
+      - name: Dispatch apt-charliek publish
+        if: steps.guard.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ steps.apt.outputs.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          gh api repos/charliek/apt-charliek/dispatches --method POST \
+            -f event_type=publish \
+            -F "client_payload[package]=strix" \
+            -F "client_payload[tag]=${tag}"
+          echo "::notice::Dispatched apt-charliek publish for strix ${tag}."

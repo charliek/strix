@@ -1,0 +1,78 @@
+name: sanity-check-app
+
+# Manually-triggered verification that the release-bot GitHub App is wired into
+# the three repos strix's release.yml touches: strix itself, charliek/homebrew-tap
+# (formula push), and charliek/apt-charliek (publish dispatch). Run from the
+# Actions UI → "Run workflow" after setting the RELEASE_BOT_APP_* secrets and
+# installing the App on all three repos.
+#
+# Each step mints a short-lived installation token scoped to one repo and calls a
+# read-only endpoint. A failure to mint (or 404) means the App is not installed
+# on that repo — fix that before the first real release.
+
+on:
+  workflow_dispatch: {}
+
+permissions: {}   # this workflow needs nothing from the workflow token
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      # ── 1. strix itself ──
+      - id: self-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_APP_KEY }}
+
+      - name: Token sees strix + bot identity
+        env:
+          GH_TOKEN: ${{ steps.self-token.outputs.token }}
+          BOT_SLUG: ${{ steps.self-token.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          echo "::group::This repo (must print ${{ github.repository }})"
+          gh api "/repos/${GITHUB_REPOSITORY}" --jq '.full_name'
+          echo "::endgroup::"
+          # Note: installation tokens can't call /user; the App identity comes
+          # from the action's app-slug output instead.
+          echo "::group::Bot identity (app-slug should end with -release-bot or similar)"
+          echo "${BOT_SLUG}[bot]"
+          echo "::endgroup::"
+
+      # ── 2. charliek/homebrew-tap (formula push target) ──
+      - id: tap-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_APP_KEY }}
+          owner: charliek
+          repositories: homebrew-tap
+
+      - name: Token can reach homebrew-tap
+        env:
+          GH_TOKEN: ${{ steps.tap-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          echo "::group::homebrew-tap (must print charliek/homebrew-tap)"
+          gh api "/repos/charliek/homebrew-tap" --jq '.full_name'
+          echo "::endgroup::"
+
+      # ── 3. charliek/apt-charliek (publish dispatch target) ──
+      - id: apt-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_APP_KEY }}
+          owner: charliek
+          repositories: apt-charliek
+
+      - name: Token can reach apt-charliek
+        env:
+          GH_TOKEN: ${{ steps.apt-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          echo "::group::apt-charliek (must print charliek/apt-charliek)"
+          gh api "/repos/charliek/apt-charliek" --jq '.full_name'
+          echo "::endgroup::"
