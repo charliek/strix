@@ -28,6 +28,8 @@ themes that match a modern editor.
 - Mouse support: click to select, click to stage, scroll diffs
 - Customizable keybindings
 - File-level reset with confirmation
+- Toggleable **History view** with a colored branch/merge rail graph and
+  commit-vs-parent diffs (press `i`)
 - Fast: pure-Rust git reads via gitoxide, cached diff rendering
 
 ## Get started

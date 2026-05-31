@@ -49,13 +49,18 @@ A two-pane layout inspired by Cursor's source control view:
 
 ## Future Phases
 
-### Phase 2: History view
+### Phase 2: History view — *shipped*
 
-A separate view (toggleable, not crammed into the main layout) for browsing commit history:
+A separate view (toggleable, not crammed into the main layout) for browsing
+commit history. Press `i` (or `2`) to enter; `Esc` or `1` returns to staging.
 
-- Commit list with author, date, message
-- Drill into a commit to see file changes
-- Reuse the same diff viewer component
+- Commit log of the current branch (HEAD ancestry, including merges), drawn
+  with a colored Unicode branch/merge rail graph
+- Drill into a commit to see its changed files; commit row shows full details
+- Reuses the same diff viewer for commit-vs-first-parent file diffs
+
+Possible follow-ups: multi-tip walk (all branches), rename tracking on the
+file list, and incremental graph layout on load-more.
 
 ### Phase 3: File browser
 

@@ -24,10 +24,11 @@ assertions.
 
 | Module        | Responsibility                                                    |
 |---------------|-------------------------------------------------------------------|
-| `app`         | State + input dispatch (`on_key`, `on_mouse`).                     |
+| `app`         | State + input dispatch (`on_key`, `on_mouse`); per-view dispatch. |
 | `terminal`    | Setup/teardown, event loop, panic-safe restore, `dump_frame`.     |
 | `ui`          | Rendering: layout, the two panes, theme, syntax highlighting.     |
-| `git`         | Repository access: status, diffs, mutations.                      |
+| `git`         | Repository access: status, history, diffs, mutations.             |
+| `graph`       | Pure rail-graph lane layout for the history view.                 |
 | `config`      | Config + theme loading; keybinding/mouse dispatch tables.         |
 
 ## Git layer
@@ -36,8 +37,10 @@ assertions.
 |-------------------------------|--------------------------------------------------------|
 | Status (staged/unstaged/untracked) | [gix](https://github.com/GitoxideLabs/gitoxide) — pure-Rust reads. |
 | Blob contents (HEAD / index / worktree) | gix object database + the working tree.        |
+| Commit walk + refs (history view) | gix `rev_walk` from HEAD (full DAG), commit objects decoded only. |
+| Per-commit changed files      | `git diff-tree -z --name-status` (parsed in `git/history.rs`).  |
 | Diff computation              | [`similar`](https://github.com/mitsuhiko/similar) over blob bytes, producing structured hunks. |
-| Stage / unstage / reset       | Shell out to `git` (`add`, `restore --staged`, `restore`). |
+| Stage / unstage / reset       | Shell out to `git` (`add`, `restore --staged`, `restore`).      |
 
 Reads stay on the pure-Rust path for speed; the three mutations shell out to
 `git`, which the [spec](../spec.md) explicitly sanctions as a fallback — it is
@@ -52,6 +55,26 @@ drives both unified rendering (a single column) and side-by-side rendering (old
 on the left, new on the right, with blank padding to keep the two columns
 aligned). Syntax highlighting is layered on top: syntect tokenizes the file
 content, and the token colours are composited with the add/delete backgrounds.
+
+The history view feeds the *same* `FileDiff` model from a different source — a
+commit blob and its first-parent blob, looked up by revspec — so the diff pane
+serves both views unchanged. The right pane swaps between that diff and a
+`git show`-style commit-details paragraph based on the selection.
+
+## History view
+
+The history view is a toggleable second view (`i` / `1` / `2`) alongside the
+status view. `app::ViewMode` selects which is active and splits input dispatch
+(`dispatch_status` / `dispatch_history`); the diff pane and its caches are
+shared via an `active_diff()` indirection. The left column splits into the
+selected commit's file list and a commit-graph log, separated by a draggable
+horizontal divider that mirrors the existing vertical one.
+
+The rail graph is a **pure** transform (`src/graph.rs`): an ordered commit list
+plus refs in, one render row per commit out, assigning each commit a lane and
+emitting Unicode rail glyphs (`● │ ╮ ╯ ╭ ╰ ─`) connecting it to its parents.
+The walk is bounded (500 commits per page, decode-only) and tree/blob reads
+happen lazily for the selected commit only.
 
 ## Performance
 

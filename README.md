@@ -61,6 +61,10 @@ strix path/to/repo # open a specific repository
 - **Right pane** — a syntax-highlighted diff of the selected file, in unified or
   side-by-side mode.
 
+Press `i` for the **History view**: a branch/merge rail graph of the current
+branch on the left, commit details or file diffs (vs the commit's first parent)
+on the right. `Esc` or `i` returns to staging.
+
 See the [keybindings](docs/getting-started/keybindings.md) for the full set.
 
 ## Documentation
