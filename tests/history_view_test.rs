@@ -41,7 +41,7 @@ fn history_app() -> App {
 
 #[test]
 fn y_enters_history_view() {
-    let mut app = history_app();
+    let (_repo, mut app) = history_app();
     app.on_key(key('y'));
     assert_eq!(app.view, ViewMode::History);
     let out = dump(&app);
@@ -51,7 +51,7 @@ fn y_enters_history_view() {
 
 #[test]
 fn esc_exits_to_status() {
-    let mut app = history_app();
+    let (_repo, mut app) = history_app();
     app.on_key(key('y'));
     assert_eq!(app.view, ViewMode::History);
     app.on_key(esc());
@@ -62,7 +62,7 @@ fn esc_exits_to_status() {
 
 #[test]
 fn number_keys_switch_views() {
-    let mut app = history_app();
+    let (_repo, mut app) = history_app();
     app.on_key(key('2'));
     assert_eq!(app.view, ViewMode::History);
     app.on_key(key('1'));
@@ -71,7 +71,7 @@ fn number_keys_switch_views() {
 
 #[test]
 fn commit_row_shows_details() {
-    let mut app = history_app();
+    let (_repo, mut app) = history_app();
     app.on_key(key('y'));
     // Defaults to the commit row, so the right pane shows details.
     assert!(app.history_shows_details());
@@ -85,7 +85,7 @@ fn commit_row_shows_details() {
 
 #[test]
 fn selecting_a_file_shows_its_diff() {
-    let mut app = history_app();
+    let (_repo, mut app) = history_app();
     app.on_key(key('y'));
     // Render once so the graph/committed geometry is recorded.
     let _ = dump(&app);
@@ -111,7 +111,7 @@ fn selecting_a_file_shows_its_diff() {
 
 #[test]
 fn selecting_a_graph_commit_defaults_to_details() {
-    let mut app = history_app();
+    let (_repo, mut app) = history_app();
     app.on_key(key('y'));
     let _ = dump(&app);
     // Graph is focused by default; move down to an older commit.
@@ -127,7 +127,7 @@ fn selecting_a_graph_commit_defaults_to_details() {
 
 #[test]
 fn clicking_a_graph_row_selects_that_commit() {
-    let mut app = history_app();
+    let (_repo, mut app) = history_app();
     app.on_key(key('y'));
     let _ = dump(&app);
     // The graph pane sits below the committed pane (top height 12) inside the
@@ -140,7 +140,7 @@ fn clicking_a_graph_row_selects_that_commit() {
 
 #[test]
 fn dragging_horizontal_divider_resizes_committed_pane() {
-    let mut app = history_app();
+    let (_repo, mut app) = history_app();
     app.on_key(key('y'));
     let _ = dump(&app);
     assert_eq!(app.committed_height(), 12, "default height");
@@ -160,7 +160,7 @@ fn dragging_horizontal_divider_resizes_committed_pane() {
 
 #[test]
 fn horizontal_divider_drag_clamps_to_minimum() {
-    let mut app = history_app();
+    let (_repo, mut app) = history_app();
     app.on_key(key('y'));
     let _ = dump(&app);
 
