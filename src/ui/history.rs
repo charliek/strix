@@ -13,7 +13,7 @@ use crate::app::{App, HistoryFocus};
 use crate::git::{ChangeKind, CommitFile, CommitInfo};
 use crate::graph::GraphRow;
 use crate::ui::theme::Theme;
-use crate::ui::{centered_hint, diff_view, panel_block};
+use crate::ui::{centered_hint, diff_view, panel_block, selection_style};
 
 pub fn render(frame: &mut Frame, body: Rect, app: &App) {
     let theme = &app.theme;
@@ -273,17 +273,6 @@ fn change_color(change: ChangeKind, theme: &Theme) -> Color {
         ChangeKind::Added | ChangeKind::Copied => theme.staged,
         ChangeKind::Deleted => theme.del,
         _ => theme.unstaged,
-    }
-}
-
-fn selection_style(focused: bool, theme: &Theme) -> Style {
-    if focused {
-        Style::new()
-            .bg(theme.selection_bg)
-            .fg(theme.selection_fg)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::new().bg(theme.selection_bg)
     }
 }
 

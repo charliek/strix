@@ -175,6 +175,20 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+/// The highlight style for a selected list row: the selection background, plus
+/// the selection foreground in bold when its pane is focused. Shared by the
+/// staging and history list panes so selection styling stays consistent.
+pub fn selection_style(focused: bool, theme: &Theme) -> Style {
+    if focused {
+        Style::new()
+            .bg(theme.selection_bg)
+            .fg(theme.selection_fg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::new().bg(theme.selection_bg)
+    }
+}
+
 /// A bordered panel with focus-aware border + title colours. Shared by the
 /// staging and diff panes (and future overlays) so focus styling stays
 /// consistent.

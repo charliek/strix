@@ -7,7 +7,7 @@ use ratatui::Frame;
 use crate::app::{App, Focus};
 use crate::git::{Change, FileEntry, Section, Status};
 use crate::ui::theme::Theme;
-use crate::ui::{centered_hint, panel_block};
+use crate::ui::{centered_hint, panel_block, selection_style};
 
 /// One row of the staging list, in display order.
 enum Row<'a> {
