@@ -8,6 +8,17 @@ Each release below is headed by a `## vX.Y.Z` entry added by
 `/release-workflows:release`; `release.yml` turns that section into the GitHub
 Release notes.
 
+## [Unreleased]
+
+### Added
+- **History view.** Toggleable second view (`i` / `1` / `2`, `Esc` to leave)
+  with a colored branch/merge rail graph of the current branch on the bottom
+  left, the selected commit's changed files on the top left, and either commit
+  details (`git show`-style) or the file's diff vs its first parent on the
+  right. The vertical split bar resizes the left column vs the diff; a new
+  draggable horizontal divider resizes the file list vs the graph. `b`
+  collapses the entire left column, just as it does in the status view.
+
 ## v0.0.1 — 2026-05-30
 
 First release. strix is a focused, polished terminal UI for the two git

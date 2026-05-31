@@ -90,7 +90,6 @@ nav:
       - Architecture: reference/architecture.md
   - Development:
       - Setup: development/setup.md
-      - Project Spec: spec.md
 
 extra:
   social:

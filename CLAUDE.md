@@ -3,10 +3,11 @@
 ## Direction (read first)
 
 strix is a focused, polished terminal UI for the two git operations done most
-often: **staging changes** and **viewing diffs**. It is *not* a full git client
-— no commit creation, branch management, merge-conflict resolution, stashing, or
-remote operations in the MVP (see `docs/spec.md` for the full scope and the
-explicit non-goals).
+often: **staging changes** and **viewing diffs**, plus a toggleable **history
+view** (`i`) with a rail-graph commit log. It is *not* a full git client — no
+commit creation, branch management, merge-conflict resolution, stashing, or
+remote operations (see
+[Non-goals](docs/reference/architecture.md#non-goals) for the explicit list).
 
 **North star.** Visual quality matching a modern editor's diff view (Zed/Cursor),
 with first-class mouse *and* keyboard support, fast enough to feel instant on
@@ -55,11 +56,10 @@ A single binary crate, split into a library (`src/lib.rs`) and a thin binary
   index / worktree blob bytes, producing a structured model that drives both
   unified and side-by-side rendering.
 - **Mutations** (stage / unstage / reset) **shell out to `git`** (`git add`,
-  `git restore --staged`, `git restore` / `git checkout`). This is the
-  CLI fallback the spec explicitly sanctions (`docs/spec.md`): it is rock-solid
-  and avoids gix's less-mature index-write porcelain. Keep these shell-outs
-  confined to `git/ops.rs` and documented there; a future iteration can move them
-  to pure gix once that porcelain matures.
+  `git restore --staged`, `git restore` / `git checkout`). It is rock-solid and
+  avoids gix's less-mature index-write porcelain. Keep these shell-outs confined
+  to `git/ops.rs` and documented there; a future iteration can move them to pure
+  gix once that porcelain matures.
 
 ## Library preferences
 

@@ -23,9 +23,6 @@ on [ratatui](https://github.com/ratatui/ratatui),
 [gitoxide](https://github.com/GitoxideLabs/gitoxide), and
 [syntect](https://github.com/trishume/syntect).
 
-> **Status:** active development toward the MVP. See
-> [`docs/spec.md`](docs/spec.md) for scope.
-
 ## Installation
 
 ### macOS (Homebrew)
@@ -60,6 +57,10 @@ strix path/to/repo # open a specific repository
   Move files between sections to stage/unstage; reset a file back to HEAD.
 - **Right pane** — a syntax-highlighted diff of the selected file, in unified or
   side-by-side mode.
+
+Press `i` for the **History view**: a branch/merge rail graph of the current
+branch on the left, commit details or file diffs (vs the commit's first parent)
+on the right. `Esc` or `i` returns to staging.
 
 See the [keybindings](docs/getting-started/keybindings.md) for the full set.
 
