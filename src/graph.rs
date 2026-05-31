@@ -78,7 +78,7 @@ pub fn layout(commits: &[CommitInfo], refs: &[RefLabel]) -> Vec<GraphRow> {
         // for that parent, else open a fresh lane.
         let mut spawned: Vec<usize> = Vec::new();
         for parent in commit.parents.iter().skip(1) {
-            if lanes.iter().any(|slot| *slot == Some(*parent)) {
+            if lanes.contains(&Some(*parent)) {
                 continue;
             }
             let lane = free_lane(&mut lanes);
