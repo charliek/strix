@@ -8,7 +8,7 @@ Each release below is headed by a `## vX.Y.Z` entry added by
 `/release-workflows:release`; `release.yml` turns that section into the GitHub
 Release notes.
 
-## [Unreleased]
+## v0.0.2 — 2026-05-31
 
 ### Added
 - **History view.** Toggleable second view (`i` / `1` / `2`, `Esc` to leave)
@@ -18,6 +18,16 @@ Release notes.
   right. The vertical split bar resizes the left column vs the diff; a new
   draggable horizontal divider resizes the file list vs the graph. `b`
   collapses the entire left column, just as it does in the status view.
+
+### Docs
+- Homebrew + apt install methods documented.
+- History view coverage added across keybindings, usage, index, README,
+  configuration, and architecture.
+- Retired the original planning doc (`docs/spec.md`); folded its still-relevant
+  non-goals and performance targets into `docs/reference/architecture.md`.
+
+### CI
+- Bumped `create-github-app-token` v2 → v3 (Node 24).
 
 ## v0.0.1 — 2026-05-30
 
