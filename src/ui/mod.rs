@@ -137,28 +137,27 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         .add_modifier(Modifier::BOLD);
     let label_style = Style::new().fg(theme.footer_fg);
 
+    // The `b` toggle's label tracks what the key will do next.
+    let changes_label = if app.show_changes {
+        "hide  "
+    } else {
+        "changes  "
+    };
     let hints: Vec<(&str, &str)> = match app.view {
-        ViewMode::Status => {
-            // The toggle's label tracks what the key will do next.
-            let changes_label = if app.show_changes {
-                "hide  "
-            } else {
-                "changes  "
-            };
-            vec![
-                (" j/k ", "move  "),
-                (" space ", "stage  "),
-                (" d ", "split  "),
-                (" b ", changes_label),
-                (" y ", "history  "),
-                (" ? ", "help  "),
-                (" q ", "quit"),
-            ]
-        }
+        ViewMode::Status => vec![
+            (" j/k ", "move  "),
+            (" space ", "stage  "),
+            (" d ", "split  "),
+            (" b ", changes_label),
+            (" y ", "history  "),
+            (" ? ", "help  "),
+            (" q ", "quit"),
+        ],
         ViewMode::History => vec![
             (" j/k ", "move  "),
             (" tab ", "pane  "),
             (" d ", "split  "),
+            (" b ", changes_label),
             (" y/esc ", "status  "),
             (" ? ", "help  "),
             (" q ", "quit"),

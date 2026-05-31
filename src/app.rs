@@ -435,8 +435,21 @@ impl App {
     /// is read-only, so staging ops do nothing.
     fn dispatch_history(&mut self, action: Action) {
         match action {
-            Action::SwitchPane => self.cycle_history_focus(),
-            Action::FocusStaging => self.history_focus_left(),
+            Action::SwitchPane => {
+                if self.show_changes {
+                    self.cycle_history_focus();
+                } else {
+                    self.reveal_history_panel(); // Tab reveals a hidden panel and lands in it.
+                }
+            }
+            Action::ToggleChanges => self.toggle_history_panel(),
+            Action::FocusStaging => {
+                if self.show_changes {
+                    self.history_focus_left();
+                } else {
+                    self.reveal_history_panel();
+                }
+            }
             Action::FocusDiff => self.history_focus_right(),
             Action::Down => self.history_move(true),
             Action::Up => self.history_move(false),
@@ -444,12 +457,8 @@ impl App {
             Action::Bottom => self.history_to_edge(true),
             Action::HalfPageDown => self.scroll_diff(true, self.half_page()),
             Action::HalfPageUp => self.scroll_diff(false, self.half_page()),
-            // Read-only view: the changes toggle and staging ops do nothing.
-            Action::ToggleChanges
-            | Action::ToggleStage
-            | Action::Stage
-            | Action::Unstage
-            | Action::Discard => {}
+            // Read-only view: staging ops do nothing.
+            Action::ToggleStage | Action::Stage | Action::Unstage | Action::Discard => {}
             // Handled in `dispatch`.
             Action::Quit
             | Action::Help
@@ -459,6 +468,23 @@ impl App {
             | Action::ShowStatus
             | Action::ShowHistory => {}
         }
+    }
+
+    /// Mirror of `toggle_changes` for the history view: hiding forces focus to
+    /// the Diff (the only visible pane); revealing returns to the Graph (the
+    /// history view's entry-default focus).
+    fn toggle_history_panel(&mut self) {
+        if self.show_changes {
+            self.show_changes = false;
+            self.history_focus = HistoryFocus::Diff;
+        } else {
+            self.reveal_history_panel();
+        }
+    }
+
+    fn reveal_history_panel(&mut self) {
+        self.show_changes = true;
+        self.history_focus = HistoryFocus::Graph;
     }
 
     fn half_page(&self) -> u16 {
@@ -746,7 +772,7 @@ impl App {
     /// Whether a position lands on the history view's horizontal split bar — its
     /// two border rows — within the left column.
     fn on_hdivider(&self, pos: Position) -> bool {
-        if self.view != ViewMode::History {
+        if self.view != ViewMode::History || !self.show_changes {
             return false;
         }
         let left = self.left_col_area.get();

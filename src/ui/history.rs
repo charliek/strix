@@ -18,6 +18,21 @@ use crate::ui::{centered_hint, diff_view, panel_block, selection_style};
 pub fn render(frame: &mut Frame, body: Rect, app: &App) {
     let theme = &app.theme;
 
+    // `b` collapses the left column, like the status view. Hidden: the diff
+    // pane fills the body; clear the stale geometry so mouse hit-testing can't
+    // match where the panels used to be.
+    if !app.show_changes {
+        app.set_committed_area(Rect::default());
+        app.set_graph_area(Rect::default());
+        app.set_hsplit_geometry(Rect::default(), 0);
+        if app.history_shows_details() {
+            render_details(frame, body, app);
+        } else {
+            diff_view::render(frame, body, app);
+        }
+        return;
+    }
+
     // Left column is a fixed width (shared with the status view); the diff takes
     // the rest. Reuse the vertical split bar wholesale.
     let width = app.changes_pane_width(body.width);

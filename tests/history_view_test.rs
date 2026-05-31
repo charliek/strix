@@ -177,6 +177,40 @@ fn horizontal_divider_drag_clamps_to_minimum() {
 }
 
 #[test]
+fn b_collapses_and_restores_the_history_left_panel() {
+    let (_repo, mut app) = history_app();
+    app.on_key(key('y'));
+    let before = dump(&app);
+    assert!(
+        before.contains("Committed Changes"),
+        "panels shown:\n{before}"
+    );
+    assert!(before.contains("Graph"));
+
+    // `b` hides the left column; focus moves to the diff (the only pane left).
+    app.on_key(key('b'));
+    assert!(!app.show_changes, "show_changes flipped off");
+    assert_eq!(app.history_focus(), HistoryFocus::Diff);
+    let hidden = dump(&app);
+    assert!(!hidden.contains("Committed Changes"), "hidden:\n{hidden}");
+    assert!(!hidden.contains("Graph"), "hidden:\n{hidden}");
+    // The commit details (the right pane when the commit row is selected)
+    // still render — just full-width now.
+    assert!(
+        hidden.contains("Author"),
+        "details still rendered:\n{hidden}"
+    );
+
+    // `b` again reveals the panel and lands focus back in the Graph.
+    app.on_key(key('b'));
+    assert!(app.show_changes);
+    assert_eq!(app.history_focus(), HistoryFocus::Graph);
+    let restored = dump(&app);
+    assert!(restored.contains("Committed Changes"));
+    assert!(restored.contains("Graph"));
+}
+
+#[test]
 fn empty_repo_history_renders_without_panic() {
     let dir = common::init_empty_repo();
     let mut app = App::new(dir.path().to_path_buf()).unwrap();
