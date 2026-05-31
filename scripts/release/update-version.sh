@@ -45,7 +45,23 @@ fi
 
 # 3. Regenerate Cargo.lock so the strix entry matches. --offline is safe: we're
 #    only changing an internal version string, not the dependency tree.
-cargo update --workspace --offline >/dev/null
+#
+#    Resolve cargo via mise when the repo's toolchain is pinned there
+#    (.mise.toml is the source of truth), else fall back to whatever cargo is on
+#    PATH (CI runners install Rust via actions-rs and don't need mise). Without
+#    this the script silently inherits the caller's shell — non-interactive
+#    shells often don't have cargo on PATH even though mise has installed it.
+if command -v mise >/dev/null 2>&1 && [[ -f .mise.toml ]]; then
+  cargo=(mise exec -- cargo)
+elif command -v cargo >/dev/null 2>&1; then
+  cargo=(cargo)
+else
+  echo "error: cargo not found and 'mise exec' unavailable." >&2
+  echo "       Install Rust (via rustup) or run inside a shell where" >&2
+  echo "       \`mise exec -- cargo --version\` or \`cargo --version\` works." >&2
+  exit 1
+fi
+"${cargo[@]}" update --workspace --offline >/dev/null
 
 # 4. Verify the lockfile saw the bump.
 if ! grep -q "^version = \"$V\"" Cargo.lock; then
