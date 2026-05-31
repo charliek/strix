@@ -4,7 +4,7 @@ use common::init_repo_with_history;
 use strix::app::{App, HistoryFocus, ViewMode};
 use strix::crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use strix::git::{FileDiff, LineKind};
-use strix::ratatui::layout::Position;
+use tempfile::TempDir;
 
 fn key(c: char) -> KeyEvent {
     KeyEvent::from(KeyCode::Char(c))
@@ -34,9 +34,13 @@ fn dump(app: &App) -> String {
     strix::terminal::dump_frame(app, W, H).unwrap()
 }
 
-fn history_app() -> App {
+/// Build an `App` against a 3-commit repo. The returned `TempDir` must be held
+/// for the `App`'s lifetime — dropping it deletes the repo and the commit walk
+/// would then find nothing (mirrors the pattern in `mouse_test.rs`).
+fn history_app() -> (TempDir, App) {
     let repo = init_repo_with_history();
-    App::new(repo.path().to_path_buf()).unwrap()
+    let app = App::new(repo.path().to_path_buf()).unwrap();
+    (repo, app)
 }
 
 #[test]

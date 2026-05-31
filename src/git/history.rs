@@ -215,7 +215,7 @@ impl Repo {
         let mut files = Vec::new();
         for (change, path, orig_path) in parse_name_status(&stdout) {
             let (old_spec, new_spec) = self.diff_specs(commit, &path, orig_path.as_deref(), change);
-            let stat = self.stat_from_specs(&old_spec, &new_spec);
+            let stat = stat_of(&self.file_diff_from_specs(&old_spec, &new_spec));
             files.push(CommitFile {
                 path,
                 orig_path,
@@ -267,24 +267,26 @@ impl Repo {
             &String::from_utf8_lossy(&new),
         ))
     }
+}
 
-    fn stat_from_specs(&self, old_spec: &str, new_spec: &str) -> CommitStat {
-        match self.file_diff_from_specs(old_spec, new_spec) {
-            FileDiff::Binary => CommitStat {
-                binary: true,
-                ..CommitStat::default()
-            },
-            FileDiff::Text(lines) => {
-                let mut stat = CommitStat::default();
-                for line in &lines {
-                    match line.kind {
-                        LineKind::Addition => stat.added += 1,
-                        LineKind::Deletion => stat.deleted += 1,
-                        _ => {}
-                    }
+/// The +/- line counts for an already-computed diff (so the file list and the
+/// detailed view never diff the same blobs twice).
+fn stat_of(diff: &FileDiff) -> CommitStat {
+    match diff {
+        FileDiff::Binary => CommitStat {
+            binary: true,
+            ..CommitStat::default()
+        },
+        FileDiff::Text(lines) => {
+            let mut stat = CommitStat::default();
+            for line in lines {
+                match line.kind {
+                    LineKind::Addition => stat.added += 1,
+                    LineKind::Deletion => stat.deleted += 1,
+                    _ => {}
                 }
-                stat
             }
+            stat
         }
     }
 }

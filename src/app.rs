@@ -490,11 +490,9 @@ impl App {
     fn exit_history(&mut self) {
         self.view = ViewMode::Status;
         self.focus = Focus::Staging;
-        self.diff_scroll = 0;
         // Drop the per-file render caches: the status diff describes a different
         // file than the history view left behind.
-        self.highlight_cache.borrow_mut().clear();
-        *self.sbs_rows.borrow_mut() = None;
+        self.reset_diff_view();
         self.sync_diff();
     }
 
@@ -1042,9 +1040,7 @@ impl App {
             if self.history_diff_key.is_some() {
                 self.history_diff = None;
                 self.history_diff_key = None;
-                self.diff_scroll = 0;
-                self.highlight_cache.borrow_mut().clear();
-                *self.sbs_rows.borrow_mut() = None;
+                self.reset_diff_view();
             }
             return;
         }
@@ -1057,6 +1053,12 @@ impl App {
         }
         self.history_diff = Some(self.repo.commit_file_diff(commit, file));
         self.history_diff_key = key;
+        self.reset_diff_view();
+    }
+
+    /// Reset the diff pane to the top and drop the per-file render caches, which
+    /// describe the diff being replaced.
+    fn reset_diff_view(&mut self) {
         self.diff_scroll = 0;
         self.highlight_cache.borrow_mut().clear();
         *self.sbs_rows.borrow_mut() = None;
