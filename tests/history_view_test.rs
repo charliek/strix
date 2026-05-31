@@ -219,3 +219,35 @@ fn empty_repo_history_renders_without_panic() {
     let out = dump(&app);
     assert!(out.contains("No commits"), "empty-state frame:\n{out}");
 }
+
+#[test]
+fn exiting_history_clears_horizontal_divider_state() {
+    let (_repo, mut app) = history_app();
+    app.on_key(key('i'));
+    let _ = dump(&app);
+
+    // Grab the hdivider, exit history without releasing.
+    let dy = 1 + app.committed_height();
+    app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 4, dy));
+    app.on_key(esc());
+    assert_eq!(app.view, ViewMode::Status);
+    assert!(
+        !app.divider_engaged(),
+        "stale hdivider state survived exit_history"
+    );
+}
+
+#[test]
+fn exit_history_with_hidden_changes_focuses_diff() {
+    let (_repo, mut app) = history_app();
+    // Hide the Changes panel in status view first.
+    app.on_key(key('b'));
+    assert!(!app.show_changes);
+    // Enter history, then Esc back to status.
+    app.on_key(key('i'));
+    app.on_key(esc());
+    assert_eq!(app.view, ViewMode::Status);
+    assert!(!app.show_changes, "Changes panel stays hidden");
+    // Hidden-panel invariant: focus must be the only visible pane.
+    assert_eq!(app.focus, strix::app::Focus::Diff);
+}
