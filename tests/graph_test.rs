@@ -62,6 +62,58 @@ fn merge_spawns_and_rejoins_a_lane() {
 }
 
 #[test]
+fn merge_into_active_branch_keeps_a_connector() {
+    // A "criss-cross" style: two branches each merge in the other branch's
+    // tip. The second merge's extra parent is already an active lane, so the
+    // connector must still be drawn (regression for the "no glyph for active
+    // merge parent" bug Codex flagged).
+    let dir = init_repo_with_branches();
+    let path = dir.path();
+    // Tip is the merge from init_repo_with_branches; extend with a second
+    // merge that re-references the already-active lane.
+    common::git(path, &["checkout", "-q", "-b", "feature2"]);
+    common::write(path, "f2.txt", "x\n");
+    common::git(path, &["add", "."]);
+    common::git_env(
+        path,
+        &[
+            ("GIT_AUTHOR_DATE", "2021-01-05T00:00:00"),
+            ("GIT_COMMITTER_DATE", "2021-01-05T00:00:00"),
+        ],
+        &["commit", "-q", "-m", "f2 tip"],
+    );
+    common::git(path, &["checkout", "-q", "main"]);
+    common::git_env(
+        path,
+        &[
+            ("GIT_AUTHOR_DATE", "2021-01-06T00:00:00"),
+            ("GIT_COMMITTER_DATE", "2021-01-06T00:00:00"),
+        ],
+        &["merge", "--no-ff", "-q", "-m", "merge f2", "feature2"],
+    );
+    let repo = Repo::open(path).expect("open repo");
+    let commits = repo.history(50).expect("history");
+    let refs = repo.ref_labels().expect("refs");
+    let rows = graph::layout(&commits, &refs);
+
+    // The newest row (the f2 merge) must show a side connector — either a
+    // spawn corner or the join glyph on the merged lane. Without the fix, the
+    // active-lane parent was skipped and the row had only a node.
+    let merge_row = &rows[0];
+    let connectors: String = merge_row
+        .cells
+        .iter()
+        .filter(|c| matches!(c.glyph, '╮' | '╭' | '╯' | '╰' | '─'))
+        .map(|c| c.glyph)
+        .collect();
+    assert!(
+        !connectors.is_empty(),
+        "merge row should keep a connector glyph: {:?}",
+        merge_row.cells
+    );
+}
+
+#[test]
 fn tip_commit_carries_branch_labels() {
     let dir = init_repo_with_branches();
     let repo = Repo::open(dir.path()).expect("open repo");

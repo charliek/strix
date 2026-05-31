@@ -515,7 +515,19 @@ impl App {
 
     fn exit_history(&mut self) {
         self.view = ViewMode::Status;
-        self.focus = Focus::Staging;
+        // Respect the status view's hidden-panel invariant: when the Changes
+        // panel is hidden, focus must be the only visible pane (Diff). Returning
+        // to a hidden Staging pane would silently route keys nowhere visible.
+        self.focus = if self.show_changes {
+            Focus::Staging
+        } else {
+            Focus::Diff
+        };
+        // Clear any in-flight horizontal-divider drag/hover state so it can't
+        // leak into the status view's mouse handling (the hdivider doesn't exist
+        // outside history).
+        self.dragging_hdivider = false;
+        self.hovering_hdivider = false;
         // Drop the per-file render caches: the status diff describes a different
         // file than the history view left behind.
         self.reset_diff_view();
@@ -1211,11 +1223,14 @@ impl App {
     }
 
     /// The "Committed Changes" sub-pane height clamped so both it and the Graph
-    /// keep a usable height. Shared by the layout and the drag handler.
+    /// keep a usable height — and so the result never exceeds the available
+    /// `left_height` on a very short terminal (where even both minimums won't
+    /// fit, the top pane gets what's left and the graph collapses).
     pub fn committed_pane_height(&self, left_height: u16) -> u16 {
         let max = left_height
             .saturating_sub(MIN_GRAPH_HEIGHT)
-            .max(MIN_COMMITTED_HEIGHT);
+            .max(MIN_COMMITTED_HEIGHT)
+            .min(left_height);
         self.committed_height.clamp(MIN_COMMITTED_HEIGHT, max)
     }
 

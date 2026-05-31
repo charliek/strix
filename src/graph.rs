@@ -67,23 +67,31 @@ pub fn layout(commits: &[CommitInfo], refs: &[RefLabel]) -> Vec<GraphRow> {
             None => free_lane(&mut lanes),
         };
 
-        // The first parent continues in the node's lane; converged side-lanes
-        // are released.
+        // The first parent continues in the node's lane.
         lanes[node_lane] = commit.parents.first().copied();
-        for &lane in converging.iter().skip(1) {
-            lanes[lane] = None;
-        }
 
-        // Extra (merge) parents take their own lane: reuse one already waiting
-        // for that parent, else open a fresh lane.
+        // Extra (merge) parents either reuse an existing waiting lane (the
+        // merge feeds an already-active branch) or take a fresh one. Either
+        // way the lane needs a side connector on this row, so we record it in
+        // `spawned`. Allocating BEFORE we free converged side-lanes prevents
+        // `free_lane` from recycling a converged lane and double-claiming it
+        // (which would overwrite its join corner with a spawn corner).
         let mut spawned: Vec<usize> = Vec::new();
         for parent in commit.parents.iter().skip(1) {
-            if lanes.contains(&Some(*parent)) {
-                continue;
-            }
-            let lane = free_lane(&mut lanes);
-            lanes[lane] = Some(*parent);
+            let lane = match lanes.iter().position(|slot| *slot == Some(*parent)) {
+                Some(lane) => lane,
+                None => {
+                    let lane = free_lane(&mut lanes);
+                    lanes[lane] = Some(*parent);
+                    lane
+                }
+            };
             spawned.push(lane);
+        }
+
+        // Now release the converged side-lanes that aren't holding a parent.
+        for &lane in converging.iter().skip(1) {
+            lanes[lane] = None;
         }
 
         let after = &lanes;
