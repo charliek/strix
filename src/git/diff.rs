@@ -68,9 +68,10 @@ impl Repo {
         }
     }
 
-    /// Bytes of an object addressed by a revspec (`HEAD:path`, `:path`), or
-    /// empty if it doesn't resolve — e.g. a newly added file has no HEAD blob.
-    fn object_bytes(&self, spec: &str) -> Vec<u8> {
+    /// Bytes of an object addressed by a revspec (`HEAD:path`, `:path`,
+    /// `<oid>:path`), or empty if it doesn't resolve — e.g. a newly added file
+    /// has no HEAD blob. Shared with `history.rs` for commit-vs-parent diffs.
+    pub(crate) fn object_bytes(&self, spec: &str) -> Vec<u8> {
         self.gix()
             .rev_parse_single(BStr::new(spec))
             .ok()
@@ -84,11 +85,11 @@ impl Repo {
     }
 }
 
-fn is_binary(bytes: &[u8]) -> bool {
+pub(crate) fn is_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(BINARY_SCAN_BYTES).any(|&b| b == 0)
 }
 
-fn diff_lines(old: &str, new: &str) -> Vec<DiffLine> {
+pub(crate) fn diff_lines(old: &str, new: &str) -> Vec<DiffLine> {
     let diff = TextDiff::from_lines(old, new);
     let mut lines = Vec::new();
     for group in diff.grouped_ops(CONTEXT_LINES) {
