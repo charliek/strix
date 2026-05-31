@@ -19,6 +19,9 @@ fn default_bindings() {
     assert_eq!(keymap.action(key('q')), Some(Action::Quit));
     assert_eq!(keymap.action(key('d')), Some(Action::ToggleDiffMode));
     assert_eq!(keymap.action(key('b')), Some(Action::ToggleChanges));
+    assert_eq!(keymap.action(key('i')), Some(Action::ToggleHistory));
+    assert_eq!(keymap.action(key('1')), Some(Action::ShowStatus));
+    assert_eq!(keymap.action(key('2')), Some(Action::ShowHistory));
     assert_eq!(keymap.action(ctrl('d')), Some(Action::HalfPageDown));
     assert_eq!(keymap.action(key('G')), Some(Action::Bottom));
     assert_eq!(keymap.action(key(' ')), Some(Action::ToggleStage));

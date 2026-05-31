@@ -7,7 +7,7 @@ use ratatui::Frame;
 use crate::app::{App, Focus};
 use crate::git::{Change, FileEntry, Section, Status};
 use crate::ui::theme::Theme;
-use crate::ui::{centered_hint, panel_block};
+use crate::ui::{centered_hint, panel_block, selection_style};
 
 /// One row of the staging list, in display order.
 enum Row<'a> {
@@ -95,15 +95,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         }
     }
 
-    let highlight = if focused {
-        Style::new()
-            .bg(theme.selection_bg)
-            .fg(theme.selection_fg)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::new().bg(theme.selection_bg)
-    };
-    let list = List::new(items).highlight_style(highlight);
+    let list = List::new(items).highlight_style(selection_style(focused, theme));
 
     let mut state = app.staging_state_mut();
     state.select(selected_item);

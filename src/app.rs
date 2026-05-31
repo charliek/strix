@@ -12,7 +12,11 @@ use ratatui::widgets::ListState;
 use syntect::parsing::SyntaxReference;
 
 use crate::config::Config;
-use crate::git::{Change, DiffLine, FileDiff, FileEntry, LineKind, Repo, Section, Status};
+use crate::git::{
+    Change, CommitFile, CommitInfo, DiffLine, FileDiff, FileEntry, LineKind, RefLabel, Repo,
+    Section, Status,
+};
+use crate::graph::{self, GraphRow};
 use crate::keys::{Action, Keymap};
 use crate::ui::theme::Theme;
 
@@ -32,6 +36,12 @@ const DEFAULT_CHANGES_WIDTH: u16 = 32;
 /// the Changes list nor the diff can be collapsed to nothing.
 const MIN_CHANGES_WIDTH: u16 = 16;
 const MIN_DIFF_WIDTH: u16 = 24;
+/// History view: default + minimum heights (rows) for the two stacked left
+/// sub-panes, and how many commits to load per page.
+const DEFAULT_COMMITTED_HEIGHT: u16 = 12;
+const MIN_COMMITTED_HEIGHT: u16 = 4;
+const MIN_GRAPH_HEIGHT: u16 = 4;
+const HISTORY_PAGE: usize = 500;
 
 /// Which pane currently receives keyboard input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,6 +55,21 @@ pub enum Focus {
 pub enum DiffMode {
     Unified,
     SideBySide,
+}
+
+/// Which top-level view is showing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewMode {
+    Status,
+    History,
+}
+
+/// Which sub-pane of the history view receives keyboard input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryFocus {
+    Graph,
+    CommittedChanges,
+    Diff,
 }
 
 /// One syntax-highlighted line: `(foreground colour, text)` segments, shared
@@ -136,6 +161,35 @@ pub struct App {
     body_area: Cell<Rect>,
     divider_x: Cell<u16>,
 
+    // --- History view ---
+    pub view: ViewMode,
+    history_focus: HistoryFocus,
+    commits: Vec<CommitInfo>,
+    refs: Vec<RefLabel>,
+    graph_rows: Vec<GraphRow>,
+    /// True once a walk returned fewer commits than requested — no more to load.
+    history_loaded_all: bool,
+    selected_commit: usize,
+    commit_files: Vec<CommitFile>,
+    /// Row in the top "Committed Changes" list: 0 is the commit (`●`) row,
+    /// `1..=commit_files.len()` index into `commit_files`.
+    committed_row: usize,
+    history_diff: Option<FileDiff>,
+    history_diff_key: Option<(gix::ObjectId, String)>,
+    /// Height (rows) of the top "Committed Changes" sub-pane; the Graph fills the
+    /// rest. Adjusted by dragging the horizontal divider. Mirrors `changes_width`.
+    committed_height: u16,
+    dragging_hdivider: bool,
+    hovering_hdivider: bool,
+    committed_area: Cell<Rect>,
+    graph_area: Cell<Rect>,
+    /// The left column's body rect and the horizontal divider row, recorded
+    /// during rendering for hit-testing a drag (mirrors `body_area`/`divider_x`).
+    left_col_area: Cell<Rect>,
+    hdivider_y: Cell<u16>,
+    committed_state: RefCell<ListState>,
+    graph_state: RefCell<ListState>,
+
     keymap: Keymap,
 }
 
@@ -178,6 +232,26 @@ impl App {
             diff_area: Cell::new(Rect::default()),
             body_area: Cell::new(Rect::default()),
             divider_x: Cell::new(0),
+            view: ViewMode::Status,
+            history_focus: HistoryFocus::Graph,
+            commits: Vec::new(),
+            refs: Vec::new(),
+            graph_rows: Vec::new(),
+            history_loaded_all: false,
+            selected_commit: 0,
+            commit_files: Vec::new(),
+            committed_row: 0,
+            history_diff: None,
+            history_diff_key: None,
+            committed_height: DEFAULT_COMMITTED_HEIGHT,
+            dragging_hdivider: false,
+            hovering_hdivider: false,
+            committed_area: Cell::new(Rect::default()),
+            graph_area: Cell::new(Rect::default()),
+            left_col_area: Cell::new(Rect::default()),
+            hdivider_y: Cell::new(0),
+            committed_state: RefCell::new(ListState::default()),
+            graph_state: RefCell::new(ListState::default()),
             keymap: Keymap::from_config(config.keys.as_ref()),
         };
         app.clamp_selection();
@@ -245,23 +319,72 @@ impl App {
 
         if self.modal.is_some() {
             self.on_key_modal(key);
+        } else if key.code == KeyCode::Esc {
+            // Esc leaves the history view; it is not in the keymap (so the modal's
+            // own Esc handling stays first). A no-op in the status view.
+            if self.view == ViewMode::History {
+                self.exit_history();
+            }
         } else if let Some(action) = self.keymap.action(key) {
             self.dispatch(action);
         }
 
         // A handled key may have moved the selection or changed status; keep the
-        // cached diff in sync.
-        self.sync_diff();
+        // active view's cached diff in sync.
+        self.sync_active();
     }
 
     /// Interpret an action in context: navigation keys move the file cursor in
     /// the staging pane but scroll the diff pane; staging ops act on the
     /// selected file regardless of focus.
     fn dispatch(&mut self, action: Action) {
+        // View-agnostic actions are handled the same in either view.
         match action {
-            Action::Quit => self.should_quit = true,
-            Action::Help => self.modal = Some(Modal::Help),
-            Action::Refresh => self.refresh(),
+            Action::Quit => {
+                self.should_quit = true;
+                return;
+            }
+            Action::Help => {
+                self.modal = Some(Modal::Help);
+                return;
+            }
+            Action::ToggleDiffMode => {
+                self.toggle_diff_mode();
+                return;
+            }
+            Action::Refresh => {
+                self.refresh_active();
+                return;
+            }
+            Action::ToggleHistory => {
+                self.toggle_history();
+                return;
+            }
+            Action::ShowStatus => {
+                if self.view == ViewMode::History {
+                    self.exit_history();
+                }
+                return;
+            }
+            Action::ShowHistory => {
+                if self.view == ViewMode::Status {
+                    self.enter_history();
+                }
+                return;
+            }
+            _ => {}
+        }
+        match self.view {
+            ViewMode::Status => self.dispatch_status(action),
+            ViewMode::History => self.dispatch_history(action),
+        }
+    }
+
+    /// Interpret a navigation/staging action in the status view: navigation keys
+    /// move the file cursor in the staging pane but scroll the diff pane; staging
+    /// ops act on the selected file regardless of focus.
+    fn dispatch_status(&mut self, action: Action) {
+        match action {
             Action::SwitchPane => {
                 if self.show_changes {
                     self.toggle_focus();
@@ -269,7 +392,6 @@ impl App {
                     self.reveal_changes(); // Tab reveals a hidden panel and lands in it.
                 }
             }
-            Action::ToggleDiffMode => self.toggle_diff_mode(),
             Action::ToggleChanges => self.toggle_changes(),
             // Focusing a hidden panel reveals it first.
             Action::FocusStaging => self.reveal_changes(),
@@ -297,11 +419,248 @@ impl App {
             Action::Stage => self.stage_selected(),
             Action::Unstage => self.unstage_selected(),
             Action::Discard => self.request_discard(),
+            // Handled in `dispatch`.
+            Action::Quit
+            | Action::Help
+            | Action::Refresh
+            | Action::ToggleDiffMode
+            | Action::ToggleHistory
+            | Action::ShowStatus
+            | Action::ShowHistory => {}
         }
+    }
+
+    /// Interpret a navigation action in the history view: it acts on whichever
+    /// sub-pane (Graph / Committed changes / Diff) currently has focus. The view
+    /// is read-only, so staging ops do nothing.
+    fn dispatch_history(&mut self, action: Action) {
+        match action {
+            Action::SwitchPane => {
+                if self.show_changes {
+                    self.cycle_history_focus();
+                } else {
+                    self.reveal_history_panel(); // Tab reveals a hidden panel and lands in it.
+                }
+            }
+            Action::ToggleChanges => self.toggle_history_panel(),
+            Action::FocusStaging => {
+                if self.show_changes {
+                    self.history_focus_left();
+                } else {
+                    self.reveal_history_panel();
+                }
+            }
+            Action::FocusDiff => self.history_focus_right(),
+            Action::Down => self.history_move(true),
+            Action::Up => self.history_move(false),
+            Action::Top => self.history_to_edge(false),
+            Action::Bottom => self.history_to_edge(true),
+            Action::HalfPageDown => self.scroll_diff(true, self.half_page()),
+            Action::HalfPageUp => self.scroll_diff(false, self.half_page()),
+            // Read-only view: staging ops do nothing.
+            Action::ToggleStage | Action::Stage | Action::Unstage | Action::Discard => {}
+            // Handled in `dispatch`.
+            Action::Quit
+            | Action::Help
+            | Action::Refresh
+            | Action::ToggleDiffMode
+            | Action::ToggleHistory
+            | Action::ShowStatus
+            | Action::ShowHistory => {}
+        }
+    }
+
+    /// Mirror of `toggle_changes` for the history view: hiding forces focus to
+    /// the Diff (the only visible pane); revealing returns to the Graph (the
+    /// history view's entry-default focus).
+    fn toggle_history_panel(&mut self) {
+        if self.show_changes {
+            self.show_changes = false;
+            self.history_focus = HistoryFocus::Diff;
+        } else {
+            self.reveal_history_panel();
+        }
+    }
+
+    fn reveal_history_panel(&mut self) {
+        self.show_changes = true;
+        self.history_focus = HistoryFocus::Graph;
     }
 
     fn half_page(&self) -> u16 {
         (self.diff_viewport.get() / 2).max(1)
+    }
+
+    // --- History view: enter / exit / load ---
+
+    fn toggle_history(&mut self) {
+        match self.view {
+            ViewMode::Status => self.enter_history(),
+            ViewMode::History => self.exit_history(),
+        }
+    }
+
+    fn enter_history(&mut self) {
+        if self.commits.is_empty() {
+            self.load_history();
+        }
+        self.view = ViewMode::History;
+        self.history_focus = HistoryFocus::Graph;
+        self.selected_commit = 0;
+        self.committed_row = 0;
+        self.diff_scroll = 0;
+        self.load_commit_files();
+        self.sync_history_diff();
+    }
+
+    fn exit_history(&mut self) {
+        self.view = ViewMode::Status;
+        // Respect the status view's hidden-panel invariant: when the Changes
+        // panel is hidden, focus must be the only visible pane (Diff). Returning
+        // to a hidden Staging pane would silently route keys nowhere visible.
+        self.focus = if self.show_changes {
+            Focus::Staging
+        } else {
+            Focus::Diff
+        };
+        // Clear any in-flight horizontal-divider drag/hover state so it can't
+        // leak into the status view's mouse handling (the hdivider doesn't exist
+        // outside history).
+        self.dragging_hdivider = false;
+        self.hovering_hdivider = false;
+        // Drop the per-file render caches: the status diff describes a different
+        // file than the history view left behind.
+        self.reset_diff_view();
+        self.sync_diff();
+    }
+
+    /// Load (or reload) the commit walk + refs + graph layout, leaving `commits`
+    /// empty on an empty repo or error (the UI renders an empty-state hint).
+    fn load_history(&mut self) {
+        match self.repo.history(HISTORY_PAGE) {
+            Ok(commits) => {
+                self.history_loaded_all = commits.len() < HISTORY_PAGE;
+                self.commits = commits;
+            }
+            Err(err) => {
+                tracing::warn!("history walk failed: {err:#}");
+                self.commits.clear();
+                self.history_loaded_all = true;
+            }
+        }
+        self.refs = self.repo.ref_labels().unwrap_or_default();
+        self.graph_rows = graph::layout(&self.commits, &self.refs);
+    }
+
+    /// Load the selected commit's changed-file list, resetting the top-pane
+    /// selection to the commit (`●`) row.
+    fn load_commit_files(&mut self) {
+        self.committed_row = 0;
+        self.committed_state.borrow_mut().select(None);
+        let Some(commit) = self.commits.get(self.selected_commit) else {
+            self.commit_files.clear();
+            return;
+        };
+        self.commit_files = self.repo.commit_files(commit).unwrap_or_else(|err| {
+            tracing::warn!("listing commit files failed: {err:#}");
+            Vec::new()
+        });
+    }
+
+    /// Pull in the next page of history when the Graph selection reaches the end
+    /// of what's loaded, preserving the selected commit.
+    fn load_more_history(&mut self) {
+        if self.history_loaded_all {
+            return;
+        }
+        let want = self.commits.len() + HISTORY_PAGE;
+        match self.repo.history(want) {
+            Ok(commits) => {
+                self.history_loaded_all = commits.len() < want;
+                self.commits = commits;
+                self.graph_rows = graph::layout(&self.commits, &self.refs);
+            }
+            Err(err) => {
+                tracing::warn!("loading more history failed: {err:#}");
+                self.history_loaded_all = true;
+            }
+        }
+    }
+
+    // --- History view: navigation ---
+
+    fn cycle_history_focus(&mut self) {
+        self.history_focus = match self.history_focus {
+            HistoryFocus::Graph => HistoryFocus::CommittedChanges,
+            HistoryFocus::CommittedChanges => HistoryFocus::Diff,
+            HistoryFocus::Diff => HistoryFocus::Graph,
+        };
+    }
+
+    fn history_focus_left(&mut self) {
+        self.history_focus = match self.history_focus {
+            HistoryFocus::Diff => HistoryFocus::CommittedChanges,
+            HistoryFocus::CommittedChanges | HistoryFocus::Graph => HistoryFocus::Graph,
+        };
+    }
+
+    fn history_focus_right(&mut self) {
+        self.history_focus = match self.history_focus {
+            HistoryFocus::Graph => HistoryFocus::CommittedChanges,
+            HistoryFocus::CommittedChanges | HistoryFocus::Diff => HistoryFocus::Diff,
+        };
+    }
+
+    fn history_move(&mut self, down: bool) {
+        match self.history_focus {
+            HistoryFocus::Graph => {
+                if down {
+                    self.select_commit_next();
+                } else {
+                    self.select_commit_prev();
+                }
+            }
+            HistoryFocus::CommittedChanges => {
+                if down {
+                    self.committed_row = (self.committed_row + 1).min(self.commit_files.len());
+                } else {
+                    self.committed_row = self.committed_row.saturating_sub(1);
+                }
+            }
+            HistoryFocus::Diff => self.scroll_diff(down, 1),
+        }
+    }
+
+    fn history_to_edge(&mut self, bottom: bool) {
+        match self.history_focus {
+            HistoryFocus::Graph => {
+                self.selected_commit = if bottom {
+                    self.commits.len().saturating_sub(1)
+                } else {
+                    0
+                };
+                self.load_commit_files();
+            }
+            HistoryFocus::CommittedChanges => {
+                self.committed_row = if bottom { self.commit_files.len() } else { 0 };
+            }
+            HistoryFocus::Diff => {
+                self.diff_scroll = if bottom { self.diff_max_scroll() } else { 0 };
+            }
+        }
+    }
+
+    fn select_commit_next(&mut self) {
+        if self.selected_commit + 1 >= self.commits.len() {
+            self.load_more_history();
+        }
+        self.selected_commit = (self.selected_commit + 1).min(self.commits.len().saturating_sub(1));
+        self.load_commit_files();
+    }
+
+    fn select_commit_prev(&mut self) {
+        self.selected_commit = self.selected_commit.saturating_sub(1);
+        self.load_commit_files();
     }
 
     /// Handle a mouse event; returns whether the frame should be redrawn.
@@ -319,17 +678,20 @@ impl App {
         // must not clear the error toast or recompute the diff, and it redraws
         // only when the highlighted state actually changes.
         if let MouseEventKind::Moved = event.kind {
-            let was = self.hovering_divider;
+            let was = self.hovering_divider || self.hovering_hdivider;
             self.hovering_divider = self.on_divider(pos);
-            return self.hovering_divider != was;
+            self.hovering_hdivider = self.on_hdivider(pos);
+            return (self.hovering_divider || self.hovering_hdivider) != was;
         }
 
         self.last_error = None;
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                // Grabbing the split bar starts a resize instead of a pane click.
+                // Grabbing a split bar starts a resize instead of a pane click.
                 if self.on_divider(pos) {
                     self.dragging_divider = true;
+                } else if self.on_hdivider(pos) {
+                    self.dragging_hdivider = true;
                 } else {
                     self.on_click(pos);
                 }
@@ -337,12 +699,18 @@ impl App {
             MouseEventKind::Drag(MouseButton::Left) if self.dragging_divider => {
                 self.resize_changes(pos)
             }
-            MouseEventKind::Up(MouseButton::Left) => self.dragging_divider = false,
+            MouseEventKind::Drag(MouseButton::Left) if self.dragging_hdivider => {
+                self.resize_committed(pos)
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.dragging_divider = false;
+                self.dragging_hdivider = false;
+            }
             MouseEventKind::ScrollDown => self.on_scroll(pos, true),
             MouseEventKind::ScrollUp => self.on_scroll(pos, false),
             _ => {}
         }
-        self.sync_diff();
+        self.sync_active();
         true
     }
 
@@ -358,6 +726,10 @@ impl App {
     }
 
     fn on_click(&mut self, pos: Position) {
+        if self.view == ViewMode::History {
+            self.history_click(pos);
+            return;
+        }
         match self.pane_at(pos) {
             Some(Focus::Diff) => self.focus = Focus::Diff,
             Some(Focus::Staging) => {
@@ -374,6 +746,29 @@ impl App {
         }
     }
 
+    /// Route a click in the history view to its sub-pane: the Graph selects a
+    /// commit, the Committed Changes list selects the commit row or a file, the
+    /// diff pane just takes focus.
+    fn history_click(&mut self, pos: Position) {
+        let graph = self.graph_area.get();
+        let committed = self.committed_area.get();
+        if graph.contains(pos) {
+            self.history_focus = HistoryFocus::Graph;
+            let row = self.graph_state.borrow().offset() + (pos.y - graph.y) as usize;
+            if row < self.commits.len() {
+                self.selected_commit = row;
+                self.load_commit_files();
+            }
+        } else if committed.contains(pos) {
+            self.history_focus = HistoryFocus::CommittedChanges;
+            let row = self.committed_state.borrow().offset() + (pos.y - committed.y) as usize;
+            // Row 0 is the commit (●) row; rows below index into the file list.
+            self.committed_row = row.min(self.commit_files.len());
+        } else if self.diff_area.get().contains(pos) {
+            self.history_focus = HistoryFocus::Diff;
+        }
+    }
+
     /// Whether a position lands on the split bar — its two border columns —
     /// while the Changes panel is shown.
     fn on_divider(&self, pos: Position) -> bool {
@@ -386,10 +781,25 @@ impl App {
         on_body_row && (pos.x == dx || pos.x.saturating_add(1) == dx)
     }
 
-    /// Whether the split bar should show its active affordance (highlight +
+    /// Whether a position lands on the history view's horizontal split bar — its
+    /// two border rows — within the left column.
+    fn on_hdivider(&self, pos: Position) -> bool {
+        if self.view != ViewMode::History || !self.show_changes {
+            return false;
+        }
+        let left = self.left_col_area.get();
+        let dy = self.hdivider_y.get();
+        let on_left_col = pos.x >= left.x && pos.x < left.x.saturating_add(left.width);
+        on_left_col && (pos.y == dy || pos.y.saturating_add(1) == dy)
+    }
+
+    /// Whether either split bar should show its active affordance (highlight +
     /// resize pointer): the mouse hovers it, or a drag is in progress.
     pub fn divider_engaged(&self) -> bool {
-        self.hovering_divider || self.dragging_divider
+        self.hovering_divider
+            || self.dragging_divider
+            || self.hovering_hdivider
+            || self.dragging_hdivider
     }
 
     /// Move the split bar so the Changes panel's right edge follows the cursor,
@@ -400,12 +810,40 @@ impl App {
         self.changes_width = self.changes_pane_width(body.width);
     }
 
+    /// Move the horizontal split bar so the Committed Changes sub-pane's bottom
+    /// edge follows the cursor, clamped so both sub-panes keep a usable height.
+    fn resize_committed(&mut self, pos: Position) {
+        let left = self.left_col_area.get();
+        self.committed_height = pos.y.saturating_sub(left.y);
+        self.committed_height = self.committed_pane_height(left.height);
+    }
+
     fn on_scroll(&mut self, pos: Position, down: bool) {
+        if self.view == ViewMode::History {
+            self.history_scroll(pos, down);
+            return;
+        }
         match self.pane_at(pos) {
             Some(Focus::Diff) => self.scroll_diff(down, SCROLL_STEP),
             Some(Focus::Staging) if down => self.select_next(),
             Some(Focus::Staging) => self.select_prev(),
             None => {}
+        }
+    }
+
+    fn history_scroll(&mut self, pos: Position, down: bool) {
+        if self.graph_area.get().contains(pos) {
+            self.history_focus = HistoryFocus::Graph;
+            if down {
+                self.select_commit_next();
+            } else {
+                self.select_commit_prev();
+            }
+        } else if self.committed_area.get().contains(pos) {
+            self.history_focus = HistoryFocus::CommittedChanges;
+            self.history_move(down);
+        } else if self.diff_area.get().contains(pos) {
+            self.scroll_diff(down, SCROLL_STEP);
         }
     }
 
@@ -597,6 +1035,73 @@ impl App {
         *self.sbs_rows.borrow_mut() = None;
     }
 
+    /// Keep whichever view is active in sync after an input event.
+    fn sync_active(&mut self) {
+        match self.view {
+            ViewMode::Status => self.sync_diff(),
+            ViewMode::History => self.sync_history_diff(),
+        }
+    }
+
+    /// Re-read the active view's data: status re-reads the working tree; history
+    /// re-walks commits (keeping the cursor on the same commit by oid) and
+    /// reloads its file list.
+    fn refresh_active(&mut self) {
+        match self.view {
+            ViewMode::Status => self.refresh(),
+            ViewMode::History => {
+                let current = self.commits.get(self.selected_commit).map(|c| c.id);
+                self.load_history();
+                self.selected_commit = current
+                    .and_then(|id| self.commits.iter().position(|c| c.id == id))
+                    .unwrap_or(0);
+                self.load_commit_files();
+                self.sync_history_diff();
+            }
+        }
+    }
+
+    /// Recompute the history diff for the selected commit + top-pane row. The
+    /// commit (`●`) row shows details instead of a file diff, so it clears the
+    /// cached diff. Indexing is guarded so an empty repo never panics.
+    fn sync_history_diff(&mut self) {
+        if self.view != ViewMode::History {
+            return;
+        }
+        let Some(commit) = self.commits.get(self.selected_commit) else {
+            self.history_diff = None;
+            self.history_diff_key = None;
+            return;
+        };
+        // Row 0 is the commit itself: the right pane shows details, no file diff.
+        if self.committed_row == 0 {
+            if self.history_diff_key.is_some() {
+                self.history_diff = None;
+                self.history_diff_key = None;
+                self.reset_diff_view();
+            }
+            return;
+        }
+        let Some(file) = self.commit_files.get(self.committed_row - 1) else {
+            return;
+        };
+        let key = Some((commit.id, file.path.clone()));
+        if key == self.history_diff_key {
+            return;
+        }
+        self.history_diff = Some(self.repo.commit_file_diff(commit, file));
+        self.history_diff_key = key;
+        self.reset_diff_view();
+    }
+
+    /// Reset the diff pane to the top and drop the per-file render caches, which
+    /// describe the diff being replaced.
+    fn reset_diff_view(&mut self) {
+        self.diff_scroll = 0;
+        self.highlight_cache.borrow_mut().clear();
+        *self.sbs_rows.borrow_mut() = None;
+    }
+
     /// Syntax-highlight one already-sanitised line, memoised per file so
     /// scrolling reuses the result instead of re-parsing through syntect on
     /// every frame. Single-line highlighting carries no cross-line state (see
@@ -628,6 +1133,116 @@ impl App {
         Ref::map(self.sbs_rows.borrow(), |cached| {
             cached.as_ref().expect("filled above")
         })
+    }
+
+    // --- History view: accessors for rendering + mouse ---
+
+    /// The diff the diff pane should render, by view: the status view's selected
+    /// file, or the history view's selected commit file.
+    pub fn active_diff(&self) -> Option<&FileDiff> {
+        match self.view {
+            ViewMode::Status => self.current_diff.as_ref(),
+            ViewMode::History => self.history_diff.as_ref(),
+        }
+    }
+
+    /// The path backing `active_diff`, for the diff title and syntax lookup.
+    pub fn active_diff_path(&self) -> Option<String> {
+        match self.view {
+            ViewMode::Status => self.selected_file().map(|(_, entry)| entry.path.clone()),
+            ViewMode::History => self
+                .commit_files
+                .get(self.committed_row.checked_sub(1)?)
+                .map(|file| file.path.clone()),
+        }
+    }
+
+    /// Whether the history view should show commit details (the `●` row is
+    /// selected) rather than a file diff in the right pane.
+    pub fn history_shows_details(&self) -> bool {
+        self.view == ViewMode::History && self.committed_row == 0
+    }
+
+    /// Whether the diff pane is the focused pane, in either view.
+    pub fn diff_focused(&self) -> bool {
+        match self.view {
+            ViewMode::Status => self.focus == Focus::Diff,
+            ViewMode::History => self.history_focus == HistoryFocus::Diff,
+        }
+    }
+
+    pub fn history_focus(&self) -> HistoryFocus {
+        self.history_focus
+    }
+
+    pub fn commits(&self) -> &[CommitInfo] {
+        &self.commits
+    }
+
+    pub fn graph_rows(&self) -> &[GraphRow] {
+        &self.graph_rows
+    }
+
+    pub fn selected_commit(&self) -> usize {
+        self.selected_commit
+    }
+
+    pub fn selected_commit_info(&self) -> Option<&CommitInfo> {
+        self.commits.get(self.selected_commit)
+    }
+
+    pub fn history_files(&self) -> &[CommitFile] {
+        &self.commit_files
+    }
+
+    pub fn committed_row(&self) -> usize {
+        self.committed_row
+    }
+
+    pub fn committed_state_mut(&self) -> std::cell::RefMut<'_, ListState> {
+        self.committed_state.borrow_mut()
+    }
+
+    pub fn graph_state_mut(&self) -> std::cell::RefMut<'_, ListState> {
+        self.graph_state.borrow_mut()
+    }
+
+    pub fn set_committed_area(&self, area: Rect) {
+        self.committed_area.set(area);
+    }
+
+    pub fn set_graph_area(&self, area: Rect) {
+        self.graph_area.set(area);
+    }
+
+    /// Record the left column's body rect and the horizontal divider row for this
+    /// frame, so a drag on it can be hit-tested (mirrors `set_split_geometry`).
+    pub fn set_hsplit_geometry(&self, left: Rect, hdivider_y: u16) {
+        self.left_col_area.set(left);
+        self.hdivider_y.set(hdivider_y);
+    }
+
+    /// The "Committed Changes" sub-pane height clamped so both it and the Graph
+    /// keep a usable height — and so the result never exceeds the available
+    /// `left_height` on a very short terminal (where even both minimums won't
+    /// fit, the top pane gets what's left and the graph collapses).
+    pub fn committed_pane_height(&self, left_height: u16) -> u16 {
+        let max = left_height
+            .saturating_sub(MIN_GRAPH_HEIGHT)
+            .max(MIN_COMMITTED_HEIGHT)
+            .min(left_height);
+        self.committed_height.clamp(MIN_COMMITTED_HEIGHT, max)
+    }
+
+    /// Whether the horizontal divider shows its active affordance.
+    pub fn hdivider_engaged(&self) -> bool {
+        self.hovering_hdivider || self.dragging_hdivider
+    }
+
+    /// Current height (rows) of the "Committed Changes" sub-pane. Exposed for
+    /// tests that drag the horizontal divider.
+    pub fn committed_height(&self) -> u16 {
+        self.committed_height
     }
 
     /// Largest valid diff scroll offset, from the last render's content rows

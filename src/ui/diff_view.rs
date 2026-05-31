@@ -6,7 +6,7 @@ use ratatui::Frame;
 use syntect::parsing::SyntaxReference;
 use unicode_width::UnicodeWidthChar;
 
-use crate::app::{App, DiffMode, Focus, SbsRow};
+use crate::app::{App, DiffMode, SbsRow};
 use crate::git::{DiffLine, FileDiff, LineKind};
 use crate::ui::syntax::syntax_for;
 use crate::ui::theme::Theme;
@@ -21,11 +21,11 @@ const SBS_GUTTER: usize = 5;
 
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
-    let focused = app.focus == Focus::Diff;
-    let selected = app.selected_file();
+    let focused = app.diff_focused();
+    let path = app.active_diff_path();
 
-    let title = match selected {
-        Some((_, entry)) => format!(" Diff · {} ", entry.path),
+    let title = match &path {
+        Some(path) => format!(" Diff · {path} "),
         None => " Diff ".to_string(),
     };
     let block = panel_block(&title, focused, theme);
@@ -33,7 +33,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(block, area);
     app.set_diff_area(inner);
 
-    let lines = match &app.current_diff {
+    let lines = match app.active_diff() {
         Some(FileDiff::Text(lines)) if !lines.is_empty() => lines,
         other => {
             let message = match other {
@@ -47,8 +47,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         }
     };
 
-    let path = selected.map(|(_, entry)| entry.path.as_str()).unwrap_or("");
-    let syntax = syntax_for(path);
+    let syntax = syntax_for(path.as_deref().unwrap_or(""));
     match app.diff_mode {
         DiffMode::Unified => render_unified(frame, inner, app, lines, syntax),
         DiffMode::SideBySide => render_side_by_side(frame, inner, app, lines, syntax),

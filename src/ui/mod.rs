@@ -1,4 +1,5 @@
 pub mod diff_view;
+pub mod history;
 pub mod modal;
 pub mod staging;
 pub mod syntax;
@@ -10,7 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
 
-use crate::app::App;
+use crate::app::{App, ViewMode};
 use crate::ui::theme::Theme;
 
 /// Top-level render: header / body / footer, with the body split into the
@@ -33,6 +34,21 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     render_header(frame, header, app);
 
+    match app.view {
+        ViewMode::Status => draw_status_body(frame, body, app),
+        ViewMode::History => history::render(frame, body, app),
+    }
+
+    render_footer(frame, footer, app);
+
+    // Overlays draw last, on top of everything.
+    modal::render(frame, app);
+}
+
+/// The status view's body: the Changes panel (fixed width) beside the diff, or
+/// the full-width diff when the panel is hidden.
+fn draw_status_body(frame: &mut Frame, body: Rect, app: &App) {
+    let theme = &app.theme;
     if app.show_changes {
         // The Changes panel is a fixed width; the diff takes the rest, so a
         // wider terminal feeds the diff. Drag the split bar to resize (see
@@ -52,16 +68,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
         app.set_staging_area(Rect::default());
         diff_view::render(frame, body, app);
     }
-
-    render_footer(frame, footer, app);
-
-    // Overlays draw last, on top of everything.
-    modal::render(frame, app);
 }
 
 /// Tint the split bar — the two adjacent pane borders at `divider_x` — with the
 /// focus accent, so it reads as draggable while hovered or being dragged.
-fn highlight_divider(frame: &mut Frame, body: Rect, divider_x: u16, theme: &Theme) {
+pub(crate) fn highlight_divider(frame: &mut Frame, body: Rect, divider_x: u16, theme: &Theme) {
     let style = Style::new()
         .fg(theme.border_focused)
         .add_modifier(Modifier::BOLD);
@@ -82,7 +93,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     // the right-aligned branch never clobbers the left title.
     frame.render_widget(Block::new().style(Style::new().bg(theme.header_bg)), area);
 
-    let left = Line::from(vec![
+    let mut left_spans = vec![
         Span::styled(
             " strix ",
             Style::new()
@@ -90,8 +101,11 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(app.repo_name(), Style::new().fg(theme.dim)),
-    ]);
-    frame.render_widget(Paragraph::new(left), area);
+    ];
+    if app.view == ViewMode::History {
+        left_spans.push(Span::styled(" · history", Style::new().fg(theme.title)));
+    }
+    frame.render_widget(Paragraph::new(Line::from(left_spans)), area);
 
     if let Some(branch) = app.status.head_label() {
         let right = Line::from(Span::styled(
@@ -123,21 +137,34 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         .add_modifier(Modifier::BOLD);
     let label_style = Style::new().fg(theme.footer_fg);
 
-    // The toggle's label tracks what the key will do next.
+    // The `b` toggle's label tracks what the key will do next.
     let changes_label = if app.show_changes {
         "hide  "
     } else {
         "changes  "
     };
+    let hints: Vec<(&str, &str)> = match app.view {
+        ViewMode::Status => vec![
+            (" j/k ", "move  "),
+            (" space ", "stage  "),
+            (" d ", "split  "),
+            (" b ", changes_label),
+            (" i ", "history  "),
+            (" ? ", "help  "),
+            (" q ", "quit"),
+        ],
+        ViewMode::History => vec![
+            (" j/k ", "move  "),
+            (" tab ", "pane  "),
+            (" d ", "split  "),
+            (" b ", changes_label),
+            (" i/esc ", "status  "),
+            (" ? ", "help  "),
+            (" q ", "quit"),
+        ],
+    };
     let mut spans = Vec::new();
-    for (key, label) in [
-        (" j/k ", "move  "),
-        (" space ", "stage  "),
-        (" d ", "split  "),
-        (" b ", changes_label),
-        (" ? ", "help  "),
-        (" q ", "quit"),
-    ] {
+    for (key, label) in hints {
         spans.push(Span::styled(key, key_style));
         spans.push(Span::styled(label, label_style));
     }
@@ -145,6 +172,20 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         Paragraph::new(Line::from(spans)).style(Style::new().bg(theme.footer_bg)),
         area,
     );
+}
+
+/// The highlight style for a selected list row: the selection background, plus
+/// the selection foreground in bold when its pane is focused. Shared by the
+/// staging and history list panes so selection styling stays consistent.
+pub fn selection_style(focused: bool, theme: &Theme) -> Style {
+    if focused {
+        Style::new()
+            .bg(theme.selection_bg)
+            .fg(theme.selection_fg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::new().bg(theme.selection_bg)
+    }
 }
 
 /// A bordered panel with focus-aware border + title colours. Shared by the
