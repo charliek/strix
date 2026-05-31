@@ -173,10 +173,10 @@ jobs:
       - name: Skip if the release-bot App is not configured
         id: guard
         env:
-          APP_ID: ${{ secrets.RELEASE_BOT_APP_ID }}
+          CLIENT_ID: ${{ secrets.RELEASE_BOT_CLIENT_ID }}
         run: |
-          if [ -z "${APP_ID}" ]; then
-            echo "::warning::RELEASE_BOT_APP_ID not set — skipping Homebrew formula update."
+          if [ -z "${CLIENT_ID}" ]; then
+            echo "::warning::RELEASE_BOT_CLIENT_ID not set — skipping Homebrew formula update."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
@@ -187,7 +187,7 @@ jobs:
         id: tap
         uses: actions/create-github-app-token@v3
         with:
-          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          client-id: ${{ secrets.RELEASE_BOT_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_BOT_APP_KEY }}
           owner: charliek
           repositories: homebrew-tap
@@ -255,7 +255,7 @@ jobs:
       - name: Decide whether to dispatch
         id: guard
         env:
-          APP_ID: ${{ secrets.RELEASE_BOT_APP_ID }}
+          CLIENT_ID: ${{ secrets.RELEASE_BOT_CLIENT_ID }}
         run: |
           tag="${GITHUB_REF_NAME}"
           case "${tag}" in
@@ -265,8 +265,8 @@ jobs:
               exit 0
               ;;
           esac
-          if [ -z "${APP_ID}" ]; then
-            echo "::warning::RELEASE_BOT_APP_ID not set — skipping dispatch. apt-charliek can self-heal on its next scheduled re-scan."
+          if [ -z "${CLIENT_ID}" ]; then
+            echo "::warning::RELEASE_BOT_CLIENT_ID not set — skipping dispatch. apt-charliek can self-heal on its next scheduled re-scan."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
@@ -277,7 +277,7 @@ jobs:
         id: apt
         uses: actions/create-github-app-token@v3
         with:
-          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          client-id: ${{ secrets.RELEASE_BOT_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_BOT_APP_KEY }}
           owner: charliek
           repositories: apt-charliek
