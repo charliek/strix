@@ -43,9 +43,8 @@ assertions.
 | Stage / unstage / reset       | Shell out to `git` (`add`, `restore --staged`, `restore`).      |
 
 Reads stay on the pure-Rust path for speed; the three mutations shell out to
-`git`, which the [spec](../spec.md) explicitly sanctions as a fallback — it is
-reliable and sidesteps gix's less-mature index-write porcelain. Those shell-outs
-are confined to `git/ops.rs`.
+`git` because it is reliable and sidesteps gix's less-mature index-write
+porcelain. Those shell-outs are confined to `git/ops.rs`.
 
 ## Diff model
 
@@ -78,12 +77,40 @@ happen lazily for the selected commit only.
 
 ## Performance
 
+Targets (small to mid-size repos, up to ~2M LOC):
+
+| Metric                                  | Target              |
+|-----------------------------------------|---------------------|
+| Startup                                 | < 100 ms            |
+| Diff render (typical file)              | < 50 ms             |
+| Scrolling / pane switching              | No frame drops      |
+| Resident memory                         | Tens of MB, not hundreds |
+
+How they're met:
+
 - Rendered diffs are cached per `(file, mode)` and invalidated when the file or
   diff mode changes.
 - Syntax highlighting runs over the visible window plus a small buffer, not the
   whole file.
-- Targets: startup < 100 ms and diff render < 50 ms on mid-size repos, with no
-  frame drops while scrolling.
+- The history walk decodes commit objects only (no trees or blobs) and is
+  bounded to a page (500 commits); per-commit trees and blobs load lazily for
+  the selected commit.
+
+## Non-goals
+
+strix deliberately leaves these to `git` itself, to other tools, or to a future
+phase:
+
+- Commit creation (use `git commit`)
+- Branch management (create / switch / delete branches)
+- Merge conflict resolution
+- Stashing
+- Remote operations (push, pull, fetch)
+- Hunk-level or line-level staging (file-level only)
+
+Keeping the surface area narrow is the point: strix earns its place by doing
+"review a changeset and stage it" — and now "browse history" — very well, not by
+covering everything `git` does.
 
 ## Testing
 

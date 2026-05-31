@@ -23,9 +23,6 @@ on [ratatui](https://github.com/ratatui/ratatui),
 [gitoxide](https://github.com/GitoxideLabs/gitoxide), and
 [syntect](https://github.com/trishume/syntect).
 
-> **Status:** active development toward the MVP. See
-> [`docs/spec.md`](docs/spec.md) for scope.
-
 ## Installation
 
 ### macOS (Homebrew)

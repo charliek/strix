@@ -8,11 +8,9 @@ strix is built for one workflow done well: review a changeset and stage it. It
 deliberately leaves commit creation, branch management, and remote operations to
 `git` itself, and spends its effort on the parts a terminal usually does poorly —
 a clean two-pane layout, syntax-highlighted diffs, real mouse support, and
-themes that match a modern editor.
-
-!!! note "Status"
-    strix is in active development toward its MVP. See the
-    [Project Spec](spec.md) for the full scope and non-goals.
+themes that match a modern editor. See
+[Non-goals](reference/architecture.md#non-goals) for the full list of what strix
+intentionally doesn't do.
 
 ## What it looks like
 
