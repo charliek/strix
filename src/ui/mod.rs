@@ -140,7 +140,11 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     let hints: Vec<(&str, &str)> = match app.view {
         ViewMode::Status => {
             // The toggle's label tracks what the key will do next.
-            let changes_label = if app.show_changes { "hide  " } else { "changes  " };
+            let changes_label = if app.show_changes {
+                "hide  "
+            } else {
+                "changes  "
+            };
             vec![
                 (" j/k ", "move  "),
                 (" space ", "stage  "),

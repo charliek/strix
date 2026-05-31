@@ -153,7 +153,11 @@ fn row_cells(
     // Corners for side-lanes joining (converging) or leaving (spawned) the node.
     for &lane in converging {
         if lane != node_lane {
-            glyphs[lane] = if lane > node_lane { JOIN_RIGHT } else { JOIN_LEFT };
+            glyphs[lane] = if lane > node_lane {
+                JOIN_RIGHT
+            } else {
+                JOIN_LEFT
+            };
         }
     }
     for &lane in spawned {

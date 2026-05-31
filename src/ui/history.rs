@@ -124,7 +124,11 @@ fn render_details(frame: &mut Frame, area: Rect, app: &App) {
 
     let value = Style::new().fg(theme.fg);
     let mut lines = vec![
-        field("commit ", &commit.id.to_string(), Style::new().fg(theme.title)),
+        field(
+            "commit ",
+            &commit.id.to_string(),
+            Style::new().fg(theme.title),
+        ),
         field(
             "Author ",
             &format!("{} <{}>", commit.author_name, commit.author_email),
@@ -137,8 +141,7 @@ fn render_details(frame: &mut Frame, area: Rect, app: &App) {
         ),
     ];
     // Only show the committer when it differs from the author.
-    if commit.committer_name != commit.author_name
-        || commit.committer_email != commit.author_email
+    if commit.committer_name != commit.author_name || commit.committer_email != commit.author_email
     {
         lines.push(field(
             "Commit ",
@@ -163,7 +166,9 @@ fn field(name: &str, val: &str, val_style: Style) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             name.to_string(),
-            Style::new().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+            Style::new()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(val.to_string(), val_style),
     ])
@@ -191,7 +196,10 @@ fn stat_summary(files: &[CommitFile], theme: &Theme) -> Vec<Line<'static>> {
             Span::styled(file.display_path(), Style::new().fg(theme.fg)),
         ];
         if file.stat.binary {
-            spans.push(Span::styled("  (binary)".to_string(), Style::new().fg(theme.dim)));
+            spans.push(Span::styled(
+                "  (binary)".to_string(),
+                Style::new().fg(theme.dim),
+            ));
         } else {
             spans.push(Span::styled(
                 format!("  +{} ", file.stat.added),
@@ -252,7 +260,10 @@ fn graph_row(row: &GraphRow, commits: &[CommitInfo], theme: &Theme) -> ListItem<
                     .add_modifier(Modifier::BOLD),
             ));
         }
-        spans.push(Span::styled(commit.summary.clone(), Style::new().fg(theme.fg)));
+        spans.push(Span::styled(
+            commit.summary.clone(),
+            Style::new().fg(theme.fg),
+        ));
     }
     ListItem::new(Line::from(spans))
 }
@@ -302,7 +313,11 @@ fn fmt_time(seconds: i64, offset: i32) -> String {
     let secs = local.rem_euclid(86_400);
     let (hour, minute) = (secs / 3600, (secs % 3600) / 60);
     let (year, month, day) = civil_from_days(days);
-    let (sign, off) = if offset < 0 { ('-', -offset) } else { ('+', offset) };
+    let (sign, off) = if offset < 0 {
+        ('-', -offset)
+    } else {
+        ('+', offset)
+    };
     let (oh, om) = (off / 3600, (off % 3600) / 60);
     format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02} {sign}{oh:02}{om:02}")
 }

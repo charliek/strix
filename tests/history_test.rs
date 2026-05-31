@@ -1,8 +1,6 @@
 mod common;
 
-use common::{
-    init_empty_repo, init_repo_with_branches, init_repo_with_history, setup_for_binary,
-};
+use common::{init_empty_repo, init_repo_with_branches, init_repo_with_history, setup_for_binary};
 use strix::git::{ChangeKind, CommitFile, CommitInfo, FileDiff, LineKind, Repo};
 
 fn commit<'a>(commits: &'a [CommitInfo], summary: &str) -> &'a CommitInfo {

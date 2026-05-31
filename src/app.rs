@@ -618,8 +618,7 @@ impl App {
         if self.selected_commit + 1 >= self.commits.len() {
             self.load_more_history();
         }
-        self.selected_commit =
-            (self.selected_commit + 1).min(self.commits.len().saturating_sub(1));
+        self.selected_commit = (self.selected_commit + 1).min(self.commits.len().saturating_sub(1));
         self.load_commit_files();
     }
 
@@ -1195,6 +1194,12 @@ impl App {
     /// Whether the horizontal divider shows its active affordance.
     pub fn hdivider_engaged(&self) -> bool {
         self.hovering_hdivider || self.dragging_hdivider
+    }
+
+    /// Current height (rows) of the "Committed Changes" sub-pane. Exposed for
+    /// tests that drag the horizontal divider.
+    pub fn committed_height(&self) -> u16 {
+        self.committed_height
     }
 
     /// Largest valid diff scroll offset, from the last render's content rows
