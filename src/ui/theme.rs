@@ -33,6 +33,18 @@ pub struct Theme {
     pub del_bg: Color,
     pub hunk: Color,
     pub line_no: Color,
+    /// Cycling colours for the history graph's branch lanes.
+    pub lanes: Vec<Color>,
+}
+
+impl Theme {
+    /// The colour for graph lane `index`, cycling through the palette.
+    pub fn lane(&self, index: usize) -> Color {
+        if self.lanes.is_empty() {
+            return self.title;
+        }
+        self.lanes[index % self.lanes.len()]
+    }
 }
 
 const fn rgb(r: u8, g: u8, b: u8) -> Color {
@@ -100,6 +112,14 @@ impl Theme {
             del_bg: rgb(49, 32, 39),
             hunk: rgb(125, 207, 255),
             line_no: rgb(60, 67, 99),
+            lanes: vec![
+                rgb(122, 162, 247),
+                rgb(158, 206, 106),
+                rgb(224, 175, 104),
+                rgb(187, 154, 247),
+                rgb(125, 207, 255),
+                rgb(247, 118, 142),
+            ],
         }
     }
 
@@ -128,6 +148,14 @@ impl Theme {
             del_bg: rgb(42, 31, 31),
             hunk: rgb(95, 175, 215),
             line_no: rgb(88, 88, 88),
+            lanes: vec![
+                rgb(95, 135, 215),
+                rgb(135, 175, 95),
+                rgb(215, 175, 95),
+                rgb(175, 135, 215),
+                rgb(95, 175, 215),
+                rgb(215, 95, 95),
+            ],
         }
     }
 
@@ -156,6 +184,14 @@ impl Theme {
             del_bg: rgb(255, 238, 240),
             hunk: rgb(1, 132, 188),
             line_no: rgb(192, 192, 192),
+            lanes: vec![
+                rgb(64, 120, 242),
+                rgb(80, 161, 79),
+                rgb(193, 132, 1),
+                rgb(166, 38, 164),
+                rgb(1, 132, 188),
+                rgb(228, 86, 73),
+            ],
         }
     }
 
@@ -184,6 +220,14 @@ impl Theme {
             del_bg: rgb(48, 35, 43),
             hunk: rgb(137, 220, 235),
             line_no: rgb(69, 71, 90),
+            lanes: vec![
+                rgb(137, 180, 250),
+                rgb(166, 227, 161),
+                rgb(249, 226, 175),
+                rgb(203, 166, 247),
+                rgb(137, 220, 235),
+                rgb(243, 139, 168),
+            ],
         }
     }
 
@@ -212,6 +256,14 @@ impl Theme {
             del_bg: rgb(58, 36, 32),
             hunk: rgb(131, 165, 152),
             line_no: rgb(80, 73, 69),
+            lanes: vec![
+                rgb(131, 165, 152),
+                rgb(184, 187, 38),
+                rgb(250, 189, 47),
+                rgb(211, 134, 155),
+                rgb(142, 192, 124),
+                rgb(251, 73, 52),
+            ],
         }
     }
 
