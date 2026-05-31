@@ -158,12 +158,40 @@ jobs:
           done
           gh release upload "${GITHUB_REF_NAME}" "${assets[@]}" --clobber
 
+  # ─── flip the Release out of draft + mark it as `latest` ───
+  # See cc-plugins:release-workflows references/workflows/job-finalize-release.yml
+  # for the rationale. Short version: `gh release create` occasionally stores
+  # a release as a tag-less draft when the just-pushed tag isn't yet visible
+  # to the Release API, asset uploads then attach to the draft, and the public
+  # `releases/download/<tag>/...` URLs serve 404 even though
+  # `gh release view <tag>` shows the assets. The homebrew job below curls
+  # those URLs to hash the tarballs and would fail in that state. Flipping
+  # the release out of draft rewrites asset URLs to use the tag slug.
+  # Idempotent — `--draft=false --latest` on an already-published latest
+  # release is a no-op. Strix v0.0.2 hit this; the fix landed in
+  # cc-plugins#12 and is adopted here.
+  finalize-release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish the Release (flip draft → latest)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          gh release edit "${tag}" --draft=false --latest
+          echo "::notice::Release ${tag} published (not draft, marked latest)."
+
   # ─── render + push Formula/strix.rb to charliek/homebrew-tap ───
   # Uses a release-bot App token scoped to homebrew-tap (no PAT). The formula's
   # sha256s depend on built bytes, so this is a post-build CI step, not part of
-  # update-version.sh.
+  # update-version.sh. `needs: finalize-release` (not `build`) so the public
+  # asset URLs are guaranteed reachable before we curl them.
   homebrew:
-    needs: build
+    needs: finalize-release
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -206,10 +234,25 @@ jobs:
           # Pull the four release tarballs and hash them. strix is a public repo,
           # so the assets download over plain HTTPS — no token needed here (the
           # tap token in GH_TOKEN is scoped to homebrew-tap, not strix).
+          #
+          # Retry on 404: even with finalize-release in front of this job, the
+          # public `releases/download/<tag>/...` URL has a short CDN
+          # propagation lag (typically 5-20s on first hit) after a release is
+          # published. Retry with backoff before giving up. Matches the
+          # convention's job-homebrew-tap.yml template (cc-plugins#12).
           dl="$(mktemp -d)"
           for triple in darwin_amd64 darwin_arm64 linux_amd64 linux_arm64; do
-            curl -fsSL -o "${dl}/strix_${triple}.tar.gz" \
-              "https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/strix_${triple}.tar.gz"
+            url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/strix_${triple}.tar.gz"
+            out="${dl}/strix_${triple}.tar.gz"
+            for attempt in 1 2 3 4 5; do
+              if curl -fsSL -o "${out}" "${url}"; then break; fi
+              if [ "${attempt}" = 5 ]; then
+                echo "::error::Failed to download ${url} after 5 attempts (last status from curl above)."
+                exit 1
+              fi
+              echo "::warning::Download attempt ${attempt} failed for ${url}; retrying in 10s."
+              sleep 10
+            done
           done
           sha() { shasum -a 256 "${dl}/strix_$1.tar.gz" | awk '{print $1}'; }
 
@@ -249,7 +292,7 @@ jobs:
   # Uses a release-bot App token scoped to apt-charliek (no PAT). The
   # repository_dispatch endpoint needs Contents:write, which the App has.
   apt-dispatch:
-    needs: build
+    needs: finalize-release
     runs-on: ubuntu-latest
     steps:
       - name: Decide whether to dispatch
