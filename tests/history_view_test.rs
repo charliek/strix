@@ -46,7 +46,7 @@ fn history_app() -> (TempDir, App) {
 #[test]
 fn y_enters_history_view() {
     let (_repo, mut app) = history_app();
-    app.on_key(key('y'));
+    app.on_key(key('i'));
     assert_eq!(app.view, ViewMode::History);
     let out = dump(&app);
     assert!(out.contains("Committed Changes"), "frame:\n{out}");
@@ -56,7 +56,7 @@ fn y_enters_history_view() {
 #[test]
 fn esc_exits_to_status() {
     let (_repo, mut app) = history_app();
-    app.on_key(key('y'));
+    app.on_key(key('i'));
     assert_eq!(app.view, ViewMode::History);
     app.on_key(esc());
     assert_eq!(app.view, ViewMode::Status);
@@ -76,7 +76,7 @@ fn number_keys_switch_views() {
 #[test]
 fn commit_row_shows_details() {
     let (_repo, mut app) = history_app();
-    app.on_key(key('y'));
+    app.on_key(key('i'));
     // Defaults to the commit row, so the right pane shows details.
     assert!(app.history_shows_details());
     let out = dump(&app);
@@ -90,7 +90,7 @@ fn commit_row_shows_details() {
 #[test]
 fn selecting_a_file_shows_its_diff() {
     let (_repo, mut app) = history_app();
-    app.on_key(key('y'));
+    app.on_key(key('i'));
     // Render once so the graph/committed geometry is recorded.
     let _ = dump(&app);
     // Move focus to the committed-changes list and step onto the first file.
@@ -116,7 +116,7 @@ fn selecting_a_file_shows_its_diff() {
 #[test]
 fn selecting_a_graph_commit_defaults_to_details() {
     let (_repo, mut app) = history_app();
-    app.on_key(key('y'));
+    app.on_key(key('i'));
     let _ = dump(&app);
     // Graph is focused by default; move down to an older commit.
     app.on_key(key('j'));
@@ -132,7 +132,7 @@ fn selecting_a_graph_commit_defaults_to_details() {
 #[test]
 fn clicking_a_graph_row_selects_that_commit() {
     let (_repo, mut app) = history_app();
-    app.on_key(key('y'));
+    app.on_key(key('i'));
     let _ = dump(&app);
     // The graph pane sits below the committed pane (top height 12) inside the
     // body (which starts at row 1): its first row is around y = 1 + 12 + 1.
@@ -145,7 +145,7 @@ fn clicking_a_graph_row_selects_that_commit() {
 #[test]
 fn dragging_horizontal_divider_resizes_committed_pane() {
     let (_repo, mut app) = history_app();
-    app.on_key(key('y'));
+    app.on_key(key('i'));
     let _ = dump(&app);
     assert_eq!(app.committed_height(), 12, "default height");
 
@@ -165,7 +165,7 @@ fn dragging_horizontal_divider_resizes_committed_pane() {
 #[test]
 fn horizontal_divider_drag_clamps_to_minimum() {
     let (_repo, mut app) = history_app();
-    app.on_key(key('y'));
+    app.on_key(key('i'));
     let _ = dump(&app);
 
     let dy = 1 + app.committed_height();
@@ -179,7 +179,7 @@ fn horizontal_divider_drag_clamps_to_minimum() {
 #[test]
 fn b_collapses_and_restores_the_history_left_panel() {
     let (_repo, mut app) = history_app();
-    app.on_key(key('y'));
+    app.on_key(key('i'));
     let before = dump(&app);
     assert!(
         before.contains("Committed Changes"),
@@ -214,7 +214,7 @@ fn b_collapses_and_restores_the_history_left_panel() {
 fn empty_repo_history_renders_without_panic() {
     let dir = common::init_empty_repo();
     let mut app = App::new(dir.path().to_path_buf()).unwrap();
-    app.on_key(key('y'));
+    app.on_key(key('i'));
     assert_eq!(app.view, ViewMode::History);
     let out = dump(&app);
     assert!(out.contains("No commits"), "empty-state frame:\n{out}");

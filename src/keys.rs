@@ -111,7 +111,7 @@ const DEFAULTS: &[(&str, Action)] = &[
     ("backtab", Action::SwitchPane),
     ("d", Action::ToggleDiffMode),
     ("b", Action::ToggleChanges),
-    ("y", Action::ToggleHistory),
+    ("i", Action::ToggleHistory),
     ("1", Action::ShowStatus),
     ("2", Action::ShowHistory),
     ("j", Action::Down),
