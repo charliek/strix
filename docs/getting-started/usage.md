@@ -86,7 +86,7 @@ strix diff v1.2.0...HEAD   # review HEAD against v1.2.0's merge base
 staging view — the changeset is a branch against its base rather than the
 working tree:
 
-```
+```text
  strix  my-repo · main…HEAD                                                
 ╭ Changes ───────────────────╮╭ Diff · unified ──────────────────────╮
 │ M src/app.rs       +40 −2  ││  src/app.rs                          │
@@ -126,8 +126,9 @@ A few things behave differently here than in the staging view:
   well (not a toggle); `Esc` does **not** exit the review session — quit with
   `q`.
 
-An unresolvable range (unknown revision, or no merge base between the two
-sides) fails before the TUI opens: strix exits non-zero and prints a message
+An unresolvable range (unknown revision, an operand that is not a commit —
+e.g. a blob — or no merge base between the two sides) fails before the TUI
+opens: strix exits non-zero and prints a message
 naming the offending operand. See [CLI](../reference/cli.md) for the full
 grammar, the merge-base caveat, and exit behavior.
 

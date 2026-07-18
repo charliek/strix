@@ -31,7 +31,8 @@ assertions.
 | `git`         | Repository access: status, history, diffs, mutations.             |
 | `git/review.rs` | Branch-range review: `resolve_range` (gix `merge_base`), file listing via paired `git diff-tree` name-status/numstat runs, and lazy per-file diffs. |
 | `graph`       | Pure rail-graph lane layout for the history view.                 |
-| `config`      | Config read (`toml`) and write-back (`toml_edit`); theme loading; keybinding/mouse dispatch tables. |
+| `config`      | Config read (`toml`) and write-back (`toml_edit`). |
+| `keys`        | The configurable keymap: `Action`, default chords, `[keys]` overrides; dispatch itself lives in `App::on_key`/`App::on_mouse`. |
 
 ## Git layer
 

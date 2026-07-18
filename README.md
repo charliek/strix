@@ -66,9 +66,11 @@ Press `i` for the **History view**: a branch/merge rail graph of the current
 branch on the left, commit details or file diffs (vs the commit's first parent)
 on the right. `Esc` or `i` returns to staging.
 
-`strix diff <RANGE>` opens a read-only review of a branch against its merge
-base — the same "what does this branch add" comparison a GitHub pull request
-shows. See [Usage](docs/getting-started/usage.md#reviewing-a-branch) for the
+`strix diff <RANGE>` opens a read-only review of a range. The bare `BASE`
+and `A...B` forms compare against the merge base — the same "what does this
+branch add" comparison a GitHub pull request shows — while `A..B` compares
+the two revisions directly. See
+[Usage](docs/getting-started/usage.md#reviewing-a-branch) for the
 range grammar and [keybindings](docs/getting-started/keybindings.md) for the
 full key set.
 

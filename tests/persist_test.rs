@@ -118,25 +118,21 @@ fn invalid_existing_toml_is_never_clobbered() {
 }
 
 #[test]
-#[cfg(unix)]
-fn read_only_dir_fails_deterministically_with_no_residue() {
-    use std::os::unix::fs::PermissionsExt;
-
+fn unusable_config_dir_fails_deterministically_with_no_residue() {
+    // A config dir whose parent is a regular file: create_dir_all fails on
+    // every platform and for every euid (0o555 tricks pass under root).
     let base = tempfile::tempdir().unwrap();
-    let dir = base.path().join("ro");
-    fs::create_dir(&dir).unwrap();
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+    let blocker = base.path().join("blocker");
+    fs::write(&blocker, "not a directory").unwrap();
+    let dir = blocker.join("strix");
 
     let result = persist(&dir, Setting::Theme("dark".to_string()));
 
-    // Restore write permission so the tempdir can clean itself up.
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
-
     assert!(
         result.is_err(),
-        "a read-only dir can't accept the temp file"
+        "a dir that cannot exist can't accept the temp file"
     );
-    assert!(tmp_residue(&dir).is_empty());
+    assert!(tmp_residue(base.path()).is_empty());
 }
 
 // --- App wiring: t/d/n persist through the injected config dir ---
@@ -200,23 +196,18 @@ fn pressing_t_with_no_config_dir_still_flashes_the_theme_not_a_persist_error() {
 }
 
 #[test]
-#[cfg(unix)]
 fn a_deterministic_persist_failure_flashes_info_but_keeps_the_in_app_change() {
-    use std::os::unix::fs::PermissionsExt;
-
     let repo = init_repo();
     let base = tempfile::tempdir().unwrap();
-    let dir = base.path().join("ro");
-    fs::create_dir(&dir).unwrap();
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+    let blocker = base.path().join("blocker");
+    fs::write(&blocker, "not a directory").unwrap();
+    let dir = blocker.join("strix");
 
     let mut app = App::new(repo.path().to_path_buf())
         .unwrap()
         .with_config_dir(Some(dir.clone()));
 
     press(&mut app, 'd');
-
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
 
     assert_eq!(
         app.diff_mode,

@@ -241,25 +241,38 @@ fn staged_paths(dir: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
+/// A review session over a repo with a DIRTY worktree: if a staging input ever
+/// leaked through to the status handlers, there would be something to stage.
+fn dirty_review_app() -> (TempDir, App) {
+    let repo = init_repo_with_diverged_branches();
+    write(repo.path(), "feature.txt", "uncommitted local edit\n");
+    let app = App::for_review(repo.path().to_path_buf(), &Config::default(), "main").unwrap();
+    assert!(
+        !app.status.unstaged.is_empty(),
+        "fixture must have stageable changes for inertness to mean anything"
+    );
+    (repo, app)
+}
+
 #[test]
 fn staging_keys_are_inert() {
-    let (repo, mut app) = review_app("main");
+    let (repo, mut app) = dirty_review_app();
     let before = staged_paths(repo.path());
     let _ = dump(&app);
     for k in [space(), enter(), key('s'), key('u'), key('x')] {
         app.on_key(k);
         assert!(app.modal.is_none(), "no modal opens in review");
+        assert_eq!(
+            staged_paths(repo.path()),
+            before,
+            "staging keys must not touch the index in review"
+        );
     }
-    assert_eq!(
-        staged_paths(repo.path()),
-        before,
-        "staging keys must not touch the index in review"
-    );
 }
 
 #[test]
 fn marker_column_click_does_not_stage() {
-    let (repo, mut app) = review_app("main");
+    let (repo, mut app) = dirty_review_app();
     let before = staged_paths(repo.path());
     // Render first so the list geometry is recorded.
     let _ = dump(&app);

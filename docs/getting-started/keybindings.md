@@ -98,7 +98,7 @@ does not exit the session (unlike History); quit with `q`.
 | Gesture                       | Action                                          |
 |-------------------------------|-------------------------------------------------|
 | Click a file                  | Select it (and show its diff)                   |
-| Click a file's status marker  | Toggle stage / unstage                          |
+| Click a file's status marker  | Toggle stage / unstage (staging view only; a no-op in the read-only Review view) |
 | Click a pane                  | Focus that pane                                 |
 | Click a commit in the graph   | Select it (and show its details)                |
 | Drag the vertical split bar   | Resize the left column vs the diff              |

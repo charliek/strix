@@ -398,6 +398,11 @@ impl App {
     /// theme-cycle resolution hermetic.
     pub fn with_config_dir(mut self, config_dir: Option<PathBuf>) -> Self {
         self.config_dir = config_dir;
+        // Re-resolve against the injected directory so startup resolution and
+        // later cycling/persistence always read the same themes/ location.
+        let (name, theme) = Theme::resolve(&self.theme_name, self.config_dir.as_deref());
+        self.theme_name = name;
+        self.theme = theme;
         self
     }
 
