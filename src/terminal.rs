@@ -149,9 +149,16 @@ fn install_panic_hook() {
 /// `--dump-frame` and by integration tests to assert on rendered output without
 /// driving a real terminal.
 pub fn dump_frame(app: &App, width: u16, height: u16) -> Result<String> {
+    Ok(buffer_to_string(&render_to_buffer(app, width, height)?))
+}
+
+/// Render a single frame to the in-memory test backend and return the raw
+/// [`Buffer`], so tests can assert on per-cell styling (e.g. foreground colours)
+/// that `dump_frame`'s text serialization drops.
+pub fn render_to_buffer(app: &App, width: u16, height: u16) -> Result<Buffer> {
     let mut terminal = Terminal::new(TestBackend::new(width, height))?;
     terminal.draw(|frame| ui::draw(frame, app))?;
-    Ok(buffer_to_string(terminal.backend().buffer()))
+    Ok(terminal.backend().buffer().clone())
 }
 
 fn buffer_to_string(buffer: &Buffer) -> String {

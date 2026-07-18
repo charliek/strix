@@ -412,7 +412,7 @@ fn deleted_branch_flashes_and_keeps_the_stale_list() {
     app.reload();
 
     assert!(
-        app.last_error.is_some(),
+        app.flash.is_some(),
         "a failed re-resolution flashes an error"
     );
     let files_after: Vec<String> = app.review_files().iter().map(|f| f.path.clone()).collect();
@@ -435,13 +435,13 @@ fn recovered_branch_clears_the_flash_and_updates_the_list() {
 
     git(repo.path(), &["branch", "-D", "main"]);
     app.reload();
-    assert!(app.last_error.is_some());
+    assert!(app.flash.is_some());
 
     // Recreate the base branch: the next reload must recover and stop flashing.
     git(repo.path(), &["branch", "main", main_tip.trim()]);
     app.reload();
     assert!(
-        app.last_error.is_none(),
+        app.flash.is_none(),
         "a successful refresh clears the review flash"
     );
     assert!(!app.review_files().is_empty());

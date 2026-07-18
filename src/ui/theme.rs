@@ -56,35 +56,115 @@ impl Theme {
     pub const PRESETS: &'static [&'static str] =
         &["tokyo-night", "dark", "light", "catppuccin", "gruvbox"];
 
+    /// The canonical preset name for `name` (folding aliases and case/`_`-`-`
+    /// spelling), or `None` if there's no such preset. Single source of truth for
+    /// the alias table, shared by [`preset`](Self::preset) and
+    /// [`resolve`](Self::resolve).
+    fn preset_canonical(name: &str) -> Option<&'static str> {
+        Some(match normalize(name).as_str() {
+            "tokyo-night" | "tokyonight" | "tokyo" => "tokyo-night",
+            "dark" => "dark",
+            "light" => "light",
+            "catppuccin" | "catppuccin-mocha" | "mocha" => "catppuccin",
+            "gruvbox" | "gruvbox-dark" => "gruvbox",
+            _ => return None,
+        })
+    }
+
     /// A built-in theme by name (case-insensitive, `_` and `-` interchangeable),
     /// or `None` if there's no such preset.
     pub fn preset(name: &str) -> Option<Theme> {
-        match normalize(name).as_str() {
-            "tokyo-night" | "tokyonight" | "tokyo" => Some(Self::tokyo_night()),
-            "dark" => Some(Self::dark()),
-            "light" => Some(Self::light()),
-            "catppuccin" | "catppuccin-mocha" | "mocha" => Some(Self::catppuccin()),
-            "gruvbox" | "gruvbox-dark" => Some(Self::gruvbox()),
-            _ => None,
+        Some(Self::theme_for_canonical(Self::preset_canonical(name)?))
+    }
+
+    /// Build the palette for an already-canonical preset name. Kept separate from
+    /// [`preset_canonical`](Self::preset_canonical) so [`resolve`](Self::resolve)
+    /// can build a theme from a canonical name it already computed, without
+    /// re-normalizing or re-matching the alias table.
+    fn theme_for_canonical(canonical: &str) -> Theme {
+        match canonical {
+            "tokyo-night" => Self::tokyo_night(),
+            "dark" => Self::dark(),
+            "light" => Self::light(),
+            "catppuccin" => Self::catppuccin(),
+            "gruvbox" => Self::gruvbox(),
+            other => unreachable!("non-canonical preset name {other:?}"),
         }
     }
 
-    /// Resolve a theme by name: a built-in preset, or a `<name>.toml` file in the
-    /// config directory's `themes/`. Falls back to the default with a warning.
-    pub fn load(name: &str, config_dir: Option<&Path>) -> Theme {
-        if let Some(theme) = Self::preset(name) {
-            return theme;
+    /// Resolve a theme by name, reporting the **canonical** name actually loaded
+    /// alongside the theme. Aliases fold to their canonical preset name; an
+    /// unknown name and a malformed custom file both resolve to
+    /// `("tokyo-night", default)`; a valid custom `<name>.toml` resolves to its
+    /// stem. Reporting the resolved name (never the requested one) keeps the shown
+    /// name from ever diverging from the displayed theme.
+    pub fn resolve(name: &str, config_dir: Option<&Path>) -> (String, Theme) {
+        if let Some(canonical) = Self::preset_canonical(name) {
+            return (canonical.to_string(), Self::theme_for_canonical(canonical));
         }
         if let Some(dir) = config_dir {
             let path = dir.join("themes").join(format!("{name}.toml"));
             match std::fs::read_to_string(&path) {
-                Ok(text) => return Theme::from_toml(&text),
+                Ok(text) => {
+                    return match Theme::from_toml_checked(&text) {
+                        Some(theme) => (name.to_string(), theme),
+                        // A malformed file warns and resolves to the default,
+                        // whose canonical name is what gets reported/flashed.
+                        None => (Self::PRESETS[0].to_string(), Theme::default()),
+                    };
+                }
                 Err(err) => tracing::warn!("theme {name:?} not found ({err}); using default"),
             }
         } else {
             tracing::warn!("unknown theme {name:?}; using default");
         }
-        Theme::default()
+        (Self::PRESETS[0].to_string(), Theme::default())
+    }
+
+    /// The themes that can be cycled through, in cycle order: the `PRESETS` first
+    /// (their canonical order), then user `themes/*.toml` stems sorted lexically.
+    /// A custom stem that shadows a preset name is omitted — presets win, matching
+    /// [`resolve`](Self::resolve)/[`load`](Self::load) precedence.
+    pub fn available(config_dir: Option<&Path>) -> Vec<String> {
+        let mut names: Vec<String> = Self::PRESETS.iter().map(|name| name.to_string()).collect();
+        if let Some(dir) = config_dir {
+            let mut user = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(dir.join("themes")) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
+                        continue;
+                    }
+                    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                        continue;
+                    };
+                    if Self::preset_canonical(stem).is_some() {
+                        // A stem shadowing a preset name OR alias is omitted:
+                        // resolve() would load the preset, never the file.
+                        continue;
+                    }
+                    user.push(stem.to_string());
+                }
+            }
+            user.sort();
+            names.extend(user);
+        }
+        names
+    }
+
+    /// Resolve the theme that follows `current` in the cycle, wrapping around.
+    /// `current` is matched against [`available`](Self::available) (enumerated
+    /// fresh each call, so a newly added/removed user theme is picked up); a
+    /// `current` no longer present — e.g. its file was deleted — restarts the
+    /// cycle at index 0. Returns the canonical name + theme via
+    /// [`resolve`](Self::resolve).
+    pub fn cycle(current: &str, config_dir: Option<&Path>) -> (String, Theme) {
+        let names = Self::available(config_dir);
+        let next = match names.iter().position(|name| name == current) {
+            Some(index) => (index + 1) % names.len(),
+            None => 0,
+        };
+        Self::resolve(&names[next], config_dir)
     }
 
     fn tokyo_night() -> Self {
@@ -268,14 +348,16 @@ impl Theme {
     }
 
     /// Parse a custom theme: a `base` preset (default `tokyo-night`) with any
-    /// `[colors]` and `syntax` fields overridden. Unknown/invalid fields keep
-    /// the base value.
-    fn from_toml(text: &str) -> Theme {
+    /// `[colors]` and `syntax` fields overridden. Unknown/invalid fields keep the
+    /// base value. Returns `None` for a malformed file (a TOML parse error), so
+    /// [`resolve`](Self::resolve) can report the default theme's canonical name
+    /// instead of the broken file's stem.
+    fn from_toml_checked(text: &str) -> Option<Theme> {
         let file: ThemeFile = match toml::from_str(text) {
             Ok(file) => file,
             Err(err) => {
                 tracing::warn!("invalid theme file ({err}); using default");
-                return Theme::default();
+                return None;
             }
         };
         let mut theme = file
@@ -287,7 +369,7 @@ impl Theme {
             theme.syntax_theme = syntax;
         }
         file.colors.apply(&mut theme);
-        theme
+        Some(theme)
     }
 }
 

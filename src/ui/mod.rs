@@ -12,7 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{App, ViewMode};
+use crate::app::{App, FlashKind, ViewMode};
 use crate::git::{ChangeKind, CommitFile};
 use crate::ui::theme::Theme;
 
@@ -138,12 +138,20 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
 
-    // A failed action shows a transient error in place of the key hints.
-    if let Some(error) = &app.last_error {
-        let line = Line::from(Span::styled(
-            format!(" ✗ {error}"),
-            Style::new().fg(theme.del).add_modifier(Modifier::BOLD),
-        ));
+    // A transient flash takes the footer in place of the key hints. Errors keep
+    // the `✗` + bold `del` styling; info notices (e.g. a theme name after a cycle)
+    // render plainly in `fg` with no marker, matching the house minimalism.
+    if let Some(flash) = &app.flash {
+        let line = match flash.kind {
+            FlashKind::Error => Line::from(Span::styled(
+                format!(" ✗ {}", flash.text),
+                Style::new().fg(theme.del).add_modifier(Modifier::BOLD),
+            )),
+            FlashKind::Info => Line::from(Span::styled(
+                format!(" {}", flash.text),
+                Style::new().fg(theme.fg),
+            )),
+        };
         frame.render_widget(
             Paragraph::new(line).style(Style::new().bg(theme.footer_bg)),
             area,
@@ -168,6 +176,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             (" space ", "stage  "),
             (" d ", "split  "),
             (" n ", "line #s  "),
+            (" t ", "theme  "),
             (" b ", changes_label),
             (" i ", "history  "),
             (" ? ", "help  "),
@@ -178,6 +187,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             (" tab ", "pane  "),
             (" d ", "split  "),
             (" n ", "line #s  "),
+            (" t ", "theme  "),
             (" b ", changes_label),
             (" i/esc ", "back  "),
             (" ? ", "help  "),
@@ -188,6 +198,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             (" tab ", "pane  "),
             (" d ", "split  "),
             (" n ", "line #s  "),
+            (" t ", "theme  "),
             (" b ", changes_label),
             (" i ", "history  "),
             (" ? ", "help  "),

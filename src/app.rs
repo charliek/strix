@@ -87,6 +87,37 @@ pub enum HistoryFocus {
 /// (`Rc`) so the per-file cache can hand out cheap clones each frame.
 type HighlightedLine = Rc<[(Color, String)]>;
 
+/// A transient footer message shown until the next input. `Error` marks a failed
+/// action (e.g. a stage that git rejected); `Info` a benign notice (e.g. the
+/// theme name after a cycle). Same clear-on-next-input lifecycle for both.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Flash {
+    pub text: String,
+    pub kind: FlashKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlashKind {
+    Error,
+    Info,
+}
+
+impl Flash {
+    pub fn error(text: impl Into<String>) -> Self {
+        Flash {
+            text: text.into(),
+            kind: FlashKind::Error,
+        }
+    }
+
+    pub fn info(text: impl Into<String>) -> Self {
+        Flash {
+            text: text.into(),
+            kind: FlashKind::Info,
+        }
+    }
+}
+
 /// A side-by-side row, referencing diff lines by index into the file's
 /// `Vec<DiffLine>`. Indices (not borrows) let the row layout be computed once
 /// per file and cached on `App` without a self-referential borrow.
@@ -176,9 +207,13 @@ pub struct App {
     hovering_divider: bool,
     pub modal: Option<Modal>,
     pub theme: Theme,
+    /// The canonical name of the active theme (from `Theme::resolve`), so the
+    /// cycle can find the current position and the flash never names a theme
+    /// other than the one on screen.
+    pub theme_name: String,
     pub should_quit: bool,
-    /// A transient error from the last action, shown until the next keypress.
-    pub last_error: Option<String>,
+    /// A transient message from the last action, shown until the next input.
+    pub flash: Option<Flash>,
 
     /// Cached diff for the selected file; recomputed only when the selection
     /// changes (see `sync_diff`).
@@ -274,7 +309,7 @@ impl App {
     fn build(repo_path: PathBuf, config: &Config, range: Option<&str>) -> anyhow::Result<Self> {
         let repo = Repo::open(&repo_path)?;
         let status = repo.status()?;
-        let theme = Theme::load(
+        let (theme_name, theme) = Theme::resolve(
             config.theme.as_deref().unwrap_or("tokyo-night"),
             crate::config::config_dir().as_deref(),
         );
@@ -305,8 +340,9 @@ impl App {
             hovering_divider: false,
             modal: None,
             theme,
+            theme_name,
             should_quit: false,
-            last_error: None,
+            flash: None,
             current_diff: None,
             diff_key: None,
             diff_dirty: false,
@@ -405,7 +441,7 @@ impl App {
             self.should_quit = true;
             return;
         }
-        self.last_error = None;
+        self.flash = None;
 
         if self.modal.is_some() {
             self.on_key_modal(key);
@@ -446,6 +482,10 @@ impl App {
             }
             Action::ToggleLineNumbers => {
                 self.toggle_line_numbers();
+                return;
+            }
+            Action::CycleTheme => {
+                self.cycle_theme();
                 return;
             }
             Action::Refresh => {
@@ -539,6 +579,7 @@ impl App {
             | Action::Refresh
             | Action::ToggleDiffMode
             | Action::ToggleLineNumbers
+            | Action::CycleTheme
             | Action::ToggleHistory
             | Action::ShowStatus
             | Action::ShowHistory => {}
@@ -580,6 +621,7 @@ impl App {
             | Action::Refresh
             | Action::ToggleDiffMode
             | Action::ToggleLineNumbers
+            | Action::CycleTheme
             | Action::ToggleHistory
             | Action::ShowStatus
             | Action::ShowHistory => {}
@@ -621,6 +663,7 @@ impl App {
             | Action::Refresh
             | Action::ToggleDiffMode
             | Action::ToggleLineNumbers
+            | Action::CycleTheme
             | Action::ToggleHistory
             | Action::ShowStatus
             | Action::ShowHistory => {}
@@ -927,7 +970,7 @@ impl App {
             return (self.hovering_divider || self.hovering_hdivider) != was;
         }
 
-        self.last_error = None;
+        self.flash = None;
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 // Grabbing a split bar starts a resize instead of a pane click.
@@ -1227,7 +1270,7 @@ impl App {
     fn after_mutation(&mut self, action: &str, result: anyhow::Result<()>) {
         if let Err(err) = result {
             tracing::warn!("{action} failed: {err:#}");
-            self.last_error = Some(format!("{action} failed: {err}"));
+            self.flash = Some(Flash::error(format!("{action} failed: {err}")));
         }
         self.refresh();
     }
@@ -1381,7 +1424,7 @@ impl App {
             Ok(spec) => spec,
             Err(err) => {
                 tracing::warn!("re-resolving review range failed: {err:#}");
-                self.last_error = Some(format!("review: {err}"));
+                self.flash = Some(Flash::error(format!("review: {err}")));
                 return;
             }
         };
@@ -1408,7 +1451,7 @@ impl App {
             Ok(files) => files,
             Err(err) => {
                 tracing::warn!("listing review files failed: {err:#}");
-                self.last_error = Some(format!("review: {err}"));
+                self.flash = Some(Flash::error(format!("review: {err}")));
                 return;
             }
         };
@@ -1431,12 +1474,10 @@ impl App {
     /// A successful review refresh clears a lingering review failure flash, so a
     /// watcher-driven recovery doesn't keep shouting about a fixed problem.
     fn clear_review_error(&mut self) {
-        if self
-            .last_error
-            .as_ref()
-            .is_some_and(|e| e.starts_with("review: "))
-        {
-            self.last_error = None;
+        if self.flash.as_ref().is_some_and(|flash| {
+            flash.kind == FlashKind::Error && flash.text.starts_with("review: ")
+        }) {
+            self.flash = None;
         }
     }
 
@@ -1808,6 +1849,22 @@ impl App {
     /// needs invalidating here.
     fn toggle_line_numbers(&mut self) {
         self.show_line_numbers = !self.show_line_numbers;
+    }
+
+    /// Advance to the next theme in `Theme::available` (presets then user themes),
+    /// wrapping around. The available set is enumerated fresh here so a theme file
+    /// added or removed since startup is honoured; a `theme_name` no longer in the
+    /// set (its file was deleted) restarts at index 0. The highlight cache is keyed
+    /// by line text only — its cached colours belong to the old theme — so it is
+    /// cleared here, the verified staleness hazard. The flash shows the *resolved*
+    /// canonical name, so it can never diverge from the theme now on screen.
+    fn cycle_theme(&mut self) {
+        let config_dir = crate::config::config_dir();
+        let (name, theme) = Theme::cycle(&self.theme_name, config_dir.as_deref());
+        self.theme = theme;
+        self.theme_name = name.clone();
+        self.highlight_cache.borrow_mut().clear();
+        self.flash = Some(Flash::info(name));
     }
 }
 
