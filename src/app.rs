@@ -189,6 +189,10 @@ pub struct App {
     /// Unlike navigating to a new file, this preserves the scroll position.
     diff_dirty: bool,
     pub diff_mode: DiffMode,
+    /// Whether the diff pane shows line-number gutters (unified's 10-char
+    /// number gutter, SBS's per-column 5-char gutter). The sign column in
+    /// unified mode is unaffected. Toggled with `n`; from `Config.line_numbers`.
+    pub show_line_numbers: bool,
     pub diff_scroll: u16,
     /// Inner height + total content rows of the diff pane from the last render,
     /// so scrolling can clamp to the content in either mode. Interior-mutable
@@ -307,6 +311,7 @@ impl App {
             diff_key: None,
             diff_dirty: false,
             diff_mode: config.diff_mode(),
+            show_line_numbers: config.line_numbers(),
             diff_scroll: 0,
             diff_viewport: Cell::new(0),
             diff_content_rows: Cell::new(0),
@@ -439,6 +444,10 @@ impl App {
                 self.toggle_diff_mode();
                 return;
             }
+            Action::ToggleLineNumbers => {
+                self.toggle_line_numbers();
+                return;
+            }
             Action::Refresh => {
                 self.refresh_active();
                 return;
@@ -529,6 +538,7 @@ impl App {
             | Action::Help
             | Action::Refresh
             | Action::ToggleDiffMode
+            | Action::ToggleLineNumbers
             | Action::ToggleHistory
             | Action::ShowStatus
             | Action::ShowHistory => {}
@@ -569,6 +579,7 @@ impl App {
             | Action::Help
             | Action::Refresh
             | Action::ToggleDiffMode
+            | Action::ToggleLineNumbers
             | Action::ToggleHistory
             | Action::ShowStatus
             | Action::ShowHistory => {}
@@ -609,6 +620,7 @@ impl App {
             | Action::Help
             | Action::Refresh
             | Action::ToggleDiffMode
+            | Action::ToggleLineNumbers
             | Action::ToggleHistory
             | Action::ShowStatus
             | Action::ShowHistory => {}
@@ -1786,6 +1798,16 @@ impl App {
             DiffMode::SideBySide => DiffMode::Unified,
         };
         self.diff_scroll = 0;
+    }
+
+    /// Flip the line-number gutter on/off. The gutter width is computed fresh
+    /// each render from `show_line_numbers` (see `ui::diff_view`), and neither
+    /// render cache (`highlight_cache`, `sbs_rows`) stores a width — the cached
+    /// highlight spans cover the full line and are trimmed to width after the
+    /// cache lookup, and `sbs_rows` holds only layout indices — so no cache
+    /// needs invalidating here.
+    fn toggle_line_numbers(&mut self) {
+        self.show_line_numbers = !self.show_line_numbers;
     }
 }
 

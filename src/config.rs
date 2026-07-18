@@ -21,6 +21,9 @@ pub struct Config {
     /// Auto-refresh on filesystem / git changes (a background watcher). On by
     /// default; set `false` to disable the watcher and refresh only with `r`.
     pub auto_refresh: Option<bool>,
+    /// Whether the diff pane shows line-number gutters. On by default; set
+    /// `false` to start with them hidden (toggle at runtime with `n`).
+    pub line_numbers: Option<bool>,
 }
 
 impl Config {
@@ -33,6 +36,10 @@ impl Config {
 
     pub fn auto_refresh(&self) -> bool {
         self.auto_refresh.unwrap_or(true)
+    }
+
+    pub fn line_numbers(&self) -> bool {
+        self.line_numbers.unwrap_or(true)
     }
 }
 
