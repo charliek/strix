@@ -10,8 +10,8 @@
 
 use anyhow::{Context, Result};
 
-use crate::git::diff::{diff_lines, is_binary};
-use crate::git::{FileDiff, LineKind, Repo};
+use crate::git::diff::stat_of;
+use crate::git::{FileDiff, Repo};
 
 fn bstr_string(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
@@ -255,40 +255,6 @@ impl Repo {
         };
         (old, new)
     }
-
-    fn file_diff_from_specs(&self, old_spec: &str, new_spec: &str) -> FileDiff {
-        let old = self.object_bytes(old_spec);
-        let new = self.object_bytes(new_spec);
-        if is_binary(&old) || is_binary(&new) {
-            return FileDiff::Binary;
-        }
-        FileDiff::Text(diff_lines(
-            &String::from_utf8_lossy(&old),
-            &String::from_utf8_lossy(&new),
-        ))
-    }
-}
-
-/// The +/- line counts for an already-computed diff (so the file list and the
-/// detailed view never diff the same blobs twice).
-fn stat_of(diff: &FileDiff) -> CommitStat {
-    match diff {
-        FileDiff::Binary => CommitStat {
-            binary: true,
-            ..CommitStat::default()
-        },
-        FileDiff::Text(lines) => {
-            let mut stat = CommitStat::default();
-            for line in lines {
-                match line.kind {
-                    LineKind::Addition => stat.added += 1,
-                    LineKind::Deletion => stat.deleted += 1,
-                    _ => {}
-                }
-            }
-            stat
-        }
-    }
 }
 
 fn decode_commit(commit: &gix::Commit<'_>) -> Result<CommitInfo> {
@@ -331,7 +297,7 @@ fn decode_commit(commit: &gix::Commit<'_>) -> Result<CommitInfo> {
 
 /// Parse `git diff-tree -z --name-status` output: NUL-separated fields where a
 /// status token is followed by one path (or two, `orig` then `new`, for R/C).
-fn parse_name_status(bytes: &[u8]) -> Vec<(ChangeKind, String, Option<String>)> {
+pub(crate) fn parse_name_status(bytes: &[u8]) -> Vec<(ChangeKind, String, Option<String>)> {
     let mut out = Vec::new();
     let mut fields = bytes.split(|&b| b == 0).filter(|f| !f.is_empty());
     while let Some(raw_status) = fields.next() {

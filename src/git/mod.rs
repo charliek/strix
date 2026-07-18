@@ -1,6 +1,7 @@
 pub mod diff;
 pub mod history;
 pub mod ops;
+pub mod review;
 pub mod status;
 
 use std::path::{Path, PathBuf};
@@ -10,6 +11,7 @@ use anyhow::{Context, Result};
 
 pub use diff::{DiffLine, FileDiff, LineKind};
 pub use history::{ChangeKind, CommitFile, CommitInfo, CommitStat, RefKind, RefLabel};
+pub use review::ReviewSpec;
 pub use status::{Change, FileEntry, Section, Status};
 
 /// A git repository. Object reads (diffs, blobs) go through the in-process
