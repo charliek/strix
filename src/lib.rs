@@ -7,6 +7,7 @@
 pub mod app;
 pub mod cli;
 pub mod comments;
+pub mod comments_cli;
 pub mod config;
 pub mod git;
 pub mod graph;
@@ -29,6 +30,16 @@ use clap::Parser;
 pub fn run() -> Result<()> {
     let cli = cli::Cli::parse();
     let _log_guard = logging::init();
+
+    // `comment` is a CLI-only surface (no TUI): route it before any App
+    // construction, exactly like the `--dump-frame` early return below.
+    if let Some(cli::Command::Comment { action, path }) = &cli.command {
+        let repo_path = match path {
+            Some(path) => path.clone(),
+            None => std::env::current_dir()?,
+        };
+        return comments_cli::run(&repo_path, action);
+    }
 
     let (path, range) = cli.target();
     let repo_path = match path {

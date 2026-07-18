@@ -81,6 +81,13 @@ impl Repo {
         &self.gix
     }
 
+    /// Whether `key` (a rev-spec, e.g. a detached-HEAD commit hex) still resolves
+    /// to an object in this repository — the liveness test GC uses for
+    /// commit-keyed inboxes.
+    pub fn commit_exists(&self, key: &str) -> bool {
+        self.gix.rev_parse_single(gix::bstr::BStr::new(key)).is_ok()
+    }
+
     /// Read the staged / unstaged / untracked file lists and current branch.
     ///
     /// `--no-optional-locks` keeps this read from refreshing/rewriting

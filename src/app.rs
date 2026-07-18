@@ -24,6 +24,30 @@ use crate::ui::theme::Theme;
 /// flow be shared via `run_on_selected`.
 type GitOp = fn(&Repo, &str) -> anyhow::Result<()>;
 
+/// Drop comment inboxes for branches/commits that no longer exist, once at
+/// startup (plan §3.1). Cheap and elided when nothing is stale: the store is
+/// only opened when its file already exists, and rewritten only when a set is
+/// actually dropped — so a clean open neither creates nor churns the file.
+fn startup_comment_gc(repo: &Repo) -> anyhow::Result<()> {
+    let dir = repo.strix_dir();
+    if !dir.join("comments.json").exists() {
+        return Ok(());
+    }
+    let mut live: std::collections::HashSet<String> = repo.branch_names()?.into_iter().collect();
+    // The checked-out inbox is always live even without a ref (unborn HEAD) — GC
+    // must never drop the current session's own comments (plan §3.1).
+    live.insert(repo.head_branch_key()?);
+    let commit_exists = |key: &str| repo.commit_exists(key);
+    let mut peek = crate::comments::load(&dir)?;
+    if crate::comments::gc(&mut peek, &live, commit_exists).is_empty() {
+        return Ok(());
+    }
+    crate::comments::mutate(&dir, |store| {
+        crate::comments::gc(store, &live, commit_exists);
+    })?;
+    Ok(())
+}
+
 /// Columns at the start of a staging row (the change marker) where a click
 /// toggles staging rather than only selecting.
 const MARKER_ZONE: u16 = 4;
@@ -314,6 +338,12 @@ impl App {
 
     fn build(repo_path: PathBuf, config: &Config, range: Option<&str>) -> anyhow::Result<Self> {
         let repo = Repo::open(&repo_path)?;
+        // Best-effort startup GC of dead-branch inboxes, right after the repo
+        // opens and before anything else touches the comments store. A failure
+        // (corrupt store, ref-read error) must never block opening the app.
+        if let Err(err) = startup_comment_gc(&repo) {
+            tracing::warn!("comments gc at startup failed: {err:#}");
+        }
         let status = repo.status()?;
         let (theme_name, theme) = Theme::resolve(
             config.theme.as_deref().unwrap_or("tokyo-night"),
