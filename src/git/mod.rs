@@ -39,6 +39,43 @@ impl Repo {
         &self.workdir
     }
 
+    /// The directory holding strix's per-repository state (`<common_dir>/strix`).
+    ///
+    /// `common_dir` (not `git_dir`) is deliberate: a linked worktree's `git_dir`
+    /// is private to that worktree, but its `common_dir` points back at the main
+    /// repository's `.git`, so every checkout — primary or linked — resolves to
+    /// the *same* comments store.
+    pub fn strix_dir(&self) -> PathBuf {
+        self.gix.common_dir().join("strix")
+    }
+
+    /// The key identifying the current comment inbox: the checked-out branch's
+    /// short name (works for an unborn HEAD too, whose symbolic ref names a
+    /// branch that has no commit yet), or — when HEAD is detached — the full
+    /// commit hex.
+    pub fn head_branch_key(&self) -> Result<String> {
+        match self.gix.head_name().context("reading HEAD")? {
+            Some(name) => Ok(String::from_utf8_lossy(name.shorten()).into_owned()),
+            None => {
+                let id = self.gix.head_id().context("resolving detached HEAD")?;
+                Ok(id.detach().to_string())
+            }
+        }
+    }
+
+    /// The short names of every local branch (`refs/heads/*`), for GC.
+    pub fn branch_names(&self) -> Result<Vec<String>> {
+        let refs = self.gix.references().context("opening refs")?;
+        let mut names = Vec::new();
+        for branch in refs.local_branches().context("listing local branches")? {
+            let branch = branch
+                .map_err(anyhow::Error::from_boxed)
+                .context("iterating local branches")?;
+            names.push(String::from_utf8_lossy(branch.name().shorten()).into_owned());
+        }
+        Ok(names)
+    }
+
     /// The underlying gitoxide handle, used for object reads.
     pub fn gix(&self) -> &gix::Repository {
         &self.gix

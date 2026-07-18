@@ -115,11 +115,16 @@ pub fn persist(config_dir: &Path, setting: Setting) -> anyhow::Result<()> {
     write_atomic(config_dir, &path, &doc.to_string())
 }
 
-/// Write `contents` to a sibling temp file (`config.toml.tmp.<pid>`, so
+/// Write `contents` to a sibling temp file (`<filename>.tmp.<pid>`, so
 /// concurrent strix instances don't collide) and atomically rename it over
-/// `path`. The temp file is removed if any step fails.
-fn write_atomic(dir: &Path, path: &Path, contents: &str) -> anyhow::Result<()> {
-    let tmp_path = dir.join(format!("config.toml.tmp.{}", std::process::id()));
+/// `path`. The temp file is removed if any step fails. Shared with the comments
+/// store (`src/comments.rs`), which reuses this exact durability recipe.
+pub(crate) fn write_atomic(dir: &Path, path: &Path, contents: &str) -> anyhow::Result<()> {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "config.toml".to_string());
+    let tmp_path = dir.join(format!("{file_name}.tmp.{}", std::process::id()));
     let result = (|| -> anyhow::Result<()> {
         let mut file = std::fs::File::create_new(&tmp_path)
             .with_context(|| format!("creating {}", tmp_path.display()))?;

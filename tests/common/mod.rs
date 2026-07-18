@@ -2,7 +2,7 @@
 // dead-code lint that would otherwise fire per-crate.
 #![allow(dead_code)]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use strix::app::App;
@@ -180,6 +180,37 @@ pub fn init_repo_with_orphan_branch() -> TempDir {
 
     git(path, &["checkout", "-q", "main"]);
     dir
+}
+
+/// A primary checkout plus a linked worktree checked out on a distinct branch
+/// (`side`). Both `TempDir`s must stay alive for the test; the linked worktree
+/// lives at [`WorktreeRepo::worktree`], outside the main working tree, so its
+/// `.git` is a file pointing back to the shared common dir — the property that
+/// makes both checkouts resolve the same comments store.
+pub struct WorktreeRepo {
+    pub main: TempDir,
+    /// Parent of the linked worktree (kept alive to hold the directory).
+    pub worktrees: TempDir,
+}
+
+impl WorktreeRepo {
+    /// The linked worktree's working-tree root.
+    pub fn worktree(&self) -> PathBuf {
+        self.worktrees.path().join("wt")
+    }
+}
+
+/// Build a [`WorktreeRepo`]: a one-commit `main` repo with a linked worktree on
+/// branch `side`, added via `git worktree add`.
+pub fn init_repo_with_worktree() -> WorktreeRepo {
+    let main = init_repo();
+    let worktrees = tempfile::tempdir().expect("tempdir");
+    let wt = worktrees.path().join("wt");
+    git(
+        main.path(),
+        &["worktree", "add", "-q", "-b", "side", wt.to_str().unwrap()],
+    );
+    WorktreeRepo { main, worktrees }
 }
 
 /// A repository with identity configured but no commits (unborn HEAD).

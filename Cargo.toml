@@ -48,6 +48,7 @@ notify-debouncer-mini = "0.7"
 # (src/config.rs `persist`) — it preserves comments/unknown keys/formatting on
 # rewrite, which `toml` (read-only here) cannot do.
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 toml = "1.1"
 toml_edit = "0.25"
 directories = "6.0"
