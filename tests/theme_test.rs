@@ -2,10 +2,9 @@ mod common;
 
 use std::collections::HashSet;
 
-use common::{init_repo, write};
+use common::{init_repo, press, write};
 use strix::app::{App, Flash, FlashKind};
 use strix::config::Config;
-use strix::crossterm::event::{KeyCode, KeyEvent};
 use strix::ratatui::style::Color;
 use strix::terminal::{dump_frame, render_to_buffer};
 use strix::ui::syntax::syntax_for;
@@ -182,10 +181,6 @@ fn rust_app() -> (TempDir, App) {
     write(repo.path(), "code.rs", "fn main() {\n    let x = 5;\n}\n");
     let app = App::new(repo.path().to_path_buf()).unwrap();
     (repo, app)
-}
-
-fn press(app: &mut App, ch: char) {
-    app.on_key(KeyEvent::from(KeyCode::Char(ch)));
 }
 
 #[test]

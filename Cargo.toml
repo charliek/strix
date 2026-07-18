@@ -44,9 +44,12 @@ syntect = { version = "5.3.0", default-features = false, features = ["default-fa
 notify = "8.2"
 notify-debouncer-mini = "0.7"
 
-# Config / theming
+# Config / theming. toml_edit is used only by the config write-back path
+# (src/config.rs `persist`) — it preserves comments/unknown keys/formatting on
+# rewrite, which `toml` (read-only here) cannot do.
 serde = { version = "1.0", features = ["derive"] }
 toml = "1.1"
+toml_edit = "0.25"
 directories = "6.0"
 
 # CLI / errors / logging
@@ -59,6 +62,7 @@ tracing-appender = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+toml = "1.1"
 
 [profile.release]
 lto = "thin"

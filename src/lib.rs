@@ -43,7 +43,8 @@ pub fn run() -> Result<()> {
     let app = match range {
         Some(range) => app::App::for_review(repo_path, &config, &range)?,
         None => app::App::with_config(repo_path, &config)?,
-    };
+    }
+    .with_config_dir(config::config_dir());
 
     if cli.dump_frame {
         print!("{}", terminal::dump_frame(&app, cli.width, cli.height)?);

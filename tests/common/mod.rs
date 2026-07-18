@@ -5,7 +5,14 @@
 use std::path::Path;
 use std::process::Command;
 
+use strix::app::App;
+use strix::crossterm::event::{KeyCode, KeyEvent};
 use tempfile::TempDir;
+
+/// Press a plain character key on `app`, as if typed at the keyboard.
+pub fn press(app: &mut App, ch: char) {
+    app.on_key(KeyEvent::from(KeyCode::Char(ch)));
+}
 
 /// Run a git command in `dir`, asserting success.
 pub fn git(dir: &Path, args: &[&str]) {

@@ -11,7 +11,7 @@ use ratatui::style::Color;
 use ratatui::widgets::ListState;
 use syntect::parsing::SyntaxReference;
 
-use crate::config::Config;
+use crate::config::{Config, Setting};
 use crate::git::{
     Change, CommitFile, CommitInfo, DiffLine, FileDiff, FileEntry, LineKind, RefLabel, Repo,
     ReviewSpec, Section, Status,
@@ -288,6 +288,12 @@ pub struct App {
     graph_state: RefCell<ListState>,
 
     keymap: Keymap,
+    /// The real config dir in production (set via `with_config_dir` from the
+    /// entrypoint), `None` in every existing test constructor. `None` makes
+    /// `t`/`d`/`n` persistence a silent no-op — this is what keeps `cargo test`
+    /// from ever touching the developer's real `~/.config/strix`, and lets
+    /// theme resolution (`cycle_theme`) stay hermetic in tests too.
+    config_dir: Option<PathBuf>,
 }
 
 impl App {
@@ -378,10 +384,21 @@ impl App {
             committed_state: RefCell::new(ListState::default()),
             graph_state: RefCell::new(ListState::default()),
             keymap: Keymap::from_config(config.keys.as_ref()),
+            config_dir: None,
         };
         app.clamp_selection();
         app.sync_active();
         Ok(app)
+    }
+
+    /// Inject the config directory used for persisting settings (`t`/`d`/`n`)
+    /// and for resolving themes on cycle. The real entrypoint (`lib::run`)
+    /// sets this from `config::config_dir()`; every existing test constructor
+    /// leaves it `None`, which makes persistence a silent no-op and keeps
+    /// theme-cycle resolution hermetic.
+    pub fn with_config_dir(mut self, config_dir: Option<PathBuf>) -> Self {
+        self.config_dir = config_dir;
+        self
     }
 
     /// Short display name for the repository (its working-tree directory name).
@@ -478,14 +495,17 @@ impl App {
             }
             Action::ToggleDiffMode => {
                 self.toggle_diff_mode();
+                self.persist_setting(Setting::DiffMode(self.diff_mode));
                 return;
             }
             Action::ToggleLineNumbers => {
                 self.toggle_line_numbers();
+                self.persist_setting(Setting::LineNumbers(self.show_line_numbers));
                 return;
             }
             Action::CycleTheme => {
                 self.cycle_theme();
+                self.persist_setting(Setting::Theme(self.theme_name.clone()));
                 return;
             }
             Action::Refresh => {
@@ -1859,12 +1879,26 @@ impl App {
     /// cleared here, the verified staleness hazard. The flash shows the *resolved*
     /// canonical name, so it can never diverge from the theme now on screen.
     fn cycle_theme(&mut self) {
-        let config_dir = crate::config::config_dir();
-        let (name, theme) = Theme::cycle(&self.theme_name, config_dir.as_deref());
+        let (name, theme) = Theme::cycle(&self.theme_name, self.config_dir.as_deref());
         self.theme = theme;
         self.theme_name = name.clone();
         self.highlight_cache.borrow_mut().clear();
         self.flash = Some(Flash::info(name));
+    }
+
+    /// Write `setting` to `config.toml` when a config dir was injected
+    /// (production only — see `config_dir`). A write failure is logged and
+    /// surfaced as an Info-kind flash; the in-app change it follows always
+    /// stands regardless of whether the write succeeded.
+    fn persist_setting(&mut self, setting: Setting) {
+        let Some(dir) = self.config_dir.clone() else {
+            tracing::debug!("no config dir injected; not persisting setting");
+            return;
+        };
+        if let Err(err) = crate::config::persist(&dir, setting) {
+            tracing::warn!("couldn't save setting: {err:#}");
+            self.flash = Some(Flash::info(format!("couldn't save setting: {err}")));
+        }
     }
 }
 
