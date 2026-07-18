@@ -44,6 +44,14 @@ backend, and prints the cell grid as text.
 
 ## CI
 
-`.github/workflows/ci.yml` runs fmt, clippy, tests, and a release build on every
-push to `main`. `.github/workflows/docs.yml` builds the mkdocs site and deploys
-it to GitHub Pages when `docs/` changes.
+`.github/workflows/ci.yml` runs fmt, clippy, tests, and a release build on
+every pull request into `main` and on every push to `main`. The pull-request
+run is the required gate: strix has outside users, so nothing lands on `main`
+without going through a PR and a green CI run — see the branch policy in
+`CLAUDE.md`. `.github/workflows/docs.yml` builds the mkdocs site and deploys
+it to GitHub Pages when a push to `main` touches `docs/`.
+
+## Contributing
+
+Work on a feature/milestone branch, open a pull request against `main`, and
+let CI's `ci-success` check gate the merge. There's no direct-push workflow.

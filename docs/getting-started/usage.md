@@ -26,7 +26,9 @@ it panics).
   (unstaged) and untracked files below. Each row shows a status marker
   (`M` modified, `A` added, `D` deleted, `?` untracked) coloured by state.
 - **Diff (right).** The selected file's diff, syntax-highlighted, in **unified**
-  or **side-by-side** mode.
+  or **side-by-side** mode. The line-number gutter shown above (`12`, `13`, …)
+  is on by default; press `n` to hide it, or set `line_numbers = false` — see
+  [Configuration](../guides/configuration.md).
 
 ## A typical session
 
@@ -72,6 +74,62 @@ to the staging view. The left column changes shape:
   horizontal one resizes Committed Changes vs Graph. Both are drag-to-resize.
 - **`b`** collapses the entire left column the same way it does in the status
   view, leaving the diff (or commit details) full-width.
+
+## Reviewing a branch
+
+```bash
+strix diff main            # review the current branch against main
+strix diff v1.2.0...HEAD   # review HEAD against v1.2.0's merge base
+```
+
+`strix diff <RANGE>` opens a **read-only** review session in place of the
+staging view — the changeset is a branch against its base rather than the
+working tree:
+
+```
+ strix  my-repo · main…HEAD                                                
+╭ Changes ───────────────────╮╭ Diff · unified ──────────────────────╮
+│ M src/app.rs       +40 −2  ││  src/app.rs                          │
+│ A src/git/review.rs +180   ││ @@ -12,6 +12,7 @@                     │
+│ M src/ui/mod.rs    +12 −3  ││  12  pub struct App {                │
+│                             ││ +14      pub focus: Focus,            │
+╰────────────────────────────╯╰──────────────────────────────────────╯
+ j/k move   tab pane   d split   n line #s   t theme   b hide   i history   q quit
+```
+
+`RANGE` is one of:
+
+| Form      | Meaning                              |
+|-----------|---------------------------------------|
+| `BASE`    | `merge-base(BASE, HEAD)..HEAD` — the common case, e.g. `strix diff main` |
+| `A...B`   | `merge-base(A, B)..B`                 |
+| `A..B`    | `A..B` literally, no merge-base       |
+
+An empty side means `HEAD`, matching `git`: `main..` is `main..HEAD`, `...feat`
+is `HEAD...feat`. The bare-`BASE` and `A...B` forms use the merge base — the
+same "what does this branch add" (three-dot, GitHub-PR) semantics `git diff
+main...HEAD` and a GitHub pull request diff use — not a direct two-sided
+comparison.
+
+A few things behave differently here than in the staging view:
+
+- **Committed state only.** A range compares two commits, so uncommitted
+  changes on the reviewed branch never appear — commit them, or use the
+  regular status view (`strix`, no subcommand) to see the working tree.
+- **Read-only.** Staging keys (`space`, `Enter`, `s`, `u`, `x`, and clicking a
+  file's status marker) do nothing: no modal, no index change.
+- **Live updates.** As new commits land on the reviewed branch, the file list
+  and the currently open diff refresh automatically, the same auto-refresh
+  path the staging view uses.
+- **Navigation.** `i` opens the History view, same as in the staging view;
+  `1` returns to the review session (also from History); `2` opens History as
+  well (not a toggle); `Esc` does **not** exit the review session — quit with
+  `q`.
+
+An unresolvable range (unknown revision, or no merge base between the two
+sides) fails before the TUI opens: strix exits non-zero and prints a message
+naming the offending operand. See [CLI](../reference/cli.md) for the full
+grammar, the merge-base caveat, and exit behavior.
 
 ## Inspecting a frame
 

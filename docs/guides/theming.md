@@ -18,6 +18,13 @@ Or per-invocation:
 strix --theme gruvbox
 ```
 
+Or at runtime: press `t` to cycle to the next theme. The footer flashes the
+**canonical** name of the theme it switched to (e.g. `tokyonight` resolves and
+flashes as `tokyo-night`), and the choice is written back to `config.toml` —
+see [Configuration](configuration.md#runtime-changes-persist). `t` cycles
+through the built-in presets first, in the order listed below, then your
+custom `themes/*.toml` files sorted alphabetically by file stem.
+
 ## Built-in themes
 
 | Name          | Description                          |
@@ -56,6 +63,13 @@ hunk = "#7dcfff"
 
 Any colour you omit falls back to the `base` preset's value, so a partial theme
 is fine.
+
+!!! note
+    A custom theme file whose stem matches a built-in preset name **or one of
+    its aliases** (e.g. `themes/dark.toml`, or `themes/mocha.toml` — `mocha`
+    is an alias for `catppuccin`) is unreachable: the built-in preset always
+    wins, both when resolving `theme = "…"` and when cycling with `t`. Pick a
+    stem that isn't a preset name or alias.
 
 !!! note
     Themes use 24-bit colour. On a terminal without truecolor the palette

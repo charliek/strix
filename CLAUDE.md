@@ -4,10 +4,14 @@
 
 strix is a focused, polished terminal UI for the two git operations done most
 often: **staging changes** and **viewing diffs**, plus a toggleable **history
-view** (`i`) with a rail-graph commit log. It is *not* a full git client — no
-commit creation, branch management, merge-conflict resolution, stashing, or
-remote operations (see
+view** (`i`) with a rail-graph commit log. It is becoming the review surface
+for agent-written code: **branch review** (`strix diff <base>`) is in scope as
+part of "reviewing a changeset," alongside the working tree. It is *not* a
+full git client — no commit creation, branch management, merge-conflict
+resolution, stashing, or remote operations (see
 [Non-goals](docs/reference/architecture.md#non-goals) for the explicit list).
+Upcoming on this track: inline comments on a reviewed diff (issue #6) and an
+agent-facing skill (issue #7).
 
 **North star.** Visual quality matching a modern editor's diff view (Zed/Cursor),
 with first-class mouse *and* keyboard support, fast enough to feel instant on
@@ -16,11 +20,12 @@ experience* over feature breadth.
 
 ## Branch policy
 
-`main` is the primary branch. Work proceeds in milestone branches
-(`milestone/<n>-<slug>`). Each milestone is reviewed with `/simplify` before it
-merges. **We do not open PRs**: merge the milestone branch into `main` locally
-and push `main`. CI (`.github/workflows/ci.yml`) runs on the push and is
-informational. Docs deploy to GitHub Pages on pushes that touch `docs/`.
+`main` is the primary branch. strix has outside users, so **nothing is
+committed to `main` directly**. Work proceeds on feature/milestone branches
+(`milestone/<n>-<slug>`), reviewed with `/simplify` during development, and
+lands via a pull request. CI (`.github/workflows/ci.yml`, which runs on every
+`pull_request` into `main`) is the required merge gate. Docs deploy to GitHub
+Pages on pushes to `main` that touch `docs/`.
 
 ## Architecture
 
@@ -38,8 +43,16 @@ A single binary crate, split into a library (`src/lib.rs`) and a thin binary
 - `ui/` — rendering only, never mutates state. `mod.rs` lays out header / body /
   footer; `staging.rs` and `diff_view.rs` render the two panes; `theme.rs` is the
   colour palette every widget reads from (no hard-coded colours elsewhere).
-- `git/` — repository access (see below).
-- `config.rs`, `input/` — config + keybinding/mouse dispatch (later milestones).
+- `git/` — repository access (see below), including `git/review.rs`: range
+  resolution (`resolve_range`, via gix `merge_base`) and file listing for a
+  branch review (paired `git diff-tree` name-status/numstat runs); per-file
+  diffs within a range are computed lazily, only for the selected file.
+- `config.rs` — config read (`toml`) and write-back (`toml_edit`): explicit
+  in-app changes (theme cycle, diff-mode toggle, line-numbers toggle) persist
+  to `config.toml` atomically, preserving comments/unknown keys, and never
+  overwrite a file that fails to parse.
+- `keys.rs` — the configurable keymap (`Action`, defaults, `[keys]` overrides);
+  key dispatch itself lives in `App::on_key`/`App::on_mouse` (`app.rs`).
 
 ## Git integration
 

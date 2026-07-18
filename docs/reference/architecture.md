@@ -26,25 +26,33 @@ assertions.
 |---------------|-------------------------------------------------------------------|
 | `app`         | State + input dispatch (`on_key`, `on_mouse`); per-view dispatch. |
 | `terminal`    | Setup/teardown, event loop, panic-safe restore, `dump_frame`.     |
-| `ui`          | Rendering: layout, the two panes, theme, syntax highlighting.     |
+| `ui`          | Rendering: layout, the panes, theme, syntax highlighting.         |
+| `ui/review.rs`| Review view rendering: the flat changed-file list beside the shared diff pane. |
 | `git`         | Repository access: status, history, diffs, mutations.             |
+| `git/review.rs` | Branch-range review: `resolve_range` (gix `merge_base`), file listing via paired `git diff-tree` name-status/numstat runs, and lazy per-file diffs. |
 | `graph`       | Pure rail-graph lane layout for the history view.                 |
-| `config`      | Config + theme loading; keybinding/mouse dispatch tables.         |
+| `config`      | Config read (`toml`) and write-back (`toml_edit`); theme loading; keybinding/mouse dispatch tables. |
 
 ## Git layer
 
 | Operation                     | Mechanism                                              |
 |-------------------------------|--------------------------------------------------------|
-| Status (staged/unstaged/untracked) | [gix](https://github.com/GitoxideLabs/gitoxide) — pure-Rust reads. |
+| Status (staged/unstaged/untracked) | Shell out to `git status --porcelain=v2 --branch -z`, parsed in `git/status.rs`. gix *can* compute status, but its iterator API is far less ergonomic than the stable porcelain format for a read that runs once per refresh, not on the hot path. |
 | Blob contents (HEAD / index / worktree) | gix object database + the working tree.        |
 | Commit walk + refs (history view) | gix `rev_walk` from HEAD (full DAG), commit objects decoded only. |
 | Per-commit changed files      | `git diff-tree -z --name-status` (parsed in `git/history.rs`).  |
-| Diff computation              | [`similar`](https://github.com/mitsuhiko/similar) over blob bytes, producing structured hunks. |
+| Branch-range resolution (review view) | gix `merge_base`, `rev_parse_single` + tag-peeling (`git/review.rs`). |
+| Branch-range file listing (review view) | Two `git diff-tree -z` runs (`--name-status`, `--numstat`) joined by path — no in-process diffing while listing a range that can span hundreds of files. |
+| Diff computation              | [`similar`](https://github.com/mitsuhiko/similar) over blob bytes, producing structured hunks; computed lazily, per selected file. |
 | Stage / unstage / reset       | Shell out to `git` (`add`, `restore --staged`, `restore`).      |
 
-Reads stay on the pure-Rust path for speed; the three mutations shell out to
-`git` because it is reliable and sidesteps gix's less-mature index-write
-porcelain. Those shell-outs are confined to `git/ops.rs`.
+Object reads (blobs, refs, merge-base) stay on the pure-Rust gix path for
+speed; status and the range file listing shell out to `git` because the
+porcelain formats they need are far more ergonomic than the equivalent gix
+iterator APIs for a read that isn't on the diff hot path; the three mutations
+shell out because it is reliable and sidesteps gix's less-mature index-write
+porcelain. Those shell-outs are confined to `git/ops.rs` (mutations),
+`git/status.rs`, and `git/review.rs`/`git/history.rs` (listings).
 
 ## Diff model
 
@@ -74,6 +82,27 @@ plus refs in, one render row per commit out, assigning each commit a lane and
 emitting Unicode rail glyphs (`● │ ╮ ╯ ╭ ╰ ─`) connecting it to its parents.
 The walk is bounded (500 commits per page, decode-only) and tree/blob reads
 happen lazily for the selected commit only.
+
+## Review view
+
+`strix diff <RANGE>` opens a third `app::ViewMode` (`Review`) alongside
+`Status` and `History`, resolved once at startup (`git/review.rs`) so a bad
+range fails before the terminal takes over. It reuses the shared diff pane and
+its caches; the file list is a flat `ui/review.rs` widget (no
+staged/unstaged sections, since a committed range has no such split). The view
+is read-only — staging actions are a no-op — and the file watcher refreshes it
+like the other views, guarded so a worktree-only change (no new commit on
+either side of the range) skips re-listing.
+
+## Configuration write-back
+
+Three explicit in-app actions — cycling the theme (`t`), toggling diff mode
+(`d`), and toggling line numbers (`n`) — write their new value back to
+`config.toml` via `toml_edit`, which preserves comments, unrelated keys, and
+formatting elsewhere in the file. If the existing file fails to parse, the
+write is skipped entirely (the in-app change still applies for the running
+session) rather than clobbering a user's broken-but-recoverable config.
+Reads stay on `toml`/serde; only the write path uses `toml_edit`.
 
 ## Performance
 
@@ -108,9 +137,15 @@ phase:
 - Remote operations (push, pull, fetch)
 - Hunk-level or line-level staging (file-level only)
 
-Keeping the surface area narrow is the point: strix earns its place by doing
-"review a changeset and stage it" — and now "browse history" — very well, not by
-covering everything `git` does.
+Reviewing a branch against its base (`strix diff <base>`) is explicitly **in
+scope** — it's the foundation for strix becoming the review surface for
+agent-written code (inline comments and an agent skill build on it next), not
+a future-phase item.
+
+Keeping the surface area narrow otherwise is the point: strix earns its place
+by doing "review a changeset and stage it," "browse history," and now
+"review a branch against its base" very well, not by covering everything
+`git` does.
 
 ## Testing
 
