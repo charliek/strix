@@ -3,8 +3,10 @@
 //! missing or invalid config falls back to defaults.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
+use anyhow::Context;
 use serde::Deserialize;
 
 use crate::app::DiffMode;
@@ -21,6 +23,9 @@ pub struct Config {
     /// Auto-refresh on filesystem / git changes (a background watcher). On by
     /// default; set `false` to disable the watcher and refresh only with `r`.
     pub auto_refresh: Option<bool>,
+    /// Whether the diff pane shows line-number gutters. On by default; set
+    /// `false` to start with them hidden (toggle at runtime with `n`).
+    pub line_numbers: Option<bool>,
 }
 
 impl Config {
@@ -33,6 +38,10 @@ impl Config {
 
     pub fn auto_refresh(&self) -> bool {
         self.auto_refresh.unwrap_or(true)
+    }
+
+    pub fn line_numbers(&self) -> bool {
+        self.line_numbers.unwrap_or(true)
     }
 }
 
@@ -59,4 +68,73 @@ pub fn load() -> Config {
         }),
         Err(_) => Config::default(),
     }
+}
+
+/// A single scalar written back to `config.toml` by an explicit in-app action
+/// (`t`/`d`/`n`). See [`persist`].
+pub enum Setting {
+    Theme(String),
+    DiffMode(DiffMode),
+    LineNumbers(bool),
+}
+
+/// Persist one setting into `config_dir/config.toml`, preserving everything
+/// else in the file — comments, unrelated keys/tables, formatting — via
+/// `toml_edit`. The config dir is created first if missing.
+///
+/// If `config.toml` exists but fails to parse, this returns an error
+/// *without writing anything*: a user's broken-but-recoverable file must stay
+/// byte-for-byte untouched. Otherwise the write is atomic — a sibling temp
+/// file in the same directory is written and flushed, then renamed over
+/// `config.toml`; the temp file is removed on any failure path.
+pub fn persist(config_dir: &Path, setting: Setting) -> anyhow::Result<()> {
+    std::fs::create_dir_all(config_dir)
+        .with_context(|| format!("creating config dir {}", config_dir.display()))?;
+
+    let path = config_dir.join("config.toml");
+    let mut doc = match std::fs::read_to_string(&path) {
+        Ok(text) => text
+            .parse::<toml_edit::DocumentMut>()
+            .with_context(|| format!("parsing {}", path.display()))?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => toml_edit::DocumentMut::new(),
+        Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
+    };
+
+    match setting {
+        Setting::Theme(name) => doc["theme"] = toml_edit::value(name),
+        Setting::DiffMode(mode) => {
+            let value = match mode {
+                DiffMode::Unified => "unified",
+                DiffMode::SideBySide => "side-by-side",
+            };
+            doc["diff_mode"] = toml_edit::value(value);
+        }
+        Setting::LineNumbers(enabled) => doc["line_numbers"] = toml_edit::value(enabled),
+    }
+
+    write_atomic(config_dir, &path, &doc.to_string())
+}
+
+/// Write `contents` to a sibling temp file (`config.toml.tmp.<pid>`, so
+/// concurrent strix instances don't collide) and atomically rename it over
+/// `path`. The temp file is removed if any step fails.
+fn write_atomic(dir: &Path, path: &Path, contents: &str) -> anyhow::Result<()> {
+    let tmp_path = dir.join(format!("config.toml.tmp.{}", std::process::id()));
+    let result = (|| -> anyhow::Result<()> {
+        let mut file = std::fs::File::create_new(&tmp_path)
+            .with_context(|| format!("creating {}", tmp_path.display()))?;
+        file.write_all(contents.as_bytes())
+            .with_context(|| format!("writing {}", tmp_path.display()))?;
+        // flush() alone is not a durability barrier: without sync_all a crash
+        // after the rename could leave an empty config where a full one was.
+        file.sync_all()
+            .with_context(|| format!("syncing {}", tmp_path.display()))?;
+        std::fs::rename(&tmp_path, path)
+            .with_context(|| format!("renaming {} to {}", tmp_path.display(), path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    result
 }

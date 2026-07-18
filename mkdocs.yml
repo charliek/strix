@@ -10,7 +10,7 @@
 # =============================================================================
 
 site_name: strix
-site_description: 'A focused, polished TUI for staging changes and viewing diffs'
+site_description: 'A focused, polished TUI for staging changes, viewing diffs, and reviewing a branch against its base'
 site_author: 'strix Contributors'
 site_url: 'https://charliek.github.io/strix/'
 

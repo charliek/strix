@@ -6,7 +6,7 @@
 use gix::bstr::BStr;
 use similar::{ChangeTag, DiffOp, TextDiff};
 
-use crate::git::{Change, FileEntry, Repo, Section};
+use crate::git::{Change, CommitStat, FileEntry, Repo, Section};
 
 const CONTEXT_LINES: usize = 3;
 const BINARY_SCAN_BYTES: usize = 8000;
@@ -82,6 +82,44 @@ impl Repo {
 
     fn worktree_bytes(&self, path: &str) -> Vec<u8> {
         std::fs::read(self.workdir().join(path)).unwrap_or_default()
+    }
+
+    /// Diff an arbitrary `<rev>:<path>` spec pair (an empty spec means "no side",
+    /// resolving to no bytes — an addition's old or a deletion's new). Shared by
+    /// the history and review layers, both of which diff blobs identified by
+    /// revspec rather than by working-tree state.
+    pub(crate) fn file_diff_from_specs(&self, old_spec: &str, new_spec: &str) -> FileDiff {
+        let old = self.object_bytes(old_spec);
+        let new = self.object_bytes(new_spec);
+        if is_binary(&old) || is_binary(&new) {
+            return FileDiff::Binary;
+        }
+        FileDiff::Text(diff_lines(
+            &String::from_utf8_lossy(&old),
+            &String::from_utf8_lossy(&new),
+        ))
+    }
+}
+
+/// The +/- line counts for an already-computed diff (so a file list and the
+/// detailed view never diff the same blobs twice).
+pub(crate) fn stat_of(diff: &FileDiff) -> CommitStat {
+    match diff {
+        FileDiff::Binary => CommitStat {
+            binary: true,
+            ..CommitStat::default()
+        },
+        FileDiff::Text(lines) => {
+            let mut stat = CommitStat::default();
+            for line in lines {
+                match line.kind {
+                    LineKind::Addition => stat.added += 1,
+                    LineKind::Deletion => stat.deleted += 1,
+                    _ => {}
+                }
+            }
+            stat
+        }
     }
 }
 

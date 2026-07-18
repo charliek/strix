@@ -18,8 +18,11 @@ or mouse-unfriendly.
  j/k move   space stage   d diff mode   q quit
 ```
 
-Two panes, mouse + keyboard, syntax-highlighted diffs, themeable. Built in Rust
-on [ratatui](https://github.com/ratatui/ratatui),
+Two panes, mouse + keyboard, syntax-highlighted diffs, themeable (cycle at
+runtime with `t`), toggleable line numbers (`n`) — plus a read-only
+**branch review** mode (`strix diff main`) for reviewing a branch against its
+base, GitHub-PR style. Built in Rust on
+[ratatui](https://github.com/ratatui/ratatui),
 [gitoxide](https://github.com/GitoxideLabs/gitoxide), and
 [syntect](https://github.com/trishume/syntect).
 
@@ -51,6 +54,7 @@ Direct `.deb` downloads and building from source are in the
 ```bash
 strix              # open the repository in the current directory
 strix path/to/repo # open a specific repository
+strix diff main     # review the current branch against main (read-only)
 ```
 
 - **Left pane** — staged files (top) and unstaged + untracked files (bottom).
@@ -62,7 +66,13 @@ Press `i` for the **History view**: a branch/merge rail graph of the current
 branch on the left, commit details or file diffs (vs the commit's first parent)
 on the right. `Esc` or `i` returns to staging.
 
-See the [keybindings](docs/getting-started/keybindings.md) for the full set.
+`strix diff <RANGE>` opens a read-only review of a range. The bare `BASE`
+and `A...B` forms compare against the merge base — the same "what does this
+branch add" comparison a GitHub pull request shows — while `A..B` compares
+the two revisions directly. See
+[Usage](docs/getting-started/usage.md#reviewing-a-branch) for the
+range grammar and [keybindings](docs/getting-started/keybindings.md) for the
+full key set.
 
 ## Documentation
 
@@ -72,7 +82,7 @@ The full site lives under `docs/` and builds with `mkdocs-material`
 - [Installation](docs/getting-started/installation.md)
 - [Usage](docs/getting-started/usage.md) and [Keybindings](docs/getting-started/keybindings.md)
 - [Theming](docs/guides/theming.md) and [Configuration](docs/guides/configuration.md)
-- [Architecture](docs/reference/architecture.md)
+- [CLI reference](docs/reference/cli.md) and [Architecture](docs/reference/architecture.md)
 
 `CLAUDE.md` at the repo root captures the project conventions.
 

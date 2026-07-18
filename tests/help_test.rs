@@ -1,7 +1,7 @@
 mod common;
 
 use common::init_repo;
-use strix::app::{App, Modal};
+use strix::app::{App, Flash, Modal};
 use strix::crossterm::event::{KeyCode, KeyEvent};
 use strix::terminal::dump_frame;
 
@@ -26,7 +26,7 @@ fn question_mark_opens_and_any_key_closes_help() {
 fn error_renders_in_the_footer() {
     let repo = init_repo();
     let mut app = App::new(repo.path().to_path_buf()).unwrap();
-    app.last_error = Some("boom".to_string());
+    app.flash = Some(Flash::error("boom"));
 
     let out = dump_frame(&app, 100, 20).unwrap();
     assert!(out.contains("✗ boom"), "error toast shown in footer");
@@ -36,8 +36,8 @@ fn error_renders_in_the_footer() {
 fn the_next_keypress_clears_the_error() {
     let repo = init_repo();
     let mut app = App::new(repo.path().to_path_buf()).unwrap();
-    app.last_error = Some("boom".to_string());
+    app.flash = Some(Flash::error("boom"));
 
     app.on_key(KeyEvent::from(KeyCode::Char('j')));
-    assert!(app.last_error.is_none());
+    assert!(app.flash.is_none());
 }

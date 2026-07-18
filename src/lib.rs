@@ -29,14 +29,22 @@ pub fn run() -> Result<()> {
     let cli = cli::Cli::parse();
     let _log_guard = logging::init();
 
-    let repo_path = match cli.path {
+    let (path, range) = cli.target();
+    let repo_path = match path {
         Some(path) => path,
         None => std::env::current_dir()?,
     };
 
     let mut config = config::load();
     config.theme = cli.theme.or(config.theme);
-    let app = app::App::with_config(repo_path, &config)?;
+    // A `diff <RANGE>` invocation opens a review session; the range is resolved
+    // here, before terminal setup, so a bad range bubbles out of main as a fatal
+    // anyhow error (naming the offending operand) rather than a blank TUI.
+    let app = match range {
+        Some(range) => app::App::for_review(repo_path, &config, &range)?,
+        None => app::App::with_config(repo_path, &config)?,
+    }
+    .with_config_dir(config::config_dir());
 
     if cli.dump_frame {
         print!("{}", terminal::dump_frame(&app, cli.width, cli.height)?);

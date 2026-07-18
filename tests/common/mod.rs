@@ -5,7 +5,14 @@
 use std::path::Path;
 use std::process::Command;
 
+use strix::app::App;
+use strix::crossterm::event::{KeyCode, KeyEvent};
 use tempfile::TempDir;
+
+/// Press a plain character key on `app`, as if typed at the keyboard.
+pub fn press(app: &mut App, ch: char) {
+    app.on_key(KeyEvent::from(KeyCode::Char(ch)));
+}
 
 /// Run a git command in `dir`, asserting success.
 pub fn git(dir: &Path, args: &[&str]) {
@@ -112,6 +119,66 @@ pub fn init_repo_with_branches() -> TempDir {
         ],
         &["merge", "--no-ff", "-q", "-m", "merge feature", "feature"],
     );
+    dir
+}
+
+/// A repository with `main` and `feature` genuinely diverged from a common base:
+/// after the shared `init` commit, `feature` adds two commits and `main` adds one
+/// — no merge. `merge-base(main, feature)` is the `init` commit and differs from
+/// both tips, so three-dot (`main...feature`) and two-dot ranges differ. `feature`
+/// is the checked-out branch (HEAD), so `strix diff main` reviews what `feature`
+/// adds.
+///
+/// Layout:
+/// - `init`         (base, on both)      README.md
+/// - `main`:  base → `main change`       README.md edited, main-only.txt added
+/// - `feature`: base → `feat one` → `feat two`  feature.txt, feature2.txt, rename
+pub fn init_repo_with_diverged_branches() -> TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path();
+    setup_identity(path);
+    write(path, "README.md", "# test\nshared\n");
+    write(path, "shared.txt", "alpha\nbeta\ngamma\n");
+    git(path, &["add", "."]);
+    commit_at(path, "init", "2021-01-01T00:00:00");
+
+    // main advances past the base (but never merges feature).
+    write(path, "main-only.txt", "main\n");
+    write(path, "README.md", "# test\nshared\nmain edit\n");
+    git(path, &["add", "."]);
+    commit_at(path, "main change", "2021-01-02T00:00:00");
+
+    // feature branches off the base and adds its own commits.
+    git(path, &["checkout", "-q", "-b", "feature", "HEAD~1"]);
+    write(path, "feature.txt", "feature\n");
+    git(path, &["add", "."]);
+    commit_at(path, "feat one", "2021-01-03T00:00:00");
+    // A rename+modify (exercises -M) plus a second added file.
+    git(path, &["mv", "shared.txt", "renamed.txt"]);
+    write(path, "renamed.txt", "alpha\nbeta\ngamma\ndelta\n");
+    write(path, "feature2.txt", "more\n");
+    git(path, &["add", "."]);
+    commit_at(path, "feat two", "2021-01-04T00:00:00");
+    dir
+}
+
+/// A repository with an orphan `unrelated` branch: a second root with no shared
+/// history, so `merge-base(main, unrelated)` fails. `main` is left checked out.
+pub fn init_repo_with_orphan_branch() -> TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path();
+    setup_identity(path);
+    write(path, "README.md", "# test\n");
+    git(path, &["add", "."]);
+    commit_at(path, "init", "2021-01-01T00:00:00");
+
+    git(path, &["checkout", "-q", "--orphan", "unrelated"]);
+    git(path, &["rm", "-rfq", "--cached", "."]);
+    write(path, "other.txt", "unrelated\n");
+    git(path, &["add", "."]);
+    commit_at(path, "orphan root", "2021-01-02T00:00:00");
+
+    git(path, &["checkout", "-q", "main"]);
     dir
 }
 

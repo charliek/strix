@@ -19,6 +19,28 @@ const SIGN_WIDTH: usize = 2;
 /// Side-by-side per-column gutter: `nnnn ` → 4 + 1.
 const SBS_GUTTER: usize = 5;
 
+/// The unified gutter's width for the current `show_line_numbers` setting —
+/// `GUTTER_WIDTH` when shown, `0` when hidden (the sign column is unaffected
+/// and always renders). The single source of truth for both emitting the
+/// gutter and sizing the remaining content width, so they can't drift.
+fn unified_gutter_width(show_line_numbers: bool) -> usize {
+    if show_line_numbers {
+        GUTTER_WIDTH
+    } else {
+        0
+    }
+}
+
+/// The side-by-side per-column gutter's width for the current
+/// `show_line_numbers` setting — mirrors `unified_gutter_width`.
+fn sbs_gutter_width(show_line_numbers: bool) -> usize {
+    if show_line_numbers {
+        SBS_GUTTER
+    } else {
+        0
+    }
+}
+
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
     let focused = app.diff_focused();
@@ -64,7 +86,8 @@ fn render_unified(
     app.set_diff_metrics(inner.height, clamp_u16(lines.len()));
     let theme = &app.theme;
     let offset = app.diff_scroll.min(app.diff_max_scroll()) as usize;
-    let body_width = (inner.width as usize).saturating_sub(GUTTER_WIDTH);
+    let body_width =
+        (inner.width as usize).saturating_sub(unified_gutter_width(app.show_line_numbers));
 
     let rows: Vec<Line> = lines
         .iter()
@@ -91,12 +114,13 @@ fn unified_line(
         LineKind::Deletion => ("- ", theme.del, theme.del_bg),
         _ => ("  ", theme.fg, theme.bg),
     };
-    let gutter = format!("{} {} ", gutter_num(line.old_no), gutter_num(line.new_no));
 
-    let mut spans = vec![
-        Span::styled(gutter, Style::new().fg(theme.line_no)),
-        Span::styled(sign, Style::new().fg(sign_fg).bg(bg)),
-    ];
+    let mut spans = Vec::new();
+    if app.show_line_numbers {
+        let gutter = format!("{} {} ", gutter_num(line.old_no), gutter_num(line.new_no));
+        spans.push(Span::styled(gutter, Style::new().fg(theme.line_no)));
+    }
+    spans.push(Span::styled(sign, Style::new().fg(sign_fg).bg(bg)));
     spans.extend(highlighted_content(
         app,
         syntax,
@@ -202,14 +226,18 @@ fn cell(
     } else {
         theme.bg
     };
-    let gutter = format!("{} ", gutter_num(number));
-    let mut spans = vec![Span::styled(gutter, Style::new().fg(theme.line_no))];
+    let gutter_w = sbs_gutter_width(app.show_line_numbers);
+    let mut spans = Vec::new();
+    if app.show_line_numbers {
+        let gutter = format!("{} ", gutter_num(number));
+        spans.push(Span::styled(gutter, Style::new().fg(theme.line_no)));
+    }
     spans.extend(highlighted_content(
         app,
         syntax,
         &theme.syntax_theme,
         &line.text,
-        width.saturating_sub(SBS_GUTTER),
+        width.saturating_sub(gutter_w),
         bg,
     ));
     spans
