@@ -14,7 +14,7 @@ use syntect::parsing::SyntaxReference;
 use crate::config::Config;
 use crate::git::{
     Change, CommitFile, CommitInfo, DiffLine, FileDiff, FileEntry, LineKind, RefLabel, Repo,
-    Section, Status,
+    ReviewSpec, Section, Status,
 };
 use crate::graph::{self, GraphRow};
 use crate::keys::{Action, Keymap};
@@ -62,6 +62,17 @@ pub enum DiffMode {
 pub enum ViewMode {
     Status,
     History,
+    /// A branch-to-branch review session (`strix diff <range>`).
+    Review,
+}
+
+/// Which sub-pane of the review view receives keyboard input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewFocus {
+    /// The flat changed-file list.
+    List,
+    /// The diff pane.
+    Diff,
 }
 
 /// Which sub-pane of the history view receives keyboard input.
@@ -99,6 +110,48 @@ pub enum Modal {
     },
     /// The keybinding help overlay.
     Help,
+}
+
+/// Review-session state: the resolved range, its changed-file list, and the
+/// review view's own selection / focus / cached diff. Only what is the review
+/// view's own lives here — the shared pane machinery (diff scroll + metrics,
+/// highlight / side-by-side caches, changes-pane width) stays on [`App`], reused
+/// across all three views.
+struct ReviewState {
+    /// The resolved range (its `input` is re-run verbatim on refresh).
+    spec: ReviewSpec,
+    /// The files that differ between `spec.base` and `spec.head`, in list order.
+    files: Vec<CommitFile>,
+    /// Row selected in `files` (0-based; meaningless when `files` is empty).
+    selected: usize,
+    focus: ReviewFocus,
+    /// The cached diff for the selected file and the `(base, head, path)` OID key
+    /// it was computed for, so a moved range tip recomputes it.
+    diff: Option<FileDiff>,
+    diff_key: Option<(gix::ObjectId, gix::ObjectId, String)>,
+    /// Bumped each time the file list is rebuilt by a refresh, so a test (and the
+    /// churn guard's contract) can observe that an OID-unchanged reload skips it.
+    relist_count: u64,
+    /// The list's scroll offset, persisted between frames for mouse hit-testing.
+    list_state: RefCell<ListState>,
+    /// The file list's inner rect from the last render, for mouse hit-testing.
+    list_area: Cell<Rect>,
+}
+
+impl ReviewState {
+    fn new(spec: ReviewSpec, files: Vec<CommitFile>) -> Self {
+        ReviewState {
+            spec,
+            files,
+            selected: 0,
+            focus: ReviewFocus::List,
+            diff: None,
+            diff_key: None,
+            relist_count: 0,
+            list_state: RefCell::new(ListState::default()),
+            list_area: Cell::new(Rect::default()),
+        }
+    }
 }
 
 /// Global application state. A single `App` drives both rendering and input
@@ -161,8 +214,13 @@ pub struct App {
     body_area: Cell<Rect>,
     divider_x: Cell<u16>,
 
-    // --- History view ---
+    // --- Top-level view ---
     pub view: ViewMode,
+    /// Present only in a review session (`strix diff <range>`); drives the
+    /// `ViewMode::Review` view. `None` for a status session.
+    review: Option<ReviewState>,
+
+    // --- History view ---
     history_focus: HistoryFocus,
     commits: Vec<CommitInfo>,
     refs: Vec<RefLabel>,
@@ -199,15 +257,42 @@ impl App {
     }
 
     pub fn with_config(repo_path: PathBuf, config: &Config) -> anyhow::Result<Self> {
+        Self::build(repo_path, config, None)
+    }
+
+    /// Open a review session against `range` (`strix diff <range>`). The range is
+    /// resolved here, before any terminal setup, so a bad range fails fast with a
+    /// contextual error rather than a blank TUI.
+    pub fn for_review(repo_path: PathBuf, config: &Config, range: &str) -> anyhow::Result<Self> {
+        Self::build(repo_path, config, Some(range))
+    }
+
+    fn build(repo_path: PathBuf, config: &Config, range: Option<&str>) -> anyhow::Result<Self> {
         let repo = Repo::open(&repo_path)?;
         let status = repo.status()?;
         let theme = Theme::load(
             config.theme.as_deref().unwrap_or("tokyo-night"),
             crate::config::config_dir().as_deref(),
         );
+        // A review session resolves its range up front (a bad range bubbles out).
+        let review = match range {
+            Some(range) => {
+                let spec = repo.resolve_range(range)?;
+                let files = repo.range_files(&spec)?;
+                Some(ReviewState::new(spec, files))
+            }
+            None => None,
+        };
+        let view = if review.is_some() {
+            ViewMode::Review
+        } else {
+            ViewMode::Status
+        };
         let mut app = App {
             repo,
             status,
+            view,
+            review,
             selected: 0,
             focus: Focus::Staging,
             show_changes: true,
@@ -232,7 +317,6 @@ impl App {
             diff_area: Cell::new(Rect::default()),
             body_area: Cell::new(Rect::default()),
             divider_x: Cell::new(0),
-            view: ViewMode::Status,
             history_focus: HistoryFocus::Graph,
             commits: Vec::new(),
             refs: Vec::new(),
@@ -255,7 +339,7 @@ impl App {
             keymap: Keymap::from_config(config.keys.as_ref()),
         };
         app.clamp_selection();
-        app.sync_diff();
+        app.sync_active();
         Ok(app)
     }
 
@@ -302,11 +386,12 @@ impl App {
         }
     }
 
-    /// Re-read status and recompute the diff in one step. Used by the file
-    /// watcher, whose path has no trailing `sync_diff` like `on_key`/`on_mouse`.
+    /// Re-read the active view's data and recompute its diff in one step. Used by
+    /// the file watcher, whose path has no trailing `sync_active` like
+    /// `on_key`/`on_mouse`. View-aware: it refreshes whichever view is showing.
     pub fn reload(&mut self) {
-        self.refresh();
-        self.sync_diff();
+        self.refresh_active();
+        self.sync_active();
     }
 
     pub fn on_key(&mut self, key: KeyEvent) {
@@ -321,9 +406,11 @@ impl App {
             self.on_key_modal(key);
         } else if key.code == KeyCode::Esc {
             // Esc leaves the history view; it is not in the keymap (so the modal's
-            // own Esc handling stays first). A no-op in the status view.
-            if self.view == ViewMode::History {
-                self.exit_history();
+            // own Esc handling stays first). A no-op in the status and review
+            // views (review's Esc must not exit a session).
+            match self.view {
+                ViewMode::History => self.exit_history(),
+                ViewMode::Status | ViewMode::Review => {}
             }
         } else if let Some(action) = self.keymap.action(key) {
             self.dispatch(action);
@@ -361,13 +448,13 @@ impl App {
                 return;
             }
             Action::ShowStatus => {
-                if self.view == ViewMode::History {
-                    self.exit_history();
-                }
+                // `1` returns to the session home (status or review); from history
+                // it exits back to it, and is a no-op once already home.
+                self.go_home();
                 return;
             }
             Action::ShowHistory => {
-                if self.view == ViewMode::Status {
+                if self.view != ViewMode::History {
                     self.enter_history();
                 }
                 return;
@@ -377,6 +464,24 @@ impl App {
         match self.view {
             ViewMode::Status => self.dispatch_status(action),
             ViewMode::History => self.dispatch_history(action),
+            ViewMode::Review => self.dispatch_review(action),
+        }
+    }
+
+    /// The session's home view: Review for a `strix diff` session, else Status.
+    /// History is a toggleable overlay on top of whichever home a session has.
+    fn home_view(&self) -> ViewMode {
+        if self.review.is_some() {
+            ViewMode::Review
+        } else {
+            ViewMode::Status
+        }
+    }
+
+    /// Return to the session home from history (a no-op if already home).
+    fn go_home(&mut self) {
+        if self.view == ViewMode::History {
+            self.exit_history();
         }
     }
 
@@ -470,6 +575,119 @@ impl App {
         }
     }
 
+    /// Interpret a navigation action in the review view: it acts on whichever
+    /// sub-pane (file List / Diff) has focus. The view is read-only, so staging
+    /// ops do nothing (mirrors `dispatch_history`).
+    fn dispatch_review(&mut self, action: Action) {
+        match action {
+            Action::SwitchPane => {
+                if self.show_changes {
+                    self.review_toggle_focus();
+                } else {
+                    self.reveal_review_panel(); // Tab reveals a hidden panel and lands in it.
+                }
+            }
+            Action::ToggleChanges => self.toggle_review_panel(),
+            Action::FocusStaging => {
+                if self.show_changes {
+                    self.set_review_focus(ReviewFocus::List);
+                } else {
+                    self.reveal_review_panel();
+                }
+            }
+            Action::FocusDiff => self.set_review_focus(ReviewFocus::Diff),
+            Action::Down => self.review_move(true),
+            Action::Up => self.review_move(false),
+            Action::Top => self.review_to_edge(false),
+            Action::Bottom => self.review_to_edge(true),
+            Action::HalfPageDown => self.scroll_diff(true, self.half_page()),
+            Action::HalfPageUp => self.scroll_diff(false, self.half_page()),
+            // Read-only view: staging ops do nothing (no modal, no mutation).
+            Action::ToggleStage | Action::Stage | Action::Unstage | Action::Discard => {}
+            // Handled in `dispatch`.
+            Action::Quit
+            | Action::Help
+            | Action::Refresh
+            | Action::ToggleDiffMode
+            | Action::ToggleHistory
+            | Action::ShowStatus
+            | Action::ShowHistory => {}
+        }
+    }
+
+    /// Mirror of `toggle_changes` for the review view: hiding forces focus to the
+    /// Diff (the only visible pane); revealing returns to the file List.
+    fn toggle_review_panel(&mut self) {
+        if self.show_changes {
+            self.show_changes = false;
+            self.set_review_focus(ReviewFocus::Diff);
+        } else {
+            self.reveal_review_panel();
+        }
+    }
+
+    fn reveal_review_panel(&mut self) {
+        self.show_changes = true;
+        self.set_review_focus(ReviewFocus::List);
+    }
+
+    fn review_toggle_focus(&mut self) {
+        let next = match self.review_focus() {
+            ReviewFocus::List => ReviewFocus::Diff,
+            ReviewFocus::Diff => ReviewFocus::List,
+        };
+        self.set_review_focus(next);
+    }
+
+    fn set_review_focus(&mut self, focus: ReviewFocus) {
+        if let Some(review) = self.review.as_mut() {
+            review.focus = focus;
+        }
+    }
+
+    /// Move within the review view: the file List moves the selection, the Diff
+    /// scrolls.
+    fn review_move(&mut self, down: bool) {
+        match self.review_focus() {
+            ReviewFocus::List => {
+                if let Some(review) = self.review.as_mut() {
+                    let last = review.files.len().saturating_sub(1);
+                    review.selected = if down {
+                        (review.selected + 1).min(last)
+                    } else {
+                        review.selected.saturating_sub(1)
+                    };
+                }
+            }
+            ReviewFocus::Diff => self.scroll_diff(down, 1),
+        }
+    }
+
+    fn review_to_edge(&mut self, bottom: bool) {
+        match self.review_focus() {
+            ReviewFocus::List => {
+                if let Some(review) = self.review.as_mut() {
+                    review.selected = if bottom {
+                        review.files.len().saturating_sub(1)
+                    } else {
+                        0
+                    };
+                }
+            }
+            ReviewFocus::Diff => {
+                self.diff_scroll = if bottom { self.diff_max_scroll() } else { 0 };
+            }
+        }
+    }
+
+    /// The review view's focused sub-pane (List when there is no review session).
+    fn review_focus(&self) -> ReviewFocus {
+        self.review
+            .as_ref()
+            .map(|review| review.focus)
+            .unwrap_or(ReviewFocus::List)
+    }
+
     /// Mirror of `toggle_changes` for the history view: hiding forces focus to
     /// the Diff (the only visible pane); revealing returns to the Graph (the
     /// history view's entry-default focus).
@@ -495,8 +713,9 @@ impl App {
 
     fn toggle_history(&mut self) {
         match self.view {
-            ViewMode::Status => self.enter_history(),
             ViewMode::History => self.exit_history(),
+            // From either home (status or review), `i` opens history.
+            ViewMode::Status | ViewMode::Review => self.enter_history(),
         }
     }
 
@@ -505,7 +724,12 @@ impl App {
             self.load_history();
         }
         self.view = ViewMode::History;
-        self.history_focus = HistoryFocus::Graph;
+        // Hidden left column ⇒ the Diff is the only visible pane to focus.
+        self.history_focus = if self.show_changes {
+            HistoryFocus::Graph
+        } else {
+            HistoryFocus::Diff
+        };
         self.selected_commit = 0;
         self.committed_row = 0;
         self.diff_scroll = 0;
@@ -514,32 +738,39 @@ impl App {
     }
 
     fn exit_history(&mut self) {
-        self.view = ViewMode::Status;
-        // Respect the status view's hidden-panel invariant: when the Changes
-        // panel is hidden, focus must be the only visible pane (Diff). Returning
-        // to a hidden Staging pane would silently route keys nowhere visible.
+        // Return to the session's home view (status or review), not always status.
+        self.view = self.home_view();
+        // Respect the hidden-panel invariant in whichever home we return to:
+        // when the left panel is hidden, focus must be the only visible pane
+        // (Diff), or keys would route to an invisible selection.
         self.focus = if self.show_changes {
             Focus::Staging
         } else {
             Focus::Diff
         };
+        if !self.show_changes {
+            self.set_review_focus(ReviewFocus::Diff);
+        }
         // Clear any in-flight horizontal-divider drag/hover state so it can't
-        // leak into the status view's mouse handling (the hdivider doesn't exist
+        // leak into the home view's mouse handling (the hdivider doesn't exist
         // outside history).
         self.dragging_hdivider = false;
         self.hovering_hdivider = false;
-        // Drop the per-file render caches: the status diff describes a different
-        // file than the history view left behind.
+        // Drop the per-file render caches: the home view's diff describes a
+        // different file than the history view left behind.
         self.reset_diff_view();
-        self.sync_diff();
+        self.sync_active();
     }
 
     /// Load (or reload) the commit walk + refs + graph layout, leaving `commits`
     /// empty on an empty repo or error (the UI renders an empty-state hint).
+    /// Reloads walk at least as far as what's already paged in, so a refresh
+    /// never silently truncates history the user scrolled to.
     fn load_history(&mut self) {
-        match self.repo.history(HISTORY_PAGE) {
+        let want = self.commits.len().max(HISTORY_PAGE);
+        match self.repo.history(want) {
             Ok(commits) => {
-                self.history_loaded_all = commits.len() < HISTORY_PAGE;
+                self.history_loaded_all = commits.len() < want;
                 self.commits = commits;
             }
             Err(err) => {
@@ -726,9 +957,19 @@ impl App {
     }
 
     fn on_click(&mut self, pos: Position) {
-        if self.view == ViewMode::History {
-            self.history_click(pos);
-            return;
+        // Route to the active view's own hit-testing. Review and history must
+        // never fall through to the status branch below, whose `staging_area`
+        // rect (and `toggle_stage`) would otherwise act on a stale click target.
+        match self.view {
+            ViewMode::History => {
+                self.history_click(pos);
+                return;
+            }
+            ViewMode::Review => {
+                self.review_click(pos);
+                return;
+            }
+            ViewMode::Status => {}
         }
         match self.pane_at(pos) {
             Some(Focus::Diff) => self.focus = Focus::Diff,
@@ -766,6 +1007,28 @@ impl App {
             self.committed_row = row.min(self.commit_files.len());
         } else if self.diff_area.get().contains(pos) {
             self.history_focus = HistoryFocus::Diff;
+        }
+    }
+
+    /// Route a click in the review view to its sub-pane: the file List selects a
+    /// row and focuses the list, the diff pane just takes focus. Staging is inert
+    /// in review, so a click in the marker column only selects — it never stages.
+    fn review_click(&mut self, pos: Position) {
+        let list = self.review_list_area();
+        if list.contains(pos) {
+            let row = self
+                .review
+                .as_ref()
+                .map(|review| review.list_state.borrow().offset() + (pos.y - list.y) as usize)
+                .unwrap_or(0);
+            if let Some(review) = self.review.as_mut() {
+                review.focus = ReviewFocus::List;
+                if row < review.files.len() {
+                    review.selected = row;
+                }
+            }
+        } else if self.diff_area.get().contains(pos) {
+            self.set_review_focus(ReviewFocus::Diff);
         }
     }
 
@@ -819,15 +1082,34 @@ impl App {
     }
 
     fn on_scroll(&mut self, pos: Position, down: bool) {
-        if self.view == ViewMode::History {
-            self.history_scroll(pos, down);
-            return;
+        match self.view {
+            ViewMode::History => {
+                self.history_scroll(pos, down);
+                return;
+            }
+            ViewMode::Review => {
+                self.review_scroll(pos, down);
+                return;
+            }
+            ViewMode::Status => {}
         }
         match self.pane_at(pos) {
             Some(Focus::Diff) => self.scroll_diff(down, SCROLL_STEP),
             Some(Focus::Staging) if down => self.select_next(),
             Some(Focus::Staging) => self.select_prev(),
             None => {}
+        }
+    }
+
+    /// Route a wheel event in the review view: over the list it moves the
+    /// selection, over the diff it scrolls the diff.
+    fn review_scroll(&mut self, pos: Position, down: bool) {
+        let list = self.review_list_area();
+        if list.contains(pos) {
+            self.set_review_focus(ReviewFocus::List);
+            self.review_move(down);
+        } else if self.diff_area.get().contains(pos) {
+            self.scroll_diff(down, SCROLL_STEP);
         }
     }
 
@@ -1040,6 +1322,7 @@ impl App {
         match self.view {
             ViewMode::Status => self.sync_diff(),
             ViewMode::History => self.sync_history_diff(),
+            ViewMode::Review => self.sync_review_diff(),
         }
     }
 
@@ -1051,14 +1334,138 @@ impl App {
             ViewMode::Status => self.refresh(),
             ViewMode::History => {
                 let current = self.commits.get(self.selected_commit).map(|c| c.id);
+                let prev_row = self.committed_row;
                 self.load_history();
-                self.selected_commit = current
-                    .and_then(|id| self.commits.iter().position(|c| c.id == id))
-                    .unwrap_or(0);
+                let found = current.and_then(|id| self.commits.iter().position(|c| c.id == id));
+                self.selected_commit = found.unwrap_or(0);
                 self.load_commit_files();
+                // A watcher reload must not yank the cursor off the file being
+                // viewed: keep the row when the same commit is still selected.
+                if found.is_some() {
+                    self.committed_row = prev_row.min(self.commit_files.len());
+                }
                 self.sync_history_diff();
             }
+            ViewMode::Review => self.refresh_review(),
         }
+    }
+
+    /// Re-resolve the review range and rebuild its file list only when the range
+    /// actually moved. The common watcher event during an agent run is a worktree
+    /// save, which can't change a committed range: if the re-resolved (base, head)
+    /// OIDs are unchanged, everything is kept (the churn guard). When they change,
+    /// the list is rebuilt, the selection preserved by path (falling back to the
+    /// nearest valid row), and the open diff recomputed via its OID-keyed cache.
+    /// A resolution failure after startup (e.g. the branch was deleted) flashes an
+    /// error and keeps the stale list; the next good refresh recovers.
+    fn refresh_review(&mut self) {
+        let Some(review) = self.review.as_ref() else {
+            return;
+        };
+        let (old_base, old_head) = (review.spec.base, review.spec.head);
+        // Re-resolve from the stored input by borrow (no clone): the range is only
+        // re-listed if the resolved tips moved.
+        let spec = match self.repo.resolve_range(&review.spec.input) {
+            Ok(spec) => spec,
+            Err(err) => {
+                tracing::warn!("re-resolving review range failed: {err:#}");
+                self.last_error = Some(format!("review: {err}"));
+                return;
+            }
+        };
+        if spec.base == old_base && spec.head == old_head {
+            // Range unchanged: keep the list, selection, scroll, and warm caches.
+            self.clear_review_error();
+            return;
+        }
+
+        // The range moved, so relisting is unavoidable; only now clone the prior
+        // selection's path (to follow it) past the churn guard.
+        let review = self
+            .review
+            .as_ref()
+            .expect("review present after the churn guard");
+        let prev_selected = review.selected;
+        let prev_path = review
+            .files
+            .get(prev_selected)
+            .map(|file| file.path.clone());
+        // A transient listing failure must not store the new spec: doing so would
+        // arm the churn guard against the very retry that could recover.
+        let files = match self.repo.range_files(&spec) {
+            Ok(files) => files,
+            Err(err) => {
+                tracing::warn!("listing review files failed: {err:#}");
+                self.last_error = Some(format!("review: {err}"));
+                return;
+            }
+        };
+        self.clear_review_error();
+        let selected = prev_path
+            .and_then(|path| files.iter().position(|file| file.path == path))
+            .unwrap_or_else(|| prev_selected.min(files.len().saturating_sub(1)));
+
+        if let Some(review) = self.review.as_mut() {
+            review.spec = spec;
+            review.selected = selected;
+            review.files = files;
+            review.relist_count += 1;
+            // Force the open diff to recompute against the new tips.
+            review.diff_key = None;
+        }
+        self.sync_review_diff();
+    }
+
+    /// A successful review refresh clears a lingering review failure flash, so a
+    /// watcher-driven recovery doesn't keep shouting about a fixed problem.
+    fn clear_review_error(&mut self) {
+        if self
+            .last_error
+            .as_ref()
+            .is_some_and(|e| e.starts_with("review: "))
+        {
+            self.last_error = None;
+        }
+    }
+
+    /// Recompute the review diff for the selected file, keyed on
+    /// `(base, head, path)` so a moved tip refreshes the same file's diff. Clears
+    /// the cache when the range is empty (nothing selected).
+    fn sync_review_diff(&mut self) {
+        if self.view != ViewMode::Review {
+            return;
+        }
+        let Some(review) = self.review.as_ref() else {
+            return;
+        };
+        let Some(file) = review.files.get(review.selected) else {
+            if review.diff.is_some() {
+                if let Some(review) = self.review.as_mut() {
+                    review.diff = None;
+                    review.diff_key = None;
+                }
+                self.reset_diff_view();
+            }
+            return;
+        };
+        // Check the cache by borrow first (`ObjectId` is `Copy`), so an unchanged
+        // selection — the common per-keypress case — allocates nothing.
+        let cached = review.diff_key.as_ref().is_some_and(|(base, head, path)| {
+            *base == review.spec.base && *head == review.spec.head && *path == file.path
+        });
+        if cached {
+            return;
+        }
+        // Genuine miss: clone only what the recompute needs.
+        let file = file.clone();
+        let spec = review.spec.clone();
+        let key = (spec.base, spec.head, file.path.clone());
+        let diff = self.repo.range_file_diff(&spec, &file);
+        if let Some(review) = self.review.as_mut() {
+            review.diff = Some(diff);
+            review.diff_key = Some(key);
+        }
+        self.reset_diff_view();
     }
 
     /// Recompute the history diff for the selected commit + top-pane row. The
@@ -1143,6 +1550,7 @@ impl App {
         match self.view {
             ViewMode::Status => self.current_diff.as_ref(),
             ViewMode::History => self.history_diff.as_ref(),
+            ViewMode::Review => self.review.as_ref().and_then(|review| review.diff.as_ref()),
         }
     }
 
@@ -1154,6 +1562,11 @@ impl App {
                 .commit_files
                 .get(self.committed_row.checked_sub(1)?)
                 .map(|file| file.path.clone()),
+            ViewMode::Review => self
+                .review
+                .as_ref()
+                .and_then(|review| review.files.get(review.selected))
+                .map(|file| file.path.clone()),
         }
     }
 
@@ -1163,12 +1576,80 @@ impl App {
         self.view == ViewMode::History && self.committed_row == 0
     }
 
-    /// Whether the diff pane is the focused pane, in either view.
+    /// Whether the diff pane is the focused pane, in any view.
     pub fn diff_focused(&self) -> bool {
         match self.view {
             ViewMode::Status => self.focus == Focus::Diff,
             ViewMode::History => self.history_focus == HistoryFocus::Diff,
+            ViewMode::Review => self.review_focus() == ReviewFocus::Diff,
         }
+    }
+
+    // --- Review view: accessors for rendering + mouse ---
+
+    /// The review range's normalized display label (e.g. `main…HEAD`), for the
+    /// header. `None` outside a review session.
+    pub fn review_display(&self) -> Option<&str> {
+        self.review
+            .as_ref()
+            .map(|review| review.spec.display.as_str())
+    }
+
+    /// The review file list, in display order.
+    pub fn review_files(&self) -> &[CommitFile] {
+        self.review
+            .as_ref()
+            .map(|review| review.files.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// The selected row in the review file list.
+    pub fn review_selected(&self) -> usize {
+        self.review
+            .as_ref()
+            .map(|review| review.selected)
+            .unwrap_or(0)
+    }
+
+    /// Whether the review file list is the focused pane.
+    pub fn review_list_focused(&self) -> bool {
+        self.review_focus() == ReviewFocus::List
+    }
+
+    /// How many times the review file list has been rebuilt by a refresh. Exposed
+    /// so a test can confirm an OID-unchanged reload skips relisting (the churn
+    /// guard) while a moved range does rebuild.
+    pub fn review_relist_count(&self) -> u64 {
+        self.review
+            .as_ref()
+            .map(|review| review.relist_count)
+            .unwrap_or(0)
+    }
+
+    /// The review list's persisted `ListState`; rendering borrows it so the
+    /// scroll offset is available for mouse hit-testing.
+    pub fn review_list_state_mut(&self) -> std::cell::RefMut<'_, ListState> {
+        self.review
+            .as_ref()
+            .expect("review_list_state_mut called outside a review session")
+            .list_state
+            .borrow_mut()
+    }
+
+    /// Record the review file list's inner rect for this frame, so a click or
+    /// wheel event on it can be hit-tested (mirrors `set_staging_area`).
+    pub fn set_review_list_area(&self, area: Rect) {
+        if let Some(review) = self.review.as_ref() {
+            review.list_area.set(area);
+        }
+    }
+
+    /// The review file list's last-rendered inner rect (for mouse-hit tests).
+    pub fn review_list_area(&self) -> Rect {
+        self.review
+            .as_ref()
+            .map(|review| review.list_area.get())
+            .unwrap_or_default()
     }
 
     pub fn history_focus(&self) -> HistoryFocus {

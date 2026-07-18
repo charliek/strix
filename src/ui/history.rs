@@ -10,10 +10,12 @@ use ratatui::widgets::{List, ListItem, Paragraph};
 use ratatui::Frame;
 
 use crate::app::{App, HistoryFocus};
-use crate::git::{ChangeKind, CommitFile, CommitInfo};
+use crate::git::{CommitFile, CommitInfo};
 use crate::graph::GraphRow;
 use crate::ui::theme::Theme;
-use crate::ui::{centered_hint, diff_view, panel_block, selection_style};
+use crate::ui::{
+    centered_hint, change_color, diff_view, file_stat_spans, panel_block, selection_style,
+};
 
 pub fn render(frame: &mut Frame, body: Rect, app: &App) {
     let theme = &app.theme;
@@ -202,30 +204,7 @@ fn stat_summary(files: &[CommitFile], theme: &Theme) -> Vec<Line<'static>> {
         Style::new().fg(theme.dim).add_modifier(Modifier::BOLD),
     ))];
     for file in files {
-        let color = change_color(file.change, theme);
-        let mut spans = vec![
-            Span::styled(
-                format!("  {} ", file.change.marker()),
-                Style::new().fg(color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(file.display_path(), Style::new().fg(theme.fg)),
-        ];
-        if file.stat.binary {
-            spans.push(Span::styled(
-                "  (binary)".to_string(),
-                Style::new().fg(theme.dim),
-            ));
-        } else {
-            spans.push(Span::styled(
-                format!("  +{} ", file.stat.added),
-                Style::new().fg(theme.add),
-            ));
-            spans.push(Span::styled(
-                format!("−{}", file.stat.deleted),
-                Style::new().fg(theme.del),
-            ));
-        }
-        lines.push(Line::from(spans));
+        lines.push(Line::from(file_stat_spans(file, theme)));
     }
     lines
 }
@@ -281,14 +260,6 @@ fn graph_row(row: &GraphRow, commits: &[CommitInfo], theme: &Theme) -> ListItem<
         ));
     }
     ListItem::new(Line::from(spans))
-}
-
-fn change_color(change: ChangeKind, theme: &Theme) -> Color {
-    match change {
-        ChangeKind::Added | ChangeKind::Copied => theme.staged,
-        ChangeKind::Deleted => theme.del,
-        _ => theme.unstaged,
-    }
 }
 
 /// Tint the horizontal split bar — the two adjacent pane borders at `hdivider_y`

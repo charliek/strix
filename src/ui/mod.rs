@@ -1,17 +1,19 @@
 pub mod diff_view;
 pub mod history;
 pub mod modal;
+pub mod review;
 pub mod staging;
 pub mod syntax;
 pub mod theme;
 
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::app::{App, ViewMode};
+use crate::git::{ChangeKind, CommitFile};
 use crate::ui::theme::Theme;
 
 /// Top-level render: header / body / footer, with the body split into the
@@ -37,6 +39,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     match app.view {
         ViewMode::Status => draw_status_body(frame, body, app),
         ViewMode::History => history::render(frame, body, app),
+        ViewMode::Review => review::render(frame, body, app),
     }
 
     render_footer(frame, footer, app);
@@ -102,17 +105,33 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         ),
         Span::styled(app.repo_name(), Style::new().fg(theme.dim)),
     ];
-    if app.view == ViewMode::History {
-        left_spans.push(Span::styled(" · history", Style::new().fg(theme.title)));
+    match app.view {
+        ViewMode::History => {
+            left_spans.push(Span::styled(" · history", Style::new().fg(theme.title)));
+        }
+        ViewMode::Review => {
+            if let Some(display) = app.review_display() {
+                left_spans.push(Span::styled(
+                    format!(" · {display}"),
+                    Style::new().fg(theme.title),
+                ));
+            }
+        }
+        ViewMode::Status => {}
     }
     frame.render_widget(Paragraph::new(Line::from(left_spans)), area);
 
-    if let Some(branch) = app.status.head_label() {
-        let right = Line::from(Span::styled(
-            format!("{branch} "),
-            Style::new().fg(theme.title),
-        ));
-        frame.render_widget(Paragraph::new(right).alignment(Alignment::Right), area);
+    // A review session's range label already identifies HEAD; the status branch /
+    // ahead-behind label would be misleading (e.g. for an `A...B` range), so it is
+    // suppressed there.
+    if app.view != ViewMode::Review {
+        if let Some(branch) = app.status.head_label() {
+            let right = Line::from(Span::styled(
+                format!("{branch} "),
+                Style::new().fg(theme.title),
+            ));
+            frame.render_widget(Paragraph::new(right).alignment(Alignment::Right), area);
+        }
     }
 }
 
@@ -158,7 +177,16 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             (" tab ", "pane  "),
             (" d ", "split  "),
             (" b ", changes_label),
-            (" i/esc ", "status  "),
+            (" i/esc ", "back  "),
+            (" ? ", "help  "),
+            (" q ", "quit"),
+        ],
+        ViewMode::Review => vec![
+            (" j/k ", "move  "),
+            (" tab ", "pane  "),
+            (" d ", "split  "),
+            (" b ", changes_label),
+            (" i ", "history  "),
             (" ? ", "help  "),
             (" q ", "quit"),
         ],
@@ -186,6 +214,46 @@ pub fn selection_style(focused: bool, theme: &Theme) -> Style {
     } else {
         Style::new().bg(theme.selection_bg)
     }
+}
+
+/// A changed file's theme colour, keyed on its change kind. Shared by the review
+/// file list and the history commit-detail summary.
+pub(crate) fn change_color(change: ChangeKind, theme: &Theme) -> Color {
+    match change {
+        ChangeKind::Added | ChangeKind::Copied => theme.staged,
+        ChangeKind::Deleted => theme.del,
+        _ => theme.unstaged,
+    }
+}
+
+/// The spans for one changed-file row: a bold change marker, the display path,
+/// then `+a −d` line stats (or `(binary)`). Shared by the review file list and
+/// the history commit-detail per-file breakdown so the row stays identical.
+pub(crate) fn file_stat_spans(file: &CommitFile, theme: &Theme) -> Vec<Span<'static>> {
+    let color = change_color(file.change, theme);
+    let mut spans = vec![
+        Span::styled(
+            format!("  {} ", file.change.marker()),
+            Style::new().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(file.display_path(), Style::new().fg(theme.fg)),
+    ];
+    if file.stat.binary {
+        spans.push(Span::styled(
+            "  (binary)".to_string(),
+            Style::new().fg(theme.dim),
+        ));
+    } else {
+        spans.push(Span::styled(
+            format!("  +{} ", file.stat.added),
+            Style::new().fg(theme.add),
+        ));
+        spans.push(Span::styled(
+            format!("−{}", file.stat.deleted),
+            Style::new().fg(theme.del),
+        ));
+    }
+    spans
 }
 
 /// A bordered panel with focus-aware border + title colours. Shared by the

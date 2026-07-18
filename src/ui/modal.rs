@@ -64,6 +64,8 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
         section("View"),
         binding("d", "toggle side-by-side"),
         binding("b", "show / hide changes panel"),
+        binding("i", "toggle history"),
+        binding("1 / 2", "home / history"),
         Line::raw(""),
         binding("any key", "close help"),
         binding("q", "quit"),
