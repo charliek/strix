@@ -61,6 +61,32 @@ pub enum Command {
         /// Path to the git repository (defaults to the current directory).
         path: Option<PathBuf>,
     },
+
+    /// Manage the bundled agent skill (`strix-review`).
+    ///
+    /// Repo-independent: it materializes a file under the user's data directory,
+    /// so it takes no `[PATH]` and works from anywhere.
+    Skill {
+        #[command(subcommand)]
+        action: SkillAction,
+    },
+}
+
+/// A `strix skill` action.
+#[derive(Debug, Subcommand)]
+pub enum SkillAction {
+    /// Write the bundled `strix-review` skill to the data directory and print
+    /// its absolute path (overwritten each run, so it tracks this binary).
+    ///
+    /// The location is `<data_dir>/strix/skills/strix-review/SKILL.md`, where
+    /// `data_dir` is `$STRIX_DATA_DIR` if set to a non-empty value (an empty
+    /// value counts as unset), else the platform data directory; a relative
+    /// `$STRIX_DATA_DIR` is resolved against the current directory.
+    Path {
+        /// Emit `{"path": "…"}` on stdout instead of the bare path.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// A `strix comment` action. All act on the current HEAD branch key.
@@ -124,6 +150,7 @@ impl Cli {
         match &self.command {
             Some(Command::Diff { range, path }) => (path.clone(), Some(range.clone())),
             Some(Command::Comment { path, .. }) => (path.clone(), None),
+            Some(Command::Skill { .. }) => (None, None),
             None => (self.path.clone(), None),
         }
     }
