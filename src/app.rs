@@ -11,7 +11,7 @@ use ratatui::style::Color;
 use ratatui::widgets::ListState;
 use syntect::parsing::SyntaxReference;
 
-use crate::comments::{self, Comment, Side};
+use crate::comments::{self, Comment, Side, Source};
 use crate::config::{Config, Setting};
 use crate::git::{
     Change, CommitFile, CommitInfo, DiffLine, FileDiff, FileEntry, LineKind, RefLabel, Repo,
@@ -172,6 +172,18 @@ pub enum URow {
     Orphan(u64),
 }
 
+/// A comment's anchor, captured *by value* when the input modal opens so a
+/// watcher reload that rebuilds the diff mid-typing can't dangle it. Submit
+/// persists exactly these fields; if the diff moved underneath, the comment
+/// simply re-anchors (or orphans) honestly on the next pass (plan §3.4).
+#[derive(Clone, Debug)]
+pub struct CommentAnchor {
+    pub file: String,
+    pub side: Side,
+    pub line: usize,
+    pub context: Option<String>,
+}
+
 /// A blocking overlay that captures input until dismissed.
 #[derive(Clone, Debug)]
 pub enum Modal {
@@ -183,6 +195,15 @@ pub enum Modal {
     },
     /// The keybinding help overlay.
     Help,
+    /// The single-line review-comment editor (add or edit). `cursor` is a char
+    /// index into `buffer`; `anchor` is captured by value at open; `editing` is
+    /// `Some(id)` when editing an existing human comment, `None` for a new one.
+    CommentInput {
+        buffer: String,
+        cursor: usize,
+        anchor: CommentAnchor,
+        editing: Option<u64>,
+    },
 }
 
 /// Review-session state: the resolved range, its changed-file list, and the
@@ -685,8 +706,9 @@ impl App {
             Action::Stage => self.stage_selected(),
             Action::Unstage => self.unstage_selected(),
             Action::Discard => self.request_discard(),
-            // Comment navigation is a review-view feature; inert elsewhere.
-            Action::NextComment | Action::PrevComment => {}
+            // Commenting and comment navigation are review-view features; inert
+            // elsewhere.
+            Action::Comment | Action::NextComment | Action::PrevComment => {}
             // Handled in `dispatch`.
             Action::Quit
             | Action::Help
@@ -727,11 +749,13 @@ impl App {
             Action::Bottom => self.history_to_edge(true),
             Action::HalfPageDown => self.scroll_diff(true, self.half_page()),
             Action::HalfPageUp => self.scroll_diff(false, self.half_page()),
-            // Read-only view: staging ops and comment navigation do nothing.
+            // Read-only view: staging ops, commenting, and comment navigation do
+            // nothing.
             Action::ToggleStage
             | Action::Stage
             | Action::Unstage
             | Action::Discard
+            | Action::Comment
             | Action::NextComment
             | Action::PrevComment => {}
             // Handled in `dispatch`.
@@ -779,6 +803,9 @@ impl App {
             Action::HalfPageUp => self.review_half_page(false),
             Action::NextComment => self.review_cycle_comment(true),
             Action::PrevComment => self.review_cycle_comment(false),
+            // `c` adds a comment on the code row under the cursor, or edits the
+            // human comment under it.
+            Action::Comment => self.review_comment_action(),
             // `x` deletes the comment under the cursor (diff focus only); on a code
             // row it's a silent no-op. Other staging ops stay inert.
             Action::Discard => self.review_delete_comment(),
@@ -1137,6 +1164,248 @@ impl App {
             Ok(None) => {}
             Err(err) => {
                 tracing::warn!("deleting comment failed: {err:#}");
+                self.flash = Some(Flash::error(format!("comments: {err}")));
+            }
+        }
+    }
+
+    /// Handle `c` in the review view (diff focus): open the input modal to add a
+    /// comment on the code row under the cursor, or to edit the human comment
+    /// under it. Gates per plan §3.4: a non-authoring session, the file list, a
+    /// hunk row, and an agent note each Info-flash instead of opening; an
+    /// offscreen cursor only reveals (act-and-reveal), no modal.
+    fn review_comment_action(&mut self) {
+        let Some(review) = self.review.as_ref() else {
+            return;
+        };
+        if !review.authoring {
+            self.flash = Some(Flash::info("check out the reviewed branch to comment"));
+            return;
+        }
+        if self.review_focus() != ReviewFocus::Diff {
+            self.flash = Some(Flash::info("focus the diff to comment"));
+            return;
+        }
+        // Never act on a row the user can't see: a first `c` on an offscreen
+        // cursor only scrolls it into view (mirrors `x`, finding 1 / plan §3.4).
+        if !self.reveal_cursor_before_acting() {
+            return;
+        }
+        // A comment/orphan row: edit a human note, or refuse an agent note.
+        if let Some(id) = self.cursor_comment_id() {
+            match self.review_comment(id) {
+                Some(comment) if comment.source == Source::Human => {
+                    let cursor = comment.text.chars().count();
+                    self.modal = Some(Modal::CommentInput {
+                        buffer: comment.text.clone(),
+                        cursor,
+                        anchor: CommentAnchor {
+                            file: comment.file.clone(),
+                            side: comment.side,
+                            line: comment.line,
+                            context: comment.context.clone(),
+                        },
+                        editing: Some(id),
+                    });
+                }
+                Some(_) => self.flash = Some(Flash::info("agent note — read-only")),
+                // Vanished between the row build and now (a concurrent rm): no-op.
+                None => {}
+            }
+            return;
+        }
+        // A code row: anchor a new comment, unless it's a hunk header.
+        match self.cursor_code_anchor() {
+            Some(anchor) => {
+                self.modal = Some(Modal::CommentInput {
+                    buffer: String::new(),
+                    cursor: 0,
+                    anchor,
+                    editing: None,
+                });
+            }
+            None => self.flash = Some(Flash::info("can't comment here")),
+        }
+    }
+
+    /// The anchor for a new comment on the code row under the cursor, or `None`
+    /// on a hunk header (or a row with no anchorable line). Per plan §3.4:
+    /// Addition → New/`new_no`, Deletion → Old/`old_no`, Context → New/`new_no`;
+    /// `context` is the line's text. In side-by-side a replaced-line pair anchors
+    /// to its new side when present, else its old side.
+    fn cursor_code_anchor(&self) -> Option<CommentAnchor> {
+        let review = self.review.as_ref()?;
+        let file = review.files.get(review.selected)?.path.clone();
+        let cursor = review.cursor;
+        let FileDiff::Text(lines) = review.diff.as_ref()? else {
+            return None;
+        };
+        if lines.is_empty() {
+            return None;
+        }
+        let li = match self.diff_mode {
+            DiffMode::Unified => match self.unified_rows(lines).get(cursor)? {
+                URow::Line(li) => *li,
+                URow::Comment(_) | URow::Orphan(_) => return None,
+            },
+            DiffMode::SideBySide => match self.sbs_rows(lines).get(cursor)? {
+                SbsRow::Pair { left, right } => right.or(*left)?,
+                SbsRow::Hunk(_) | SbsRow::Comment(_) | SbsRow::Orphan(_) => return None,
+            },
+        };
+        anchor_for_line(&lines[li], file)
+    }
+
+    /// Route a key to the comment input modal. Handles the editing branch of
+    /// [`on_key_modal`], run before the y/n confirm match. Plain characters
+    /// insert (char-boundary safe); Backspace/Delete/arrows/Home/End edit;
+    /// Enter submits; Esc cancels. Ctrl/Alt-modified keys are ignored (Ctrl-C is
+    /// already handled upstream, before modal routing).
+    fn on_key_comment_input(&mut self, key: KeyEvent) {
+        let modified = key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Esc => self.modal = None,
+            KeyCode::Enter => self.submit_comment_input(),
+            KeyCode::Backspace if !modified => self.comment_input_edit(InputEdit::Backspace),
+            KeyCode::Delete if !modified => self.comment_input_edit(InputEdit::Delete),
+            KeyCode::Left if !modified => self.comment_input_edit(InputEdit::Left),
+            KeyCode::Right if !modified => self.comment_input_edit(InputEdit::Right),
+            KeyCode::Home if !modified => self.comment_input_edit(InputEdit::Home),
+            KeyCode::End if !modified => self.comment_input_edit(InputEdit::End),
+            KeyCode::Char(ch) if !modified => self.comment_input_edit(InputEdit::Insert(ch)),
+            _ => {}
+        }
+    }
+
+    /// Apply one editing operation to the open comment-input buffer. All indices
+    /// are char indices, converted to byte offsets only at the mutation site so
+    /// multibyte text (CJK, emoji, combining marks) is never split.
+    fn comment_input_edit(&mut self, edit: InputEdit) {
+        let Some(Modal::CommentInput { buffer, cursor, .. }) = self.modal.as_mut() else {
+            return;
+        };
+        let len = buffer.chars().count();
+        match edit {
+            InputEdit::Insert(ch) => {
+                let at = char_byte_index(buffer, *cursor);
+                buffer.insert(at, ch);
+                *cursor += 1;
+            }
+            InputEdit::Backspace => {
+                if *cursor > 0 {
+                    let start = char_byte_index(buffer, *cursor - 1);
+                    let end = char_byte_index(buffer, *cursor);
+                    buffer.replace_range(start..end, "");
+                    *cursor -= 1;
+                }
+            }
+            InputEdit::Delete => {
+                if *cursor < len {
+                    let start = char_byte_index(buffer, *cursor);
+                    let end = char_byte_index(buffer, *cursor + 1);
+                    buffer.replace_range(start..end, "");
+                }
+            }
+            InputEdit::Left => *cursor = cursor.saturating_sub(1),
+            InputEdit::Right => *cursor = (*cursor + 1).min(len),
+            InputEdit::Home => *cursor = 0,
+            InputEdit::End => *cursor = len,
+        }
+    }
+
+    /// Submit the comment input (Enter). Transactional per plan §3.1.5: a
+    /// whitespace-only buffer cancels with no write; otherwise mutate a fresh
+    /// store read (new → push; edit → update text only, or flash "comment was
+    /// removed" if it vanished), persist, and only on success replace the
+    /// in-memory set + invalidate row caches + close the modal. A write failure
+    /// flashes and leaves the modal (buffer intact) so the user can retry or Esc.
+    fn submit_comment_input(&mut self) {
+        let Some(Modal::CommentInput {
+            buffer,
+            anchor,
+            editing,
+            ..
+        }) = self.modal.as_ref()
+        else {
+            return;
+        };
+        // Empty / whitespace-only submit is a cancel — no store write.
+        if buffer.trim().is_empty() {
+            self.modal = None;
+            return;
+        }
+        let text = buffer.clone();
+        let anchor = anchor.clone();
+        let editing = *editing;
+        let (branch, range_input) = match self.review.as_ref() {
+            Some(review) if review.authoring => {
+                (review.branch_key.clone(), review.spec.input.clone())
+            }
+            // Authoring turned off since the modal opened: drop the submit.
+            _ => {
+                self.modal = None;
+                return;
+            }
+        };
+        let dir = self.repo.strix_dir();
+
+        let result = comments::mutate(&dir, |store| {
+            match editing {
+                None => {
+                    // `take_id` scans every branch, so mint before borrowing the
+                    // entry (which would conflict with the scan's shared borrow).
+                    let id = store.take_id();
+                    let created_at = comments::now_secs();
+                    let entry = store.branches.entry(branch.clone()).or_default();
+                    // The session-open pass records the range; do it defensively
+                    // here too in case a comment is authored before that ran.
+                    record_range(entry, &range_input);
+                    entry.comments.push(Comment {
+                        id,
+                        source: Source::Human,
+                        file: anchor.file.clone(),
+                        side: anchor.side,
+                        line: anchor.line,
+                        text: text.clone(),
+                        context: anchor.context.clone(),
+                        orphaned: false,
+                        created_at,
+                    });
+                    SubmitOutcome::Added(entry.comments.clone())
+                }
+                Some(id) => {
+                    let entry = store.branches.entry(branch.clone()).or_default();
+                    record_range(entry, &range_input);
+                    match entry.comments.iter_mut().find(|c| c.id == id) {
+                        Some(comment) => {
+                            comment.text = text.clone();
+                            SubmitOutcome::Updated(entry.comments.clone())
+                        }
+                        None => SubmitOutcome::Vanished(entry.comments.clone()),
+                    }
+                }
+            }
+        });
+        match result {
+            Ok(outcome) => {
+                let (set, flash) = match outcome {
+                    SubmitOutcome::Added(set) => (set, Flash::info("comment added")),
+                    SubmitOutcome::Updated(set) => (set, Flash::info("comment updated")),
+                    SubmitOutcome::Vanished(set) => (set, Flash::info("comment was removed")),
+                };
+                if let Some(review) = self.review.as_mut() {
+                    review.comments = set;
+                }
+                self.invalidate_comment_rows();
+                self.modal = None;
+                self.flash = Some(flash);
+            }
+            Err(err) => {
+                tracing::warn!("saving comment failed: {err:#}");
+                // The modal stays open with the buffer intact so the user can
+                // retry or Esc (plan §3.1.5).
                 self.flash = Some(Flash::error(format!("comments: {err}")));
             }
         }
@@ -1651,6 +1920,12 @@ impl App {
     fn on_key_modal(&mut self, key: KeyEvent) {
         if matches!(self.modal, Some(Modal::Help)) {
             self.modal = None; // any key dismisses the help overlay
+            return;
+        }
+        // The text editor handles its own keys (typing, editing, submit/cancel)
+        // before the y/n confirm match below.
+        if matches!(self.modal, Some(Modal::CommentInput { .. })) {
+            self.on_key_comment_input(key);
             return;
         }
         match key.code {
@@ -2598,6 +2873,64 @@ fn record_range_and_reanchor(
             repo.range_file_diff(spec, file)
         });
         (entry.comments.clone(), range_changed || moved)
+    })
+}
+
+/// One editing operation on the comment-input buffer, so a single method covers
+/// every key (keeps char-index → byte-offset conversion in one place).
+enum InputEdit {
+    Insert(char),
+    Backspace,
+    Delete,
+    Left,
+    Right,
+    Home,
+    End,
+}
+
+/// What a submit did to the store, each carrying the branch's resulting comment
+/// set for the in-memory replace.
+enum SubmitOutcome {
+    Added(Vec<Comment>),
+    Updated(Vec<Comment>),
+    /// The edited comment was removed concurrently (a rm between open and submit):
+    /// the edit is dropped and the caller flashes "comment was removed".
+    Vanished(Vec<Comment>),
+}
+
+/// The byte offset of char index `idx` in `s`, or `s.len()` when `idx` is at or
+/// past the end — so an insert/replace never splits a multibyte char.
+fn char_byte_index(s: &str, idx: usize) -> usize {
+    s.char_indices()
+        .nth(idx)
+        .map(|(byte, _)| byte)
+        .unwrap_or(s.len())
+}
+
+/// Record `range` as the branch's reviewed range when it has none yet — a
+/// defensive mirror of the session-open pass (`record_range_and_reanchor`), so a
+/// comment authored before that ran still stamps the range.
+fn record_range(entry: &mut comments::Branch, range: &str) {
+    if entry.range.is_none() {
+        entry.range = Some(range.to_string());
+    }
+}
+
+/// The anchor for a new comment on a code diff line, or `None` for a hunk header
+/// (or a line missing the relevant side number). Plan §3.4: Addition → New,
+/// Deletion → Old, Context → New; the anchored line's text becomes `context`.
+fn anchor_for_line(line: &DiffLine, file: String) -> Option<CommentAnchor> {
+    let (side, number) = match line.kind {
+        LineKind::Addition => (Side::New, line.new_no),
+        LineKind::Deletion => (Side::Old, line.old_no),
+        LineKind::Context => (Side::New, line.new_no),
+        LineKind::Hunk => return None,
+    };
+    Some(CommentAnchor {
+        file,
+        side,
+        line: number?,
+        context: Some(line.text.clone()),
     })
 }
 

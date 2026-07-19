@@ -11,6 +11,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthChar;
 
 use crate::app::{App, FlashKind, ViewMode};
 use crate::git::{ChangeKind, CommitFile};
@@ -194,12 +195,12 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             (" q ", "quit"),
         ],
         ViewMode::Review => {
-            // Comment-navigation hints join the review footer; `x` deletes the
-            // comment under the cursor, so it only shows when the diff pane (where
-            // the cursor lives) is focused. The `c` authoring hint arrives with
-            // the comment action in C5.
+            // Comment-navigation hints join the review footer; `c` adds/edits and
+            // `x` deletes the comment under the cursor, so both only show when the
+            // diff pane (where the cursor lives) is focused.
             let mut hints = vec![(" j/k ", "move  "), (" ]/[ ", "notes  ")];
             if app.diff_focused() {
+                hints.push((" c ", "comment  "));
                 hints.push((" x ", "delete  "));
             }
             hints.extend([
@@ -338,4 +339,10 @@ pub fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
         .flex(Flex::Center)
         .areas(row);
     cell
+}
+
+/// The terminal-cell width of `ch` (0 for control/zero-width chars). The shared
+/// helper every widget that lays text out column-by-column reads from.
+pub(crate) fn char_width(ch: char) -> usize {
+    UnicodeWidthChar::width(ch).unwrap_or(0)
 }

@@ -35,6 +35,9 @@ pub enum Action {
     Stage,
     Unstage,
     Discard,
+    /// Add a comment on the code row under the cursor, or edit the human comment
+    /// under it (review view, diff focus).
+    Comment,
     /// Jump to the next / previous review comment on a listed file (review view).
     NextComment,
     PrevComment,
@@ -154,6 +157,7 @@ const DEFAULTS: &[(&str, Action)] = &[
     ("s", Action::Stage),
     ("u", Action::Unstage),
     ("x", Action::Discard),
+    ("c", Action::Comment),
     ("]", Action::NextComment),
     ("[", Action::PrevComment),
 ];
@@ -183,6 +187,7 @@ fn parse_action(name: &str) -> Option<Action> {
         "stage" => Action::Stage,
         "unstage" => Action::Unstage,
         "discard" => Action::Discard,
+        "comment" => Action::Comment,
         "next-comment" => Action::NextComment,
         "prev-comment" => Action::PrevComment,
         _ => return None,

@@ -10,6 +10,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -243,6 +244,15 @@ where
 
 fn is_commit_hex(key: &str) -> bool {
     key.len() == COMMIT_HEX_LEN && key.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The current Unix time in whole seconds (a comment's `created_at`). A clock
+/// before the epoch (unreachable in practice) yields `0` rather than panicking.
+pub fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Re-anchor every comment against the review's current diff, in place, and

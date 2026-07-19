@@ -4,14 +4,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use syntect::parsing::SyntaxReference;
-use unicode_width::UnicodeWidthChar;
 
 use crate::app::{App, DiffMode, SbsRow, URow};
 use crate::comments::Source;
 use crate::git::{DiffLine, FileDiff, LineKind};
 use crate::ui::syntax::syntax_for;
 use crate::ui::theme::Theme;
-use crate::ui::{centered_hint, panel_block};
+use crate::ui::{centered_hint, char_width, panel_block};
 
 /// Unified gutter: `oldd nnnn ` → 4 + 1 + 4 + 1.
 const GUTTER_WIDTH: usize = 10;
@@ -391,10 +390,6 @@ fn fit_with_ellipsis(s: &str, width: usize) -> String {
     }
     out.push('…');
     out
-}
-
-fn char_width(ch: char) -> usize {
-    UnicodeWidthChar::width(ch).unwrap_or(0)
 }
 
 /// Syntax-highlight `text` into spans (each token's colour over the line's

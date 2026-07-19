@@ -9,7 +9,6 @@
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Result};
 use serde_json::json;
@@ -114,7 +113,7 @@ fn add(
         },
     };
 
-    let created_at = now_secs();
+    let created_at = comments::now_secs();
     let comment = comments::mutate(dir, |store| {
         let id = store.take_id();
         let comment = Comment {
@@ -291,13 +290,6 @@ fn line_no(line: &DiffLine, side: Side) -> Option<usize> {
         Side::Old => line.old_no,
         Side::New => line.new_no,
     }
-}
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 /// Print a value as pretty JSON followed by a newline (agent- and human-readable).
