@@ -172,17 +172,29 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         "changes  "
     };
     let hints: Vec<(&str, &str)> = match app.view {
-        ViewMode::Status => vec![
-            (" j/k ", "move  "),
-            (" space ", "stage  "),
-            (" d ", "split  "),
-            (" n ", "line #s  "),
-            (" t ", "theme  "),
-            (" b ", changes_label),
-            (" i ", "history  "),
-            (" ? ", "help  "),
-            (" q ", "quit"),
-        ],
+        ViewMode::Status => {
+            // Comment-navigation hints join the status footer (worktree comments on
+            // the net diff); `c` adds/edits the note under the cursor, so it shows
+            // only when the diff pane (where the cursor lives) is focused.
+            let mut hints = vec![
+                (" j/k ", "move  "),
+                (" space ", "stage  "),
+                (" ]/[ ", "notes  "),
+            ];
+            if app.diff_focused() {
+                hints.push((" c ", "comment  "));
+            }
+            hints.extend([
+                (" d ", "split  "),
+                (" n ", "line #s  "),
+                (" t ", "theme  "),
+                (" b ", changes_label),
+                (" i ", "history  "),
+                (" ? ", "help  "),
+                (" q ", "quit"),
+            ]);
+            hints
+        }
         ViewMode::History => vec![
             (" j/k ", "move  "),
             (" tab ", "pane  "),

@@ -87,6 +87,19 @@ impl Status {
         self.staged.len() + self.unstaged.len()
     }
 
+    /// The comment-inbox key implied by *this* snapshot: the branch name (a normal
+    /// or unborn branch — porcelain still reports `# branch.head <name>` while
+    /// unborn), else, when detached, the commit hex. Deriving it from the same
+    /// `Status` that carries `head_oid`/the file lists keeps the whole
+    /// worktree-comment read atomic — an external checkout between two separate git
+    /// reads can't mutate the wrong branch's inbox with the other branch's files.
+    /// Matches [`Repo::head_branch_key`] semantics from one read.
+    ///
+    /// [`Repo::head_branch_key`]: crate::git::Repo::head_branch_key
+    pub fn branch_key(&self) -> Option<String> {
+        self.branch.clone().or_else(|| self.head_oid.clone())
+    }
+
     /// A short label for HEAD: the branch name, or `detached @ <short-oid>`.
     pub fn head_label(&self) -> Option<String> {
         if let Some(branch) = &self.branch {
@@ -202,6 +215,8 @@ fn parse_branch_header(field: &str, status: &mut Status) {
             status.branch = Some(rest.to_string());
         }
     } else if let Some(rest) = field.strip_prefix("# branch.oid ") {
-        status.head_oid = Some(rest.to_string());
+        // An unborn branch reports `(initial)`; there is no commit OID yet, so a
+        // worktree comment's baseline must be `None` (not the literal string).
+        status.head_oid = (rest != "(initial)").then(|| rest.to_string());
     }
 }

@@ -85,9 +85,9 @@ fn reload_keeps_the_scroll_position_for_the_same_file() {
     app.focus = Focus::Diff;
     // Render once to record the diff viewport, so scrolling can advance.
     let _ = dump_frame(&app, 80, 24).expect("dump_frame");
-    for _ in 0..5 {
-        app.on_key(KeyEvent::from(KeyCode::Char('j')));
-    }
+    // The diff pane is cursor-driven: jump the cursor to the last row (`G`), whose
+    // act-and-reveal scrolls the viewport down past the top.
+    app.on_key(KeyEvent::from(KeyCode::Char('G')));
     let scrolled = app.diff_scroll;
     assert!(scrolled > 0, "scrolled down into the diff");
 

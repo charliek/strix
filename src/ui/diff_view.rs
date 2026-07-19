@@ -339,7 +339,7 @@ fn hunk_line(line: &DiffLine, theme: &Theme) -> Line<'static> {
 /// an ellipsis. A missing id (a concurrent removal between row build and render)
 /// renders a blank line rather than panicking.
 fn comment_row(app: &App, id: u64, theme: &Theme, width: usize, orphaned: bool) -> Line<'static> {
-    let Some(comment) = app.review_comment(id) else {
+    let Some(comment) = app.active_comment(id) else {
         return Line::from(Span::raw(String::new()));
     };
     let marker = if orphaned { '⚠' } else { '●' };
@@ -350,13 +350,18 @@ fn comment_row(app: &App, id: u64, theme: &Theme, width: usize, orphaned: bool) 
     let text = comment_display_text(&comment.text);
     let full = format!("{marker} {who} {text}");
     let shown = fit_with_ellipsis(&full, width);
-    Line::from(Span::styled(
-        shown,
+    // A drifted worktree note (`stale`) is surfaced with a dim marker rather than
+    // the comment accent — a real "the line moved out from under me" visual state,
+    // never deleted. Anchored/orphaned notes keep the bold accent.
+    let style = if comment.stale {
+        Style::new().fg(theme.dim).bg(theme.bg)
+    } else {
         Style::new()
             .fg(theme.comment)
             .add_modifier(Modifier::BOLD)
-            .bg(theme.bg),
-    ))
+            .bg(theme.bg)
+    };
+    Line::from(Span::styled(shown, style))
 }
 
 /// Sanitize comment text for a single display row: render embedded newlines as

@@ -11,7 +11,7 @@ use ratatui::style::Color;
 use ratatui::widgets::ListState;
 use syntect::parsing::SyntaxReference;
 
-use crate::comments::{self, Comment, Scope, Side, Source};
+use crate::comments::{self, Comment, FileFacts, Scope, Side, Source};
 use crate::config::{Config, Setting};
 use crate::git::{
     Change, CommitFile, CommitInfo, DiffLine, FileDiff, FileEntry, LineKind, RefLabel, Repo,
@@ -262,11 +262,22 @@ pub enum Modal {
     /// The single-line review-comment editor (add or edit). `cursor` is a char
     /// index into `buffer`; `anchor` is captured by value at open; `editing` is
     /// `Some(id)` when editing an existing human comment, `None` for a new one.
+    ///
+    /// `branch`/`scope`/`base` are the **authoring identity captured at open**: a
+    /// watcher `reload()` (which modals gate input but not) plus an external
+    /// checkout can move the current branch/HEAD while the editor is open, so the
+    /// submit persists to the inbox the comment was authored against — never the
+    /// current one (plan §3.5, landed early here to close the cross-branch leak).
+    /// `scope`/`base` scope a *new* comment; an edit reuses `branch` and updates
+    /// text only.
     CommentInput {
         buffer: String,
         cursor: usize,
         anchor: CommentAnchor,
         editing: Option<u64>,
+        branch: String,
+        scope: Scope,
+        base: Option<String>,
     },
 }
 
@@ -400,6 +411,15 @@ pub struct App {
     /// mutation. `None` until first built for the current diff.
     unified_rows: RefCell<Option<Vec<URow>>>,
 
+    /// The status view's worktree-comment inbox (the checked-out branch's
+    /// `Scope::WorkTree` set) and its diff-pane cursor/editor. Status has no
+    /// dedicated state struct, so these live on `App` beside the other status
+    /// fields, mirroring `ReviewState.comments`/`.pane`. `status_branch_key` is the
+    /// inbox key, recomputed on refresh so an external checkout swings the inbox.
+    status_comments: Vec<Comment>,
+    status_branch_key: String,
+    status_pane: DiffPaneState,
+
     /// Persisted so the staging list's scroll offset survives between frames
     /// and can be read for mouse hit-testing. The pane rects are recorded
     /// during rendering for the same reason.
@@ -479,6 +499,11 @@ impl App {
             tracing::warn!("comments gc at startup failed: {err:#}");
         }
         let status = repo.status()?;
+        // The status view's worktree inbox lives under the checked-out branch key,
+        // derived from *this* status snapshot so the inbox key, `head_oid`, and the
+        // file lists are all one consistent read (an external checkout between two
+        // separate git reads could otherwise cross-mutate branches).
+        let status_branch_key = status.branch_key().unwrap_or_default();
         let (theme_name, theme) = Theme::resolve(
             config.theme.as_deref().unwrap_or("tokyo-night"),
             crate::config::config_dir().as_deref(),
@@ -530,6 +555,9 @@ impl App {
             highlight_cache: RefCell::new(HashMap::new()),
             sbs_rows: RefCell::new(None),
             unified_rows: RefCell::new(None),
+            status_comments: Vec::new(),
+            status_branch_key,
+            status_pane: DiffPaneState::default(),
             staging_state: RefCell::new(ListState::default()),
             staging_area: Cell::new(Rect::default()),
             diff_area: Cell::new(Rect::default()),
@@ -562,6 +590,10 @@ impl App {
         // corrupt store is recoverable: it flashes and opens comment-free rather
         // than failing construction.
         app.reanchor_review_comments();
+        // Load the status view's worktree inbox (re-anchor + sweep). A no-op in a
+        // review session; recoverable on a corrupt store, exactly like the review
+        // inbox above.
+        app.sync_status_comments();
         app.sync_active();
         Ok(app)
     }
@@ -619,6 +651,16 @@ impl App {
                 // diff dirty so `sync_diff` recomputes it (but, unlike a file
                 // change, keeps the scroll position).
                 self.diff_dirty = true;
+                // Recompute the inbox key from the *same* status snapshot just read
+                // (never a separate git call, which an external checkout could race)
+                // so an external checkout swings the inbox to the new branch's set;
+                // then re-anchor + sweep it against that snapshot (a HEAD advance
+                // sweeps landed notes; the sweep is write-elided, so it can't loop
+                // the watcher).
+                if let Some(key) = self.status.branch_key() {
+                    self.status_branch_key = key;
+                }
+                self.sync_status_comments();
             }
             Err(err) => tracing::warn!("status refresh failed: {err:#}"),
         }
@@ -750,32 +792,47 @@ impl App {
             // Focusing a hidden panel reveals it first.
             Action::FocusStaging => self.reveal_changes(),
             Action::FocusDiff => self.focus = Focus::Diff,
+            // The diff pane is cursor-driven (like review): j/k move the logical
+            // cursor with act-and-reveal, so `c` always has a target line and the
+            // viewport follows. The staging pane keeps moving the file selection.
             Action::Down => match self.focus {
                 Focus::Staging => self.select_next(),
-                Focus::Diff => self.scroll_diff(true, 1),
+                Focus::Diff => self.review_move_cursor(true, 1),
             },
             Action::Up => match self.focus {
                 Focus::Staging => self.select_prev(),
-                Focus::Diff => self.scroll_diff(false, 1),
+                Focus::Diff => self.review_move_cursor(false, 1),
             },
             Action::Top => match self.focus {
                 Focus::Staging => self.selected = 0,
-                Focus::Diff => self.diff_scroll = 0,
+                Focus::Diff => self.cursor_to_edge(false),
             },
             Action::Bottom => match self.focus {
                 Focus::Staging => self.selected = self.status.total().saturating_sub(1),
-                Focus::Diff => self.diff_scroll = self.diff_max_scroll(),
+                Focus::Diff => self.cursor_to_edge(true),
             },
-            // Ctrl-D/U page the diff pane regardless of which pane is focused.
-            Action::HalfPageDown => self.scroll_diff(true, self.half_page()),
-            Action::HalfPageUp => self.scroll_diff(false, self.half_page()),
+            // Ctrl-D/U move the diff cursor a half page when the diff is focused
+            // (act-and-reveal), else scroll the diff viewport (the file list is
+            // focused — leave the cursor put).
+            Action::HalfPageDown => match self.focus {
+                Focus::Diff => self.review_move_cursor(true, self.half_page() as usize),
+                Focus::Staging => self.scroll_diff(true, self.half_page()),
+            },
+            Action::HalfPageUp => match self.focus {
+                Focus::Diff => self.review_move_cursor(false, self.half_page() as usize),
+                Focus::Staging => self.scroll_diff(false, self.half_page()),
+            },
             Action::ToggleStage => self.toggle_stage(),
             Action::Stage => self.stage_selected(),
             Action::Unstage => self.unstage_selected(),
+            // `x` discards the selected file's changes (worktree-comment deletion
+            // is a separate action, deferred to C5 — it is not `x`).
             Action::Discard => self.request_discard(),
-            // Commenting and comment navigation are review-view features; inert
-            // elsewhere.
-            Action::Comment | Action::NextComment | Action::PrevComment => {}
+            // Worktree comments on the net diff: `c` adds/edits under the cursor,
+            // `]`/`[` cycle notes on the changed files.
+            Action::Comment => self.status_comment_action(),
+            Action::NextComment => self.cycle_comment(true),
+            Action::PrevComment => self.cycle_comment(false),
             // Handled in `dispatch`.
             Action::Quit
             | Action::Help
@@ -868,8 +925,8 @@ impl App {
             // file list focused, scroll the viewport only, leaving the cursor put.
             Action::HalfPageDown => self.review_half_page(true),
             Action::HalfPageUp => self.review_half_page(false),
-            Action::NextComment => self.review_cycle_comment(true),
-            Action::PrevComment => self.review_cycle_comment(false),
+            Action::NextComment => self.cycle_comment(true),
+            Action::PrevComment => self.cycle_comment(false),
             // `c` adds a comment on the code row under the cursor, or edits the
             // human comment under it.
             Action::Comment => self.review_comment_action(),
@@ -947,14 +1004,18 @@ impl App {
                 };
                 self.select_review_file(target);
             }
-            ReviewFocus::Diff => {
-                let count = self.review_row_count();
-                let idx = if bottom { count.saturating_sub(1) } else { 0 };
-                let target = self.review_target_at(idx);
-                self.set_review_cursor(target);
-                self.review_reveal_cursor();
-            }
+            ReviewFocus::Diff => self.cursor_to_edge(bottom),
         }
+    }
+
+    /// Move the diff cursor to the first or last physical row (g/G in the diff
+    /// pane), then reveal it. Shared by the review and status views' diff panes.
+    fn cursor_to_edge(&mut self, bottom: bool) {
+        let count = self.review_row_count();
+        let idx = if bottom { count.saturating_sub(1) } else { 0 };
+        let target = self.review_target_at(idx);
+        self.set_review_cursor(target);
+        self.review_reveal_cursor();
     }
 
     /// Select review file `idx` and reset the diff cursor to its first row. A
@@ -1003,7 +1064,7 @@ impl App {
     /// Scroll the diff viewport so the cursor row is visible: no-op when it
     /// already is, otherwise snap the top edge to bring it just into view.
     fn review_reveal_cursor(&mut self) {
-        if self.review.is_none() {
+        if self.active_pane().is_none() {
             return;
         }
         let cursor = self.review_cursor();
@@ -1029,7 +1090,7 @@ impl App {
     /// tested against the same clamped offset the renderer paints with (so a
     /// wheel scroll that pushed it offscreen reads as not-visible).
     fn review_cursor_visible(&self) -> bool {
-        if self.review.is_none() {
+        if self.active_pane().is_none() {
             return false;
         }
         let cursor = self.review_cursor();
@@ -1058,10 +1119,7 @@ impl App {
     /// unified/side-by-side row list, or (for an empty/binary diff) the orphan
     /// block that renders in its place. The cursor indexes into this list.
     fn review_row_count(&self) -> usize {
-        let Some(review) = self.review.as_ref() else {
-            return 0;
-        };
-        match review.diff.as_ref() {
+        match self.active_diff() {
             Some(FileDiff::Text(lines)) if !lines.is_empty() => match self.diff_mode {
                 DiffMode::Unified => self.unified_rows(lines).len(),
                 DiffMode::SideBySide => self.sbs_rows(lines).len(),
@@ -1077,8 +1135,7 @@ impl App {
     /// it, so a later commit can map one target across several physical rows
     /// (comment boxes) without changing cursor logic.
     fn review_target_at(&self, index: usize) -> Option<RowTarget> {
-        let review = self.review.as_ref()?;
-        match review.diff.as_ref() {
+        match self.active_diff() {
             Some(FileDiff::Text(lines)) if !lines.is_empty() => match self.diff_mode {
                 DiffMode::Unified => self.unified_rows(lines).get(index).map(urow_target),
                 DiffMode::SideBySide => self.sbs_rows(lines).get(index).map(sbs_target),
@@ -1095,8 +1152,7 @@ impl App {
     /// current layout (e.g. its comment was removed). The logical→physical half
     /// of the cursor seam.
     fn review_index_of(&self, target: RowTarget) -> Option<usize> {
-        let review = self.review.as_ref()?;
-        match review.diff.as_ref() {
+        match self.active_diff() {
             Some(FileDiff::Text(lines)) if !lines.is_empty() => match self.diff_mode {
                 DiffMode::Unified => self
                     .unified_rows(lines)
@@ -1117,15 +1173,36 @@ impl App {
     /// The target the cursor rests on: the pinned one, or (when unset after a
     /// reset) the target at the top of the current layout.
     fn review_cursor_target(&self) -> Option<RowTarget> {
-        let pinned = self.review.as_ref()?.pane.cursor;
+        let pinned = self.active_pane()?.cursor;
         pinned.or_else(|| self.review_target_at(0))
     }
 
     /// Pin the diff cursor to `target` (the write-side mirror of the read seam);
-    /// `None` resets it to the top of the layout. A no-op outside a review.
+    /// `None` resets it to the top of the layout. A no-op in a view with no cursor
+    /// (History).
     fn set_review_cursor(&mut self, target: Option<RowTarget>) {
-        if let Some(review) = self.review.as_mut() {
-            review.pane.cursor = target;
+        if let Some(pane) = self.active_pane_mut() {
+            pane.cursor = target;
+        }
+    }
+
+    /// The active view's diff-pane cursor/editor state: the status view's own
+    /// (`status_pane`) or the review session's (`review.pane`). History has no
+    /// cursor, so `None`. This is what lets the cursor seam serve both
+    /// cursor-bearing views from one implementation.
+    fn active_pane(&self) -> Option<&DiffPaneState> {
+        match self.view {
+            ViewMode::Status => Some(&self.status_pane),
+            ViewMode::Review => self.review.as_ref().map(|review| &review.pane),
+            ViewMode::History => None,
+        }
+    }
+
+    fn active_pane_mut(&mut self) -> Option<&mut DiffPaneState> {
+        match self.view {
+            ViewMode::Status => Some(&mut self.status_pane),
+            ViewMode::Review => self.review.as_mut().map(|review| &mut review.pane),
+            ViewMode::History => None,
         }
     }
 
@@ -1133,7 +1210,7 @@ impl App {
     /// list: keep the pinned target when it still resolves, else snap to the last
     /// physical row's target (top when the list is empty).
     fn clamp_review_cursor(&mut self) {
-        let Some(pinned) = self.review.as_ref().and_then(|r| r.pane.cursor) else {
+        let Some(pinned) = self.active_pane().and_then(|pane| pane.cursor) else {
             return; // unset already means "top"; nothing to clamp
         };
         if self.review_index_of(pinned).is_some() {
@@ -1166,19 +1243,16 @@ impl App {
     /// (ties by id) — the cycle order for `]`/`[`. Comments on files no longer in
     /// the range are excluded (they're CLI-territory, plan §3.4).
     fn ordered_comment_ids(&self) -> Vec<u64> {
-        let Some(review) = self.review.as_ref() else {
-            return Vec::new();
-        };
+        let comments = self.active_comments();
         let mut out = Vec::new();
-        for file in &review.files {
+        for path in self.active_file_paths() {
             // Sort by (line, side, id): on a replaced line the pinned SBS layout
             // emits old-side comments before new-side (see
             // `side_by_side_rows_with_comments`), so old must rank before new here
             // to visit them in on-screen order.
-            let mut ids: Vec<(usize, u8, u64)> = review
-                .comments
+            let mut ids: Vec<(usize, u8, u64)> = comments
                 .iter()
-                .filter(|c| c.file == file.path)
+                .filter(|c| c.file == path)
                 .map(|c| (c.line, side_rank(c.side), c.id))
                 .collect();
             ids.sort_unstable();
@@ -1187,11 +1261,35 @@ impl App {
         out
     }
 
+    /// The changed-file paths of the active view, in list order: the review
+    /// session's range files, or the status view's changed files (deduped by path,
+    /// staged rows first — the same path-keyed model the net diff / badge use).
+    fn active_file_paths(&self) -> Vec<String> {
+        match self.view {
+            ViewMode::Review => self
+                .review
+                .as_ref()
+                .map(|review| review.files.iter().map(|f| f.path.clone()).collect())
+                .unwrap_or_default(),
+            ViewMode::Status => {
+                let mut seen = std::collections::HashSet::new();
+                let mut out = Vec::new();
+                for entry in self.status.staged.iter().chain(self.status.unstaged.iter()) {
+                    if seen.insert(entry.path.clone()) {
+                        out.push(entry.path.clone());
+                    }
+                }
+                out
+            }
+            ViewMode::History => Vec::new(),
+        }
+    }
+
     /// Jump to the next / previous review comment on a listed file, wrapping.
     /// Switches the selected file when the target lives elsewhere, focuses the
     /// diff pane, places the cursor on the comment's row, and reveals it. Zero
     /// comments on listed files → an Info flash.
-    fn review_cycle_comment(&mut self, forward: bool) {
+    fn cycle_comment(&mut self, forward: bool) {
         let order = self.ordered_comment_ids();
         if order.is_empty() {
             self.flash = Some(Flash::info("no comments"));
@@ -1215,24 +1313,51 @@ impl App {
             None if forward => order[0],
             None => order[order.len() - 1],
         };
-        // Resolve the target's file and switch selection to it if needed.
-        let idx = self.review.as_ref().and_then(|r| {
-            let file = &r.comments.iter().find(|c| c.id == target)?.file;
-            r.files.iter().position(|f| &f.path == file)
-        });
-        if let (Some(idx), Some(review)) = (idx, self.review.as_mut()) {
-            review.selected = idx;
+        // Switch selection to the target's file if it lives elsewhere, focus the
+        // diff, and recompute that file's diff now so the row lookup + reveal see
+        // it (the trailing `sync_active` would be too late for in-handler placement).
+        if let Some(file) = self.active_comment(target).map(|c| c.file) {
+            self.select_active_file_by_path(&file);
         }
-        self.set_review_focus(ReviewFocus::Diff);
-        // Recompute the (possibly new) file's diff now, so the row lookup and the
-        // reveal both see it (the trailing `sync_active` would otherwise be too
-        // late for this in-handler placement).
-        self.sync_review_diff();
+        self.focus_active_diff();
+        self.sync_active();
         if let Some(row) = self.comment_row_index(target) {
             let cursor = self.review_target_at(row);
             self.set_review_cursor(cursor);
         }
         self.review_reveal_cursor();
+    }
+
+    /// Focus the diff pane in whichever cursor-bearing view is active.
+    fn focus_active_diff(&mut self) {
+        match self.view {
+            ViewMode::Status => self.focus = Focus::Diff,
+            ViewMode::Review => self.set_review_focus(ReviewFocus::Diff),
+            ViewMode::History => {}
+        }
+    }
+
+    /// Select the changed file at `path` in the active view (for comment nav),
+    /// leaving the selection put when the path isn't listed.
+    fn select_active_file_by_path(&mut self, path: &str) {
+        match self.view {
+            ViewMode::Review => {
+                if let Some(review) = self.review.as_mut() {
+                    if let Some(idx) = review.files.iter().position(|f| f.path == path) {
+                        review.selected = idx;
+                    }
+                }
+            }
+            // Prefer the staged row (matches the selection ordering / badge), else
+            // the unstaged one — the path-keyed dedup resolves either to the same
+            // net diff.
+            ViewMode::Status => {
+                if let Some(idx) = self.index_of(Section::Staged, path) {
+                    self.selected = idx;
+                }
+            }
+            ViewMode::History => {}
+        }
     }
 
     /// Delete the comment under the cursor (diff focus only). Transactional per
@@ -1265,9 +1390,7 @@ impl App {
         });
         match result {
             Ok(Some(set)) => {
-                if let Some(review) = self.review.as_mut() {
-                    review.comments = set;
-                }
+                self.apply_active_comments(set);
                 self.invalidate_comment_rows();
                 self.clamp_review_cursor();
                 self.flash = Some(Flash::info("comment deleted"));
@@ -1304,9 +1427,26 @@ impl App {
         if !self.reveal_cursor_before_acting() {
             return;
         }
+        self.open_comment_input_at_cursor();
+    }
+
+    /// Open the comment-input modal for the row under the (already-revealed) diff
+    /// cursor: edit the human note under it, refuse an agent note, or anchor a new
+    /// comment on a code row (a hunk header or unanchorable row flashes). Shared by
+    /// the status and review comment actions once their per-view gates have run;
+    /// `active_comment`/`cursor_code_anchor` resolve against whichever view is
+    /// active, so `submit_comment_input` scopes the note correctly.
+    fn open_comment_input_at_cursor(&mut self) {
+        // Capture the authoring identity *now*, at open: a watcher `reload()` plus
+        // an external checkout can move the current branch/HEAD while the editor is
+        // open, and the submit must land where the note was authored. `None` means
+        // the active view can't author (a non-authoring review / History) — no open.
+        let Some(identity) = self.authoring_identity() else {
+            return;
+        };
         // A comment/orphan row: edit a human note, or refuse an agent note.
         if let Some(id) = self.cursor_comment_id() {
-            match self.review_comment(id) {
+            match self.active_comment(id) {
                 Some(comment) if comment.source == Source::Human => {
                     let cursor = comment.text.chars().count();
                     self.modal = Some(Modal::CommentInput {
@@ -1319,6 +1459,9 @@ impl App {
                             context: comment.context.clone(),
                         },
                         editing: Some(id),
+                        branch: identity.branch,
+                        scope: identity.scope,
+                        base: identity.base,
                     });
                 }
                 Some(_) => self.flash = Some(Flash::info("agent note — read-only")),
@@ -1327,7 +1470,8 @@ impl App {
             }
             return;
         }
-        // A code row: anchor a new comment, unless it's a hunk header.
+        // A code row: anchor a new comment, unless it's a hunk header (or a
+        // binary/submodule file with no text anchor).
         match self.cursor_code_anchor() {
             Some(anchor) => {
                 self.modal = Some(Modal::CommentInput {
@@ -1335,10 +1479,68 @@ impl App {
                     cursor: 0,
                     anchor,
                     editing: None,
+                    branch: identity.branch,
+                    scope: identity.scope,
+                    base: identity.base,
                 });
             }
             None => self.flash = Some(Flash::info("can't comment here")),
         }
+    }
+
+    /// The authoring identity for a *new or edited* comment in the active view,
+    /// captured when the editor opens (plan §3.5): the target inbox key, how a new
+    /// comment is scoped, and its baseline HEAD. `None` when the active view can't
+    /// author — a review whose head isn't checked out (invariant §3.1.1) or
+    /// History. The status view always authors (the checked-out branch is the
+    /// inbox), stamping the worktree baseline.
+    fn authoring_identity(&self) -> Option<SubmitPlan> {
+        match self.view {
+            ViewMode::Status => Some(SubmitPlan {
+                branch: self.status_branch_key.clone(),
+                scope: Scope::WorkTree,
+                base: self.status.head_oid.clone(),
+            }),
+            ViewMode::Review => match self.review.as_ref() {
+                Some(review) if review.authoring => Some(SubmitPlan {
+                    branch: review.branch_key.clone(),
+                    scope: Scope::Range {
+                        range: review.spec.input.clone(),
+                    },
+                    base: None,
+                }),
+                _ => None,
+            },
+            ViewMode::History => None,
+        }
+    }
+
+    /// Handle `c` in the status view (diff focus): open the input modal to add a
+    /// worktree comment on the net-diff code row under the cursor, or to edit the
+    /// human comment under it. Mirrors `review_comment_action`: the file list, an
+    /// offscreen cursor (reveal only), a conflicted/binary file, a hunk row, and an
+    /// agent note each flash instead of opening. A worktree comment stamps its
+    /// scope + baseline HEAD at submit time (`submit_comment_input`).
+    fn status_comment_action(&mut self) {
+        if self.focus != Focus::Diff {
+            self.flash = Some(Flash::info("focus the diff to comment"));
+            return;
+        }
+        // Never act on a row the user can't see: a first `c` on an offscreen
+        // cursor only scrolls it into view (act-and-reveal).
+        if !self.reveal_cursor_before_acting() {
+            return;
+        }
+        // A conflicted file has no clean HEAD-vs-worktree anchor; binary and
+        // submodule files yield no code anchor below (their diff isn't `Text`), so
+        // they fall through to the "can't comment here" flash.
+        if let Some((_, entry)) = self.selected_file() {
+            if entry.change == Change::Conflicted {
+                self.flash = Some(Flash::info("can't comment on a conflicted file"));
+                return;
+            }
+        }
+        self.open_comment_input_at_cursor();
     }
 
     /// The anchor for a new comment on the code row under the cursor, or `None`
@@ -1347,15 +1549,15 @@ impl App {
     /// `context` is the line's text. In side-by-side a replaced-line pair anchors
     /// to its new side when present, else its old side.
     fn cursor_code_anchor(&self) -> Option<CommentAnchor> {
-        // Resolve the cursor's target first (dropping its borrows) before
-        // borrowing the file path / diff lines, so the nested cache reads inside
-        // `review_cursor_target` don't overlap the borrows below.
+        // Resolve the cursor's target and the file path first (owned values), so
+        // the nested cache reads don't overlap the diff-line borrow below. The
+        // file-path source is per-view: review's selected range file, or the
+        // status view's selected changed file (`active_diff_path`).
         let RowTarget::Code(li) = self.review_cursor_target()? else {
             return None;
         };
-        let review = self.review.as_ref()?;
-        let file = review.files.get(review.selected)?.path.clone();
-        let FileDiff::Text(lines) = review.diff.as_ref()? else {
+        let file = self.active_diff_path()?;
+        let FileDiff::Text(lines) = self.active_diff()? else {
             return None;
         };
         // A hunk row maps to `Code(index)` too; `anchor_for_line` returns `None`
@@ -1433,6 +1635,9 @@ impl App {
             buffer,
             anchor,
             editing,
+            branch,
+            scope,
+            base,
             ..
         }) = self.modal.as_ref()
         else {
@@ -1446,15 +1651,15 @@ impl App {
         let text = buffer.clone();
         let anchor = anchor.clone();
         let editing = *editing;
-        let (branch, range_input) = match self.review.as_ref() {
-            Some(review) if review.authoring => {
-                (review.branch_key.clone(), review.spec.input.clone())
-            }
-            // Authoring turned off since the modal opened: drop the submit.
-            _ => {
-                self.modal = None;
-                return;
-            }
+        // Persist to the identity captured when the editor opened, *not* the current
+        // branch/HEAD: a checkout + watcher reload mid-typing must land the note in
+        // the inbox it was authored against (plan §3.5). The status view records a
+        // `WorkTree` comment stamped with the baseline HEAD; a review records a
+        // `Range` comment under its exact range.
+        let plan = SubmitPlan {
+            branch: branch.clone(),
+            scope: scope.clone(),
+            base: base.clone(),
         };
         let dir = self.repo.strix_dir();
 
@@ -1465,16 +1670,14 @@ impl App {
                     // entry (which would conflict with the scan's shared borrow).
                     let id = store.take_id();
                     let created_at = comments::now_secs();
-                    let entry = store.branches.entry(branch.clone()).or_default();
-                    // The session-open pass records the range; do it defensively
-                    // here too in case a comment is authored before that ran.
-                    record_range(entry, &range_input);
+                    let entry = store.branches.entry(plan.branch.clone()).or_default();
+                    // The session-open pass records a review range; do it
+                    // defensively here too (a worktree plan carries no range).
+                    if let Scope::Range { range } = &plan.scope {
+                        record_range(entry, range);
+                    }
                     entry.comments.push(Comment {
-                        // Comments authored in a `strix diff` session are
-                        // range-scoped; the review's range is the scope source.
-                        scope: Scope::Range {
-                            range: range_input.clone(),
-                        },
+                        scope: plan.scope.clone(),
                         id,
                         source: Source::Human,
                         file: anchor.file.clone(),
@@ -1484,14 +1687,16 @@ impl App {
                         context: anchor.context.clone(),
                         orphaned: false,
                         created_at,
-                        base: None,
+                        base: plan.base.clone(),
                         stale: false,
                     });
                     SubmitOutcome::Added(entry.comments.clone())
                 }
                 Some(id) => {
-                    let entry = store.branches.entry(branch.clone()).or_default();
-                    record_range(entry, &range_input);
+                    let entry = store.branches.entry(plan.branch.clone()).or_default();
+                    if let Scope::Range { range } = &plan.scope {
+                        record_range(entry, range);
+                    }
                     match entry.comments.iter_mut().find(|c| c.id == id) {
                         Some(comment) => {
                             comment.text = text.clone();
@@ -1509,9 +1714,7 @@ impl App {
                     SubmitOutcome::Updated(set) => (set, Flash::info("comment updated")),
                     SubmitOutcome::Vanished(set) => (set, Flash::info("comment was removed")),
                 };
-                if let Some(review) = self.review.as_mut() {
-                    review.comments = set;
-                }
+                self.apply_active_comments(set);
                 self.invalidate_comment_rows();
                 // A `Vanished` submit (the edited comment was removed underneath)
                 // shrinks the row list; re-pin the cursor so it can't linger on
@@ -1544,8 +1747,10 @@ impl App {
     /// the highlight never shows while the file list is focused. In C1 a target
     /// spans one physical row, so a single index suffices.
     pub fn review_cursor_highlight(&self) -> Option<usize> {
-        if self.view == ViewMode::Review && self.diff_focused() {
-            self.review.is_some().then(|| self.review_cursor())
+        // Any cursor-bearing view (status or review) highlights its cursor row
+        // while its diff pane is focused; History has no cursor.
+        if self.diff_focused() && self.active_pane().is_some() {
+            Some(self.review_cursor())
         } else {
             None
         }
@@ -2201,12 +2406,21 @@ impl App {
             // Only a different file starts at the top; refreshing the open file
             // in place must not yank the view back up while the user scrolls.
             self.diff_scroll = 0;
+            // The new file's layout doesn't exist yet; reset the diff cursor to its
+            // top (`None`), resolved to row 0 by the next render.
+            self.status_pane.cursor = None;
         }
         // The cached highlights / row layouts describe the previous diff; drop
         // them so the new one is recomputed lazily on next render.
         self.highlight_cache.borrow_mut().clear();
         *self.sbs_rows.borrow_mut() = None;
         *self.unified_rows.borrow_mut() = None;
+        // An in-place refresh may have shrunk the row list under a pinned cursor
+        // (e.g. an edit removed lines); clamp it to the new layout. A fresh file
+        // already reset the cursor above, so clamp only the same-file case.
+        if !file_changed {
+            self.clamp_review_cursor();
+        }
     }
 
     /// Keep whichever view is active in sync after an input event.
@@ -2383,9 +2597,7 @@ impl App {
                     .get(&branch)
                     .map(|b| b.comments.clone())
                     .unwrap_or_default();
-                if let Some(review) = self.review.as_mut() {
-                    review.comments = set;
-                }
+                self.apply_review_comments(set);
                 self.invalidate_comment_rows();
                 self.clear_comment_error();
             }
@@ -2413,9 +2625,7 @@ impl App {
         };
         match record_range_and_reanchor(&self.repo, &dir, &branch, &spec, &files) {
             Ok(set) => {
-                if let Some(review) = self.review.as_mut() {
-                    review.comments = set;
-                }
+                self.apply_review_comments(set);
                 self.invalidate_comment_rows();
                 self.clear_comment_error();
             }
@@ -2424,6 +2634,90 @@ impl App {
                 self.flash_comment_error(err);
             }
         }
+    }
+
+    /// Replace the active view's in-memory comment set from a branch entry's full
+    /// set, keeping only the comments of the active view's scope (so a worktree
+    /// comment never leaks into a review render, nor vice versa).
+    fn apply_active_comments(&mut self, full: Vec<Comment>) {
+        match self.view {
+            ViewMode::Status => {
+                self.status_comments = full.into_iter().filter(is_worktree_scope).collect();
+            }
+            ViewMode::Review => self.apply_review_comments(full),
+            ViewMode::History => {}
+        }
+    }
+
+    /// Replace `review.comments` from a branch entry's full set, keeping only the
+    /// comments scoped to *this* review's exact range (codex-#5): a worktree
+    /// comment, or a range comment from a different range, is filtered out.
+    fn apply_review_comments(&mut self, full: Vec<Comment>) {
+        if let Some(review) = self.review.as_mut() {
+            let input = review.spec.input.clone();
+            review.comments = full
+                .into_iter()
+                .filter(|c| is_review_scope(c, &input))
+                .collect();
+        }
+    }
+
+    /// Re-anchor the worktree inbox and apply the §3.2 lifecycle (sweep landed
+    /// notes, flag drifted ones `stale`) for the checked-out branch, replacing the
+    /// in-memory `status_comments` with the surviving worktree-scoped set. A no-op
+    /// in a review session (the worktree surface belongs to the status view).
+    ///
+    /// The whole pass runs through [`comments::mutate_if_changed`], so a settled
+    /// inbox writes nothing — which is what keeps a re-anchor from waking the
+    /// store-dir watcher into a reload → re-anchor loop. A corrupt/unsupported
+    /// store flashes once and leaves the prior set, exactly like the review inbox.
+    fn sync_status_comments(&mut self) {
+        // Worktree comments live only in a status session; a review session's inbox
+        // is range-scoped and driven by the review lifecycle.
+        if self.review.is_some() {
+            return;
+        }
+        let dir = self.repo.strix_dir();
+        let branch = self.status_branch_key.clone();
+        let current_head = self.status.head_oid.clone();
+        let repo = &self.repo;
+        let status = &self.status;
+        let result = comments::mutate_if_changed(&dir, |store| {
+            let entry = store.branches.entry(branch.clone()).or_default();
+            let changed =
+                comments::sweep_worktree(&mut entry.comments, current_head.as_deref(), |comment| {
+                    worktree_facts(repo, status, comment)
+                });
+            let set: Vec<Comment> = entry
+                .comments
+                .iter()
+                .filter(|c| is_worktree_scope(c))
+                .cloned()
+                .collect();
+            (set, changed)
+        });
+        match result {
+            Ok(set) => {
+                self.status_comments = set;
+                self.invalidate_comment_rows();
+                self.clear_comment_error();
+            }
+            Err(err) => {
+                tracing::warn!("loading worktree comments failed: {err:#}");
+                self.flash_comment_error(err);
+            }
+        }
+    }
+
+    /// How many worktree comments (anchored, stale, or orphaned) the status inbox
+    /// holds for `file`. Drives the Changes list's `● n` badge; the count is
+    /// path-keyed (a file listed in both the staged and unstaged sections is one
+    /// target), matching the net-diff model.
+    pub fn status_comment_count(&self, file: &str) -> usize {
+        self.status_comments
+            .iter()
+            .filter(|c| c.file == file)
+            .count()
     }
 
     /// Whether the footer currently shows an error flash whose text starts with
@@ -2606,16 +2900,42 @@ impl App {
     /// below it, both ordered by id. Empty outside a review session (comments are
     /// a Review-only feature in v1), so status/history rows are unchanged.
     fn active_placements(&self, lines: &[DiffLine]) -> (Vec<u64>, BTreeMap<usize, Vec<u64>>) {
-        let Some(review) = self.review.as_ref() else {
-            return (Vec::new(), BTreeMap::new());
+        let empty = || (Vec::new(), BTreeMap::new());
+        let path = match self.selected_comment_file() {
+            Some(path) => path,
+            None => return empty(),
         };
-        if self.view != ViewMode::Review {
-            return (Vec::new(), BTreeMap::new());
+        comment_placements(lines, self.active_comments(), &path)
+    }
+
+    /// The comment set the active view renders and navigates: the status view's
+    /// worktree inbox or the review session's range inbox. Both are already
+    /// scope-filtered when populated, so a comment of the wrong scope never leaks
+    /// into the other view. Empty in History.
+    fn active_comments(&self) -> &[Comment] {
+        match self.view {
+            ViewMode::Status => &self.status_comments,
+            ViewMode::Review => self
+                .review
+                .as_ref()
+                .map(|review| review.comments.as_slice())
+                .unwrap_or(&[]),
+            ViewMode::History => &[],
         }
-        let Some(path) = review.files.get(review.selected).map(|f| f.path.as_str()) else {
-            return (Vec::new(), BTreeMap::new());
-        };
-        comment_placements(lines, &review.comments, path)
+    }
+
+    /// The path of the file whose comments the diff pane is showing — the same file
+    /// `active_diff_path` backs, except History carries no comments (→ `None`).
+    fn selected_comment_file(&self) -> Option<String> {
+        match self.view {
+            ViewMode::History => None,
+            _ => self.active_diff_path(),
+        }
+    }
+
+    /// The comment with `id` in the active view's inbox, for rendering a row.
+    pub fn active_comment(&self, id: u64) -> Option<Comment> {
+        self.active_comments().iter().find(|c| c.id == id).cloned()
     }
 
     /// The comment with `id` in the active review inbox, for rendering a row.
@@ -2658,17 +2978,11 @@ impl App {
     /// appear, so the block must render regardless of diff kind (finding 2).
     /// Always empty outside an active review session in the Review view.
     pub fn selected_file_orphans(&self) -> Vec<u64> {
-        let Some(review) = self.review.as_ref() else {
+        let Some(path) = self.selected_comment_file() else {
             return Vec::new();
         };
-        if self.view != ViewMode::Review {
-            return Vec::new();
-        }
-        let Some(path) = review.files.get(review.selected).map(|f| f.path.as_str()) else {
-            return Vec::new();
-        };
-        let mut ids: Vec<u64> = review
-            .comments
+        let mut ids: Vec<u64> = self
+            .active_comments()
             .iter()
             .filter(|c| c.orphaned && c.file == path)
             .map(|c| c.id)
@@ -2997,13 +3311,160 @@ fn record_range_and_reanchor(
         let entry = store.branches.entry(branch.to_string()).or_default();
         let range_changed = entry.active_range.as_deref() != Some(spec.input.as_str());
         entry.active_range = Some(spec.input.clone());
-        // The diff for a file is computed at most once, and only for files that
-        // carry a comment (the engine caches per file).
-        let moved = comments::reanchor(&mut entry.comments, files, |file| {
-            repo.range_file_diff(spec, file)
-        });
+        // Re-anchor only *this* range's comments (codex-#5): a worktree comment, or
+        // a comment from a different range that happens to share the branch entry,
+        // is never re-anchored against this range's diff. The diff for a file is
+        // computed at most once, and only for files that carry a comment.
+        let moved = comments::reanchor_scoped(
+            &mut entry.comments,
+            |c| is_review_scope(c, &spec.input),
+            files,
+            |file| repo.range_file_diff(spec, file),
+        );
         (entry.comments.clone(), range_changed || moved)
     })
+}
+
+/// Whether `comment` belongs to the review surface for `range_input`: a
+/// range-scoped comment whose recorded range matches. An empty recorded range —
+/// a CLI note authored before any review, or a legacy placeholder — matches any
+/// active range (it is unscoped). A worktree comment, or a range comment from a
+/// *different* range, never matches, so it is neither shown nor re-anchored in
+/// this session (codex-#5).
+fn is_review_scope(comment: &Comment, range_input: &str) -> bool {
+    matches!(&comment.scope, Scope::Range { range } if range.is_empty() || range == range_input)
+}
+
+/// Whether `comment` belongs to the status view's worktree surface. The
+/// worktree-scoped counterpart to [`is_review_scope`], used to keep range
+/// comments out of the status inbox.
+fn is_worktree_scope(comment: &Comment) -> bool {
+    matches!(comment.scope, Scope::WorkTree)
+}
+
+/// The inbox + scope decisions [`App::submit_comment_input`] captures once per
+/// submit: which branch entry to write, how a *new* comment is scoped, and its
+/// baseline HEAD (worktree only). A `Scope::Range` plan also records its range on
+/// the branch entry — derived from `scope`, so it isn't stored twice.
+struct SubmitPlan {
+    branch: String,
+    scope: Scope,
+    base: Option<String>,
+}
+
+/// Build the [`FileFacts`] the worktree sweep needs for one comment, from the
+/// current repo + status (plan §3.2 / C2c). Resolves the comment's file to a
+/// current [`FileEntry`] (following a rename by `orig_path`), computes its net
+/// HEAD→worktree diff, and the baseline-blob `resolved_in_head` signal.
+///
+/// Resolution order — [`FileFacts::Gone`] (which sweeps *unconditionally*) is
+/// returned **only** for an unambiguous worktree-local deletion, never for a
+/// file that merely left the status list:
+/// 1. listed in status under its path → `Present` (a `Change::Deleted` entry
+///    yields the deletions-only net diff and keeps the note until the deletion is
+///    committed — pending deletion is not a sweep signal);
+/// 2. a staged rename whose source is the comment's file → `Present` with
+///    `renamed_to`;
+/// 3. not listed but the path entry still exists → `Present` with an empty net
+///    diff (a clean file: a commit sweeps via `resolved_in_head && orphaned`, a
+///    revert under an unchanged HEAD only marks it stale);
+/// 4. not listed and the path entry is truly absent:
+///    - HEAD unchanged (`base == head_oid`) → [`FileFacts::Gone`] (a plain
+///      worktree-local delete → sweep, per the §3.2 matrix);
+///    - HEAD moved → `Present` with an empty net diff, so the sweep gate decides:
+///      a committed rename-away (`context ∉ HEAD:file` → `resolved_in_head =
+///      false`) stays **stale/retained** — never a blind sweep — while a committed
+///      Old-side deletion (`context ∈ base ∧ ∉ HEAD`) + orphaned sweeps.
+fn worktree_facts(repo: &Repo, status: &Status, comment: &Comment) -> FileFacts {
+    let all = || status.staged.iter().chain(status.unstaged.iter());
+    // Direct hit: the file is a listed change under its current path.
+    if let Some(entry) = all().find(|e| e.path == comment.file) {
+        return FileFacts::Present {
+            diff: repo.file_diff_head_vs_worktree(entry),
+            renamed_to: None,
+            resolved_in_head: resolved_in_head(repo, comment, &entry.path),
+        };
+    }
+    // Renamed away in the worktree (a staged rename whose source is the file).
+    if let Some(entry) = all().find(|e| e.orig_path.as_deref() == Some(comment.file.as_str())) {
+        return FileFacts::Present {
+            diff: repo.file_diff_head_vs_worktree(entry),
+            renamed_to: Some(entry.path.clone()),
+            resolved_in_head: resolved_in_head(repo, comment, &entry.path),
+        };
+    }
+    // Not a listed change, but the path entry still exists (a clean file): the
+    // empty net diff + `resolved_in_head` drive the sweep/stale decision.
+    if path_entry_exists(repo.workdir(), &comment.file) {
+        return present_clean(repo, comment);
+    }
+    // Path entry truly absent. Only an unambiguous worktree-local deletion (HEAD
+    // unchanged) sweeps; if HEAD moved, the file may have been renamed-and-committed
+    // away with no `orig_path` surviving in status — defer to the sweep gate rather
+    // than lose the note.
+    if comment.base.as_deref() == status.head_oid.as_deref() {
+        FileFacts::Gone
+    } else {
+        present_clean(repo, comment)
+    }
+}
+
+/// `FileFacts::Present` for a file with no listed change (clean, or absent after a
+/// HEAD move): a synthesized entry whose net diff is empty, plus the baseline-blob
+/// `resolved_in_head` signal that lets the sweep gate distinguish a landed change
+/// from a rename/drift.
+fn present_clean(repo: &Repo, comment: &Comment) -> FileFacts {
+    let entry = FileEntry {
+        path: comment.file.clone(),
+        orig_path: None,
+        change: Change::Modified,
+    };
+    FileFacts::Present {
+        diff: repo.file_diff_head_vs_worktree(&entry),
+        renamed_to: None,
+        resolved_in_head: resolved_in_head(repo, comment, &comment.file),
+    }
+}
+
+/// Whether a path *entry* exists under `workdir` — using `symlink_metadata` so a
+/// broken symlink (the link entry is present) counts as existing, and only a true
+/// `NotFound` counts as absent. A transient stat error (permissions, races) is
+/// treated as present, so it can never trigger a false worktree-deletion sweep.
+fn path_entry_exists(workdir: &Path, path: &str) -> bool {
+    match std::fs::symlink_metadata(workdir.join(path)) {
+        Ok(_) => true,
+        Err(err) => err.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+/// Whether the comment's anchored change has landed in HEAD, computed against the
+/// baseline blob so a context anchor is never mistaken for a committed add/delete
+/// (plan §3.2). For an added line (New side, text `T`): `T ∉ base:file ∧ T ∈
+/// HEAD:file`; for a removed line (Old side): `T ∈ base:file ∧ T ∉ HEAD:file`.
+/// Necessarily `false` while HEAD hasn't moved past `base` (same blob both sides),
+/// or when `context`/`base` is unavailable. This is a whole-file membership test —
+/// necessary but not sufficient; the engine also requires the comment to be
+/// orphaned-after-reanchor before sweeping.
+fn resolved_in_head(repo: &Repo, comment: &Comment, head_path: &str) -> bool {
+    let (Some(base), Some(context)) = (comment.base.as_deref(), comment.context.as_deref()) else {
+        return false;
+    };
+    let base_blob = repo.object_bytes(&format!("{base}:{}", comment.file));
+    let head_blob = repo.object_bytes(&format!("HEAD:{head_path}"));
+    let in_base = blob_contains_line(&base_blob, context);
+    let in_head = blob_contains_line(&head_blob, context);
+    match comment.side {
+        Side::New => !in_base && in_head,
+        Side::Old => in_base && !in_head,
+    }
+}
+
+/// Whether `bytes` (a blob) contains a line whose text equals `text`. Compared
+/// against `str::lines()`, matching how [`DiffLine::text`] is trim-end'd.
+fn blob_contains_line(bytes: &[u8], text: &str) -> bool {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .any(|line| line == text)
 }
 
 /// One editing operation on the comment-input buffer, so a single method covers

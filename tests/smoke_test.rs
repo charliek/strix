@@ -30,7 +30,9 @@ fn app_with_changes() -> (tempfile::TempDir, App) {
 #[test]
 fn renders_status_against_repo() {
     let (_repo, app) = app_with_changes();
-    let out = dump_frame(&app, 100, 30).expect("dump_frame");
+    // Wide enough for the full status footer (the comment-nav hints grew it past
+    // 100 cols, like the review footer); a narrower terminal truncates the tail.
+    let out = dump_frame(&app, 120, 30).expect("dump_frame");
     assert!(out.contains("strix"), "header shows the app name");
     assert!(out.contains("main"), "header shows the branch");
     assert!(out.contains("Staged"), "staged section header");
