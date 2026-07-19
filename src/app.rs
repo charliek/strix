@@ -825,14 +825,24 @@ impl App {
             Action::ToggleStage => self.toggle_stage(),
             Action::Stage => self.stage_selected(),
             Action::Unstage => self.unstage_selected(),
-            // `x` discards the selected file's changes (worktree-comment deletion
-            // is a separate action, deferred to C5 — it is not `x`).
-            Action::Discard => self.request_discard(),
+            // `x` discards the selected file's changes — but stays inert (neither
+            // discarding nor deleting) when the *diff pane is focused* and its
+            // cursor rests on a comment/orphan row, so it can never be mistaken for
+            // the deletion key (`X`/`Action::DeleteComment`, below). With the file
+            // list focused, `x` discards the list-selected file regardless of where
+            // the hidden diff cursor sits.
+            Action::Discard => {
+                if !self.diff_focused() || self.cursor_comment_id().is_none() {
+                    self.request_discard();
+                }
+            }
             // Worktree comments on the net diff: `c` adds/edits under the cursor,
-            // `]`/`[` cycle notes on the changed files.
+            // `]`/`[` cycle notes on the changed files, `X` deletes the one under
+            // the cursor.
             Action::Comment => self.status_comment_action(),
             Action::NextComment => self.cycle_comment(true),
             Action::PrevComment => self.cycle_comment(false),
+            Action::DeleteComment => self.delete_cursor_comment(),
             // Handled in `dispatch`.
             Action::Quit
             | Action::Help
@@ -881,7 +891,8 @@ impl App {
             | Action::Discard
             | Action::Comment
             | Action::NextComment
-            | Action::PrevComment => {}
+            | Action::PrevComment
+            | Action::DeleteComment => {}
             // Handled in `dispatch`.
             Action::Quit
             | Action::Help
@@ -928,12 +939,14 @@ impl App {
             Action::NextComment => self.cycle_comment(true),
             Action::PrevComment => self.cycle_comment(false),
             // `c` adds a comment on the code row under the cursor, or edits the
-            // human comment under it.
+            // human comment under it. `X` deletes the one under the cursor (diff
+            // focus only); on a code row it's a silent no-op.
             Action::Comment => self.review_comment_action(),
-            // `x` deletes the comment under the cursor (diff focus only); on a code
-            // row it's a silent no-op. Other staging ops stay inert.
-            Action::Discard => self.review_delete_comment(),
-            Action::ToggleStage | Action::Stage | Action::Unstage => {}
+            Action::DeleteComment => self.delete_cursor_comment(),
+            // Staging ops, including `x`/Discard, stay inert in a read-only review
+            // (milestone 6 had `x` double as comment-delete here; that overload is
+            // gone — deletion is `X` only, so `x` on a comment row is inert too).
+            Action::ToggleStage | Action::Stage | Action::Unstage | Action::Discard => {}
             // Handled in `dispatch`.
             Action::Quit
             | Action::Help
@@ -1360,28 +1373,34 @@ impl App {
         }
     }
 
-    /// Delete the comment under the cursor (diff focus only). Transactional per
-    /// plan §3.1.5: mutate a fresh store read, persist, and only on success
-    /// replace the in-memory set + invalidate the row caches; a failure leaves
-    /// everything unchanged and flashes. A code-row cursor is a silent no-op.
-    fn review_delete_comment(&mut self) {
-        if self.review_focus() != ReviewFocus::Diff {
+    /// Delete the comment under the diff-pane cursor (`Action::DeleteComment`,
+    /// `X`) — Status (worktree) and Review (range) alike, via the shared
+    /// cursor/comment-set seam (diff focus only). Transactional per plan §3.1.5:
+    /// mutate a fresh store read, persist, and only on success replace the
+    /// in-memory set + invalidate the row caches; a failure leaves everything
+    /// unchanged and flashes. A code/hunk-row cursor is a silent no-op, matching
+    /// how milestone 6 treated `x` on a non-comment row. Deletion needs no
+    /// authoring gate of its own: `authoring_identity` already yields `None` for
+    /// a non-authoring review, where no comments are ever loaded to land the
+    /// cursor on in the first place.
+    fn delete_cursor_comment(&mut self) {
+        if !self.diff_focused() {
             return;
         }
-        // Act-and-reveal: never delete a row the user can't see. A first `x` on an
+        // Act-and-reveal: never delete a row the user can't see. A first `X` on an
         // offscreen cursor (after a wheel scroll) only scrolls it into view; a
-        // second `x`, now that it's visible, deletes (finding 1, plan §3.4).
+        // second `X`, now that it's visible, deletes (finding 1, plan §3.4).
         if !self.reveal_cursor_before_acting() {
             return;
         }
         let Some(id) = self.cursor_comment_id() else {
             return; // code / hunk row: no-op
         };
-        let dir = self.repo.strix_dir();
-        let branch = match self.review.as_ref() {
-            Some(review) if review.authoring => review.branch_key.clone(),
-            _ => return,
+        let Some(identity) = self.authoring_identity() else {
+            return;
         };
+        let dir = self.repo.strix_dir();
+        let branch = identity.branch;
         let result = comments::mutate(&dir, |store| {
             let entry = store.branches.get_mut(&branch)?;
             let pos = entry.comments.iter().position(|c| c.id == id)?;

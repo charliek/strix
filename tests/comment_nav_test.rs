@@ -179,7 +179,7 @@ fn cursor_reaches_an_injected_comment_row_in_both_modes() {
         }
         app.on_key(key('l')); // focus diff
         app.on_key(key('G')); // cursor to the last (comment) row
-        app.on_key(key('x')); // delete it
+        app.on_key(key('X')); // delete it
         assert!(
             app.review_comment(1).is_none(),
             "the cursor sat on the comment row (sbs={sbs})"
@@ -347,10 +347,14 @@ fn comment_nav_with_no_comments_flashes() {
     assert_eq!(flash.text, "no comments");
 }
 
-// --- Delete (x) ---
+// --- Delete (X) ---
+//
+// C5 replaces the milestone-6 overload: `x`/`Action::Discard` no longer
+// deletes a comment in Review (it's a no-op there regardless of row);
+// deletion is `X`/`Action::DeleteComment` only.
 
 #[test]
-fn x_deletes_exactly_the_cursor_comment() {
+fn capital_x_deletes_exactly_the_cursor_comment() {
     let repo = init_repo_with_diverged_branches();
     seed_store(
         repo.path(),
@@ -364,7 +368,7 @@ fn x_deletes_exactly_the_cursor_comment() {
     let mut app = review(repo.path(), "main");
     let _ = dump(&app);
     app.on_key(key(']')); // cursor onto the first comment (lowest id)
-    app.on_key(key('x'));
+    app.on_key(key('X'));
 
     assert!(
         app.review_comment(1).is_none(),
@@ -389,6 +393,38 @@ fn x_deletes_exactly_the_cursor_comment() {
     let frame = dump(&app);
     assert!(!frame.contains("firstnote"), "the row is gone:\n{frame}");
     assert!(frame.contains("secondnote"));
+}
+
+#[test]
+fn lowercase_x_on_a_comment_row_is_inert_in_review() {
+    // The milestone-6 overload is gone: `x` never deletes a comment in Review,
+    // even with the cursor parked directly on the comment row.
+    let repo = init_repo_with_diverged_branches();
+    seed_store(
+        repo.path(),
+        "feature",
+        Some("main"),
+        vec![comment(
+            1,
+            "feature.txt",
+            Side::New,
+            1,
+            "keep me",
+            "feature",
+        )],
+    );
+    let mut app = review(repo.path(), "main");
+    let _ = dump(&app);
+    app.on_key(key(']')); // cursor onto the comment row
+    let before = store_text(repo.path());
+
+    app.on_key(key('x'));
+    assert!(
+        app.review_comment(1).is_some(),
+        "x never deletes a comment in review"
+    );
+    assert_eq!(store_text(repo.path()), before, "the store is byte-stable");
+    assert!(app.flash.is_none(), "no flash on a comment-row x");
 }
 
 #[test]
@@ -420,6 +456,37 @@ fn x_on_a_code_row_is_a_silent_no_op() {
 }
 
 #[test]
+fn capital_x_on_a_code_row_is_inert() {
+    let repo = init_repo_with_diverged_branches();
+    seed_store(
+        repo.path(),
+        "feature",
+        Some("main"),
+        vec![comment(
+            1,
+            "feature.txt",
+            Side::New,
+            1,
+            "keep me",
+            "feature",
+        )],
+    );
+    let mut app = review(repo.path(), "main");
+    select_file(&mut app, "feature.txt");
+    app.on_key(key('l')); // focus diff, cursor on a code (hunk) row
+    app.on_key(key('j')); // still a code row (the `+ feature` line)
+    let before = store_text(repo.path());
+
+    app.on_key(key('X'));
+    assert!(
+        app.review_comment(1).is_some(),
+        "X on a code row deletes nothing"
+    );
+    assert_eq!(store_text(repo.path()), before, "the store is byte-stable");
+    assert!(app.flash.is_none(), "no flash on a code-row X");
+}
+
+#[test]
 fn a_failed_delete_keeps_the_comment_and_flashes() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -442,7 +509,7 @@ fn a_failed_delete_keeps_the_comment_and_flashes() {
     perms.set_mode(0o555);
     std::fs::set_permissions(&dir, perms).unwrap();
 
-    app.on_key(key('x'));
+    app.on_key(key('X'));
 
     // Restore perms first so the assertions (and TempDir cleanup) can proceed.
     let mut restore = std::fs::metadata(&dir).unwrap().permissions();
@@ -541,7 +608,7 @@ fn a_click_after_content_shrinks_hits_the_visually_clicked_row() {
     app.on_key(key('G')); // cursor onto the trailing comment row; diff_scroll == max
     assert!(app.diff_scroll > 0);
 
-    app.on_key(key('x')); // delete it: the row list shrinks by one
+    app.on_key(key('X')); // delete it: the row list shrinks by one
     let frame = dump(&app);
     assert!(
         app.diff_scroll > app.diff_max_scroll(),
@@ -566,9 +633,9 @@ fn a_click_after_content_shrinks_hits_the_visually_clicked_row() {
 // --- Act-and-reveal gate (findings 1-3) ---
 
 #[test]
-fn x_reveals_an_offscreen_cursor_before_deleting() {
-    // A wheel scroll can push the cursor row offscreen. The first `x` must only
-    // reveal it (no delete); a second `x`, now that it's visible, deletes.
+fn capital_x_reveals_an_offscreen_cursor_before_deleting() {
+    // A wheel scroll can push the cursor row offscreen. The first `X` must only
+    // reveal it (no delete); a second `X`, now that it's visible, deletes.
     let repo = tall_repo();
     seed_store(
         repo.path(),
@@ -592,10 +659,10 @@ fn x_reveals_an_offscreen_cursor_before_deleting() {
     );
     let before = store_text(repo.path());
 
-    app.on_key(key('x'));
+    app.on_key(key('X'));
     assert!(
         app.review_comment(1).is_some(),
-        "the first x reveals but must not delete an invisible row"
+        "the first X reveals but must not delete an invisible row"
     );
     assert_eq!(
         store_text(repo.path()),
@@ -607,10 +674,10 @@ fn x_reveals_an_offscreen_cursor_before_deleting() {
         "the cursor's row was scrolled into view"
     );
 
-    app.on_key(key('x'));
+    app.on_key(key('X'));
     assert!(
         app.review_comment(1).is_none(),
-        "the second x, on the now-visible row, deletes"
+        "the second X, on the now-visible row, deletes"
     );
 }
 

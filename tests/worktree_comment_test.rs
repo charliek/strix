@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use common::{git, init_empty_repo, init_repo, init_repo_with_diverged_branches, write};
-use strix::app::App;
+use strix::app::{App, FlashKind};
 use strix::comments::{self, Branch, Comment, Scope, Side, Source, Store};
 use strix::config::Config;
 use strix::crossterm::event::{KeyCode, KeyEvent};
@@ -654,4 +654,172 @@ fn modal_submit_persists_to_the_branch_it_opened_on() {
             .is_none_or(|b| b.comments.is_empty()),
         "nothing leaked into the branch checked out mid-edit"
     );
+}
+
+// --- Delete (X), C5 ---
+//
+// `Action::DeleteComment` (`X`) deletes a worktree comment in Status via the
+// same shared cursor/comment-set seam Review uses; `x`/`Action::Discard` is
+// pinned inert on a comment/orphan row here too — it must neither delete the
+// comment nor discard the file (that's a separate, destructive op).
+
+#[test]
+fn capital_x_deletes_the_cursor_worktree_comment() {
+    let repo = init_repo();
+    write(repo.path(), "new.txt", "target\n");
+    let base = head_oid(repo.path());
+    seed(
+        repo.path(),
+        "main",
+        None,
+        vec![wt(1, "new.txt", 1, "please fix", "target", &base)],
+    );
+    let mut app = App::new(repo.path().to_path_buf()).unwrap();
+    select_status_file(&mut app, "new.txt");
+    app.on_key(key(']')); // cursor onto the comment row, diff focused
+
+    app.on_key(key('X'));
+
+    assert_eq!(
+        app.status_comment_count("new.txt"),
+        0,
+        "the comment is gone"
+    );
+    assert!(
+        worktree_comments(repo.path(), "main").is_empty(),
+        "removed from the store"
+    );
+    let frame = dump(&app);
+    assert!(!frame.contains("please fix"), "the row is gone:\n{frame}");
+}
+
+#[test]
+fn lowercase_x_on_a_comment_row_is_inert_in_status() {
+    let repo = init_repo();
+    write(repo.path(), "new.txt", "target\n");
+    let base = head_oid(repo.path());
+    seed(
+        repo.path(),
+        "main",
+        None,
+        vec![wt(1, "new.txt", 1, "please fix", "target", &base)],
+    );
+    let mut app = App::new(repo.path().to_path_buf()).unwrap();
+    select_status_file(&mut app, "new.txt");
+    app.on_key(key(']')); // cursor onto the comment row
+    let before = std::fs::read(strix_dir(repo.path()).join("comments.json")).unwrap();
+
+    app.on_key(key('x'));
+
+    assert_eq!(
+        app.status_comment_count("new.txt"),
+        1,
+        "the comment survives"
+    );
+    assert!(
+        app.modal.is_none(),
+        "no discard confirmation opens on a comment row"
+    );
+    assert_eq!(
+        std::fs::read(strix_dir(repo.path()).join("comments.json")).unwrap(),
+        before,
+        "the store is byte-stable"
+    );
+}
+
+/// Regression (codex-C5): with the file LIST focused, `x` still discards the
+/// list-selected file even though the hidden diff cursor sits on a comment row —
+/// the comment-row inert guard applies only while the diff pane is focused.
+#[test]
+fn lowercase_x_discards_when_the_list_is_focused_despite_a_comment_cursor() {
+    let repo = init_repo();
+    write(repo.path(), "new.txt", "target\n");
+    let base = head_oid(repo.path());
+    seed(
+        repo.path(),
+        "main",
+        None,
+        vec![wt(1, "new.txt", 1, "please fix", "target", &base)],
+    );
+    let mut app = App::new(repo.path().to_path_buf()).unwrap();
+    select_status_file(&mut app, "new.txt");
+    app.on_key(key(']')); // focuses the diff, cursor onto the comment row
+    app.on_key(key('h')); // focus the file list; diff cursor stays on the comment
+
+    app.on_key(key('x'));
+
+    assert!(
+        app.modal.is_some(),
+        "discard confirmation opens for the list-selected file"
+    );
+}
+
+#[test]
+fn capital_x_on_a_code_row_is_inert_in_status() {
+    let repo = init_repo();
+    write(repo.path(), "new.txt", "target\n");
+    let base = head_oid(repo.path());
+    seed(
+        repo.path(),
+        "main",
+        None,
+        vec![wt(1, "new.txt", 1, "please fix", "target", &base)],
+    );
+    let mut app = App::new(repo.path().to_path_buf()).unwrap();
+    select_status_file(&mut app, "new.txt");
+    app.on_key(key('l')); // focus diff; cursor defaults to the top (code) row
+
+    app.on_key(key('X'));
+
+    assert_eq!(
+        app.status_comment_count("new.txt"),
+        1,
+        "X on a code row deletes nothing"
+    );
+}
+
+#[test]
+fn a_failed_status_delete_keeps_the_comment_and_flashes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = init_repo();
+    write(repo.path(), "new.txt", "target\n");
+    let base = head_oid(repo.path());
+    seed(
+        repo.path(),
+        "main",
+        None,
+        vec![wt(1, "new.txt", 1, "sticky", "target", &base)],
+    );
+    let mut app = App::new(repo.path().to_path_buf()).unwrap();
+    select_status_file(&mut app, "new.txt");
+    app.on_key(key(']')); // cursor onto the comment
+    let before = std::fs::read(strix_dir(repo.path()).join("comments.json")).unwrap();
+
+    // Make the store dir read-only so the atomic write can't create its temp file.
+    let dir = strix_dir(repo.path());
+    let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+    let original = perms.mode();
+    perms.set_mode(0o555);
+    std::fs::set_permissions(&dir, perms).unwrap();
+
+    app.on_key(key('X'));
+
+    // Restore perms first so the assertions (and TempDir cleanup) can proceed.
+    let mut restore = std::fs::metadata(&dir).unwrap().permissions();
+    restore.set_mode(original);
+    std::fs::set_permissions(&dir, restore).unwrap();
+
+    assert_eq!(
+        app.status_comment_count("new.txt"),
+        1,
+        "the comment is unchanged"
+    );
+    assert_eq!(
+        std::fs::read(strix_dir(repo.path()).join("comments.json")).unwrap(),
+        before,
+        "the store is untouched"
+    );
+    let flash = app.flash.clone().expect("error flash");
+    assert_eq!(flash.kind, FlashKind::Error);
 }

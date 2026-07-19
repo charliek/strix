@@ -52,6 +52,33 @@ fn comment_actions_have_default_chords() {
     let keymap = Keymap::default();
     assert_eq!(keymap.action(key(']')), Some(Action::NextComment));
     assert_eq!(keymap.action(key('[')), Some(Action::PrevComment));
+    assert_eq!(keymap.action(key('X')), Some(Action::DeleteComment));
+}
+
+#[test]
+fn delete_comment_is_remappable_via_the_keymap() {
+    let mut overrides = HashMap::new();
+    overrides.insert("delete-comment".to_string(), vec!["d".to_string()]);
+    let keymap = Keymap::from_config(Some(&overrides));
+    assert_eq!(keymap.action(key('d')), Some(Action::DeleteComment));
+    // The default 'X' was released by the remap.
+    assert_eq!(keymap.action(key('X')), None);
+}
+
+#[test]
+fn delete_comment_chord_colliding_in_config_resolves_to_one() {
+    let mut overrides = HashMap::new();
+    overrides.insert("delete-comment".to_string(), vec!["p".to_string()]);
+    overrides.insert("comment".to_string(), vec!["p".to_string()]);
+    let keymap = Keymap::from_config(Some(&overrides));
+    let resolved = keymap.action(key('p'));
+    assert!(
+        matches!(
+            resolved,
+            Some(Action::DeleteComment) | Some(Action::Comment)
+        ),
+        "the chord resolves to exactly one of the colliding actions: {resolved:?}"
+    );
 }
 
 #[test]
