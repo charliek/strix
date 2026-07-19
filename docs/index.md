@@ -10,8 +10,9 @@ changeset can be the working tree (staging) or a branch against its base
 branch management, and remote operations to `git` itself, and spends its
 effort on the parts a terminal usually does poorly — a clean two-pane layout,
 syntax-highlighted diffs, real mouse support, and themes that match a modern
-editor. strix is becoming the review surface for agent-written code; inline
-comments and an agent-facing skill build on top of branch review. See
+editor. strix is becoming the review surface for agent-written code: inline
+review comments build on top of branch review, with an agent-facing skill
+next on that track. See
 [Non-goals](reference/architecture.md#non-goals) for the full list of what strix
 intentionally doesn't do.
 
@@ -27,6 +28,8 @@ intentionally doesn't do.
 - Syntax highlighting on diffs (powered by syntect)
 - **Branch review** (`strix diff main`): a read-only, GitHub-PR-style diff of a
   branch against its merge base
+- **Review comments** (`c`/`x`/`]`/`[` in a review session): inline notes an
+  agent reads and clears via `strix comment list|add|rm --json`
 - Light, dark, and popular preset themes (Catppuccin, Tokyo Night, Gruvbox),
   cyclable at runtime with `t` and persisted
 - Toggleable line numbers (`n`)

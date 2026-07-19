@@ -59,7 +59,12 @@ add_bg = "#202c26"
 del = "#f7768e"
 del_bg = "#312027"
 hunk = "#7dcfff"
+comment = "#bb9af7"
 ```
+
+`comment` colours the review-comment rows (`● you`/`● agent`) and the
+file-list `● n` badge in a `strix diff` session — see
+[Leaving review comments](../getting-started/usage.md#leaving-review-comments).
 
 Any colour you omit falls back to the `base` preset's value, so a partial theme
 is fine.

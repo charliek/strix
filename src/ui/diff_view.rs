@@ -4,13 +4,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use syntect::parsing::SyntaxReference;
-use unicode_width::UnicodeWidthChar;
 
-use crate::app::{App, DiffMode, SbsRow};
+use crate::app::{App, DiffMode, SbsRow, URow};
+use crate::comments::Source;
 use crate::git::{DiffLine, FileDiff, LineKind};
 use crate::ui::syntax::syntax_for;
 use crate::ui::theme::Theme;
-use crate::ui::{centered_hint, panel_block};
+use crate::ui::{centered_hint, char_width, panel_block};
 
 /// Unified gutter: `oldd nnnn ` → 4 + 1 + 4 + 1.
 const GUTTER_WIDTH: usize = 10;
@@ -55,6 +55,10 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(block, area);
     app.set_diff_area(inner);
 
+    // The review diff cursor row to paint with the selection background — `None`
+    // outside the review view or while its file list is focused (plan §3.4).
+    let cursor = app.review_cursor_highlight();
+
     let lines = match app.active_diff() {
         Some(FileDiff::Text(lines)) if !lines.is_empty() => lines,
         other => {
@@ -63,17 +67,75 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
                 Some(_) => "No changes to show",
                 None => "Select a file to view its diff",
             };
-            app.set_diff_metrics(inner.height, 0);
-            centered_hint(frame, inner, message, Style::new().fg(theme.dim));
+            render_orphans_only(frame, inner, app, message, theme, cursor);
             return;
         }
     };
 
     let syntax = syntax_for(path.as_deref().unwrap_or(""));
     match app.diff_mode {
-        DiffMode::Unified => render_unified(frame, inner, app, lines, syntax),
-        DiffMode::SideBySide => render_side_by_side(frame, inner, app, lines, syntax),
+        DiffMode::Unified => render_unified(frame, inner, app, lines, syntax, cursor),
+        DiffMode::SideBySide => render_side_by_side(frame, inner, app, lines, syntax, cursor),
     }
+}
+
+/// When `is_cursor`, repaint every span's background with the selection colour
+/// to mark the diff cursor row, keeping each span's foreground (syntax colours)
+/// and modifiers; otherwise return the line untouched. Plan §3.4 pins
+/// selection_bg as the whole-row cursor treatment.
+fn mark_cursor_row(line: Line<'static>, is_cursor: bool, theme: &Theme) -> Line<'static> {
+    if !is_cursor {
+        return line;
+    }
+    let spans: Vec<Span<'static>> = line
+        .spans
+        .into_iter()
+        .map(|span| Span::styled(span.content, span.style.bg(theme.selection_bg)))
+        .collect();
+    Line::from(spans)
+}
+
+/// Render the diff pane when there are no diff lines to show (empty text diff,
+/// binary file, or no file selected). The selected file's orphaned comments
+/// still render as a top block — for such a file it's the only place they can
+/// appear (finding 2) — with the `message` hint beneath. With no orphans this is
+/// the plain centered hint, exactly as before.
+fn render_orphans_only(
+    frame: &mut Frame,
+    inner: Rect,
+    app: &App,
+    message: &str,
+    theme: &Theme,
+    cursor: Option<usize>,
+) {
+    let orphans = app.selected_file_orphans();
+    if orphans.is_empty() {
+        app.set_diff_metrics(inner.height, 0);
+        centered_hint(frame, inner, message, Style::new().fg(theme.dim));
+        return;
+    }
+    // Metrics count only the selectable orphan rows so the cursor rests on a
+    // comment, not the trailing hint.
+    app.set_diff_metrics(inner.height, clamp_u16(orphans.len()));
+    let offset = app.diff_scroll.min(app.diff_max_scroll()) as usize;
+    let mut rows: Vec<Line> = orphans
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(inner.height as usize)
+        .map(|(i, &id)| {
+            let row = comment_row(app, id, theme, inner.width as usize, true);
+            mark_cursor_row(row, cursor == Some(i), theme)
+        })
+        .collect();
+    // The no-diff hint follows the orphan rows when there's vertical room left.
+    if rows.len() < inner.height as usize {
+        rows.push(Line::from(Span::styled(
+            message.to_string(),
+            Style::new().fg(theme.dim),
+        )));
+    }
+    frame.render_widget(Paragraph::new(rows), inner);
 }
 
 fn render_unified(
@@ -82,20 +144,32 @@ fn render_unified(
     app: &App,
     lines: &[DiffLine],
     syntax: &SyntaxReference,
+    cursor: Option<usize>,
 ) {
-    app.set_diff_metrics(inner.height, clamp_u16(lines.len()));
+    // Unified is row-driven: diff lines plus injected comment/orphan rows. Metrics
+    // count rows (not lines), so scrolling reaches an injected last row.
+    let rows = app.unified_rows(lines);
+    app.set_diff_metrics(inner.height, clamp_u16(rows.len()));
     let theme = &app.theme;
     let offset = app.diff_scroll.min(app.diff_max_scroll()) as usize;
     let body_width =
         (inner.width as usize).saturating_sub(unified_gutter_width(app.show_line_numbers));
 
-    let rows: Vec<Line> = lines
+    let out: Vec<Line> = rows
         .iter()
+        .enumerate()
         .skip(offset)
         .take(inner.height as usize)
-        .map(|line| unified_line(app, line, theme, syntax, body_width))
+        .map(|(i, row)| {
+            let line = match row {
+                URow::Line(li) => unified_line(app, &lines[*li], theme, syntax, body_width),
+                URow::Comment(id) => comment_row(app, *id, theme, inner.width as usize, false),
+                URow::Orphan(id) => comment_row(app, *id, theme, inner.width as usize, true),
+            };
+            mark_cursor_row(line, cursor == Some(i), theme)
+        })
         .collect();
-    frame.render_widget(Paragraph::new(rows), inner);
+    frame.render_widget(Paragraph::new(out), inner);
 }
 
 fn unified_line(
@@ -138,6 +212,7 @@ fn render_side_by_side(
     app: &App,
     lines: &[DiffLine],
     syntax: &SyntaxReference,
+    cursor: Option<usize>,
 ) {
     let rows = app.sbs_rows(lines);
     app.set_diff_metrics(inner.height, clamp_u16(rows.len()));
@@ -149,10 +224,11 @@ fn render_side_by_side(
 
     let out: Vec<Line> = rows
         .iter()
+        .enumerate()
         .skip(offset)
         .take(inner.height as usize)
-        .map(|row| {
-            side_by_side_line(
+        .map(|(i, row)| {
+            let line = side_by_side_line(
                 app,
                 row,
                 lines,
@@ -160,7 +236,9 @@ fn render_side_by_side(
                 syntax,
                 left_w as usize,
                 right_w as usize,
-            )
+                inner.width as usize,
+            );
+            mark_cursor_row(line, cursor == Some(i), theme)
         })
         .collect();
     frame.render_widget(Paragraph::new(out), inner);
@@ -172,6 +250,7 @@ enum Side {
     New,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn side_by_side_line(
     app: &App,
     row: &SbsRow,
@@ -180,8 +259,11 @@ fn side_by_side_line(
     syntax: &SyntaxReference,
     left_w: usize,
     right_w: usize,
+    full_w: usize,
 ) -> Line<'static> {
     match row {
+        SbsRow::Comment(id) => comment_row(app, *id, theme, full_w, false),
+        SbsRow::Orphan(id) => comment_row(app, *id, theme, full_w, true),
         SbsRow::Hunk(i) => hunk_line(&lines[*i], theme),
         SbsRow::Pair { left, right } => {
             let mut spans = cell(
@@ -250,6 +332,66 @@ fn hunk_line(line: &DiffLine, theme: &Theme) -> Line<'static> {
     ))
 }
 
+/// A full-width review-comment row (spans both columns in side-by-side): `● you
+/// <text>` / `● agent <text>`, or `⚠ …` for an orphan. The comment accent colour,
+/// text sanitized with embedded newlines shown as `⏎`, truncated to `width` with
+/// an ellipsis. A missing id (a concurrent removal between row build and render)
+/// renders a blank line rather than panicking.
+fn comment_row(app: &App, id: u64, theme: &Theme, width: usize, orphaned: bool) -> Line<'static> {
+    let Some(comment) = app.review_comment(id) else {
+        return Line::from(Span::raw(String::new()));
+    };
+    let marker = if orphaned { '⚠' } else { '●' };
+    let who = match comment.source {
+        Source::Human => "you",
+        Source::Agent => "agent",
+    };
+    let text = comment_display_text(&comment.text);
+    let full = format!("{marker} {who} {text}");
+    let shown = fit_with_ellipsis(&full, width);
+    Line::from(Span::styled(
+        shown,
+        Style::new()
+            .fg(theme.comment)
+            .add_modifier(Modifier::BOLD)
+            .bg(theme.bg),
+    ))
+}
+
+/// Sanitize comment text for a single display row: render embedded newlines as
+/// `⏎` (CLI-authored notes may be multi-line; the store keeps the raw bytes),
+/// then run the shared `sanitize` pass (tabs expanded, other control chars
+/// dropped so content can't inject escapes).
+fn comment_display_text(text: &str) -> String {
+    sanitize(&text.replace(['\n', '\r'], "⏎"))
+}
+
+/// Truncate `s` to `width` display columns (unicode-width aware), appending `…`
+/// when it doesn't fit. Returns `s` unchanged when it already fits.
+fn fit_with_ellipsis(s: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let total: usize = s.chars().map(char_width).sum();
+    if total <= width {
+        return s.to_string();
+    }
+    // Reserve one column for the ellipsis.
+    let budget = width - 1;
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in s.chars() {
+        let w = char_width(ch);
+        if used + w > budget {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.push('…');
+    out
+}
+
 /// Syntax-highlight `text` into spans (each token's colour over the line's
 /// background), expanding tabs, dropping control chars, and padding to `width`
 /// so the background fills the row.
@@ -270,7 +412,7 @@ fn highlighted_content(
         }
         let mut chunk = String::new();
         for ch in piece.chars() {
-            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            let ch_width = char_width(ch);
             if used + ch_width > width {
                 break;
             }

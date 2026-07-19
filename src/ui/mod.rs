@@ -11,6 +11,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthChar;
 
 use crate::app::{App, FlashKind, ViewMode};
 use crate::git::{ChangeKind, CommitFile};
@@ -193,19 +194,40 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             (" ? ", "help  "),
             (" q ", "quit"),
         ],
-        ViewMode::Review => vec![
-            (" j/k ", "move  "),
-            (" tab ", "pane  "),
-            (" d ", "split  "),
-            (" n ", "line #s  "),
-            (" t ", "theme  "),
-            (" b ", changes_label),
-            (" i ", "history  "),
-            (" ? ", "help  "),
-            (" q ", "quit"),
-        ],
+        ViewMode::Review => {
+            // Comment-navigation hints join the review footer; `c` adds/edits and
+            // `x` deletes the comment under the cursor, so both only show when the
+            // diff pane (where the cursor lives) is focused.
+            let mut hints = vec![(" j/k ", "move  "), (" ]/[ ", "notes  ")];
+            if app.diff_focused() {
+                hints.push((" c ", "comment  "));
+                hints.push((" x ", "delete  "));
+            }
+            hints.extend([
+                (" tab ", "pane  "),
+                (" d ", "split  "),
+                (" t ", "theme  "),
+                (" b ", changes_label),
+                (" i ", "history  "),
+                (" ? ", "help  "),
+                (" q ", "quit"),
+            ]);
+            hints
+        }
     };
     let mut spans = Vec::new();
+    // Review-only: orphaned comments that no diff block can show (files gone from
+    // the range, or binary files) are surfaced here — `strix comment list` is the
+    // only way to see/clear them (plan §3.4).
+    if app.view == ViewMode::Review {
+        let orphans = app.orphan_footer_count();
+        if orphans > 0 {
+            spans.push(Span::styled(
+                format!(" ⚠ {orphans} orphaned — strix comment list  "),
+                Style::new().fg(theme.del).add_modifier(Modifier::BOLD),
+            ));
+        }
+    }
     for (key, label) in hints {
         spans.push(Span::styled(key, key_style));
         spans.push(Span::styled(label, label_style));
@@ -317,4 +339,10 @@ pub fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
         .flex(Flex::Center)
         .areas(row);
     cell
+}
+
+/// The terminal-cell width of `ch` (0 for control/zero-width chars). The shared
+/// helper every widget that lays text out column-by-column reads from.
+pub(crate) fn char_width(ch: char) -> usize {
+    UnicodeWidthChar::width(ch).unwrap_or(0)
 }

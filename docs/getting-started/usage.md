@@ -116,8 +116,9 @@ A few things behave differently here than in the staging view:
 - **Committed state only.** A range compares two commits, so uncommitted
   changes on the reviewed branch never appear — commit them, or use the
   regular status view (`strix`, no subcommand) to see the working tree.
-- **Read-only.** Staging keys (`space`, `Enter`, `s`, `u`, `x`, and clicking a
-  file's status marker) do nothing: no modal, no index change.
+- **Read-only for staging.** Staging keys (`space`, `Enter`, `s`, `u`, and
+  clicking a file's status marker) do nothing: no modal, no index change. `x`
+  is repurposed here — see below.
 - **Live updates.** As new commits land on the reviewed branch, the file list
   and the currently open diff refresh automatically, the same auto-refresh
   path the staging view uses.
@@ -131,6 +132,68 @@ e.g. a blob — or no merge base between the two sides) fails before the TUI
 opens: strix exits non-zero and prints a message
 naming the offending operand. See [CLI](../reference/cli.md) for the full
 grammar, the merge-base caveat, and exit behavior.
+
+### Leaving review comments
+
+A review session has a per-row **cursor** in the diff pane (`j`/`k` move it,
+`g`/`G` jump to the first/last row, `Ctrl-d`/`Ctrl-u` half-page) — it renders
+with the selection colour only while the diff pane has focus, and clicking a
+row in the diff moves it there too (the scroll wheel never moves the cursor).
+
+- **`c`** — on a code row, opens a single-line input to add a comment anchored
+  to that line (`Enter` saves, `Esc` cancels, discarding the draft); on your
+  own comment's row, opens the same input pre-filled to edit it. On an
+  agent-authored comment it flashes `agent note — read-only` instead — the TUI
+  can edit human notes only. `c` on the file list, a hunk-header row, or an
+  offscreen cursor (the first keypress just scrolls it into view) does
+  nothing but flash a hint.
+- **`x`** — deletes the comment under the cursor, no confirmation. Deletion
+  only ever acts on a row you can already see: if the cursor is scrolled
+  offscreen, the first `x` reveals it and the second deletes it (the same
+  "act-and-reveal" rule `c` follows). `x` on a code row is a silent no-op —
+  staging's discard action doesn't apply in a review session.
+- **`]` / `[`** — jump to the next/previous comment, cycling across every
+  listed file in file-list then row order (wrapping at the ends). With no
+  comments in the session, they flash instead of moving.
+
+Each comment renders as its own row directly below the anchored line —
+`● you <text>` for your notes, `● agent <text>` for the agent's — in a
+distinct accent colour (`comment` in the theme; see
+[Theming](../guides/theming.md#custom-themes)). The file list shows a
+`● <n>` badge per file with any comments.
+
+**Orphans.** A comment whose anchored line moved is re-anchored automatically
+when the surrounding text still matches nearby; one whose line was edited (or
+that drifted too far to match honestly) is marked **orphaned** instead of
+silently relocated. Orphans on a file still in the range show in a
+`⚠`-marked block at the top of that file's diff — even if the diff itself is
+binary or has no textual lines to anchor to. Orphans on a file that dropped
+out of the range entirely (renamed away, or no longer part of the diff) can't
+be shown next to anything, so they're rolled into a footer counter instead:
+`⚠ N orphaned — strix comment list`.
+
+**Authoring requires reviewing your checked-out branch.** Comments are tied to
+the branch you're actually on: open a session with `strix diff main` while
+that branch is checked out, and `c` works normally. If the reviewed head
+isn't your current `HEAD` (say, you `git checkout`d elsewhere mid-review, or
+you're comparing two other refs), the session renders comment-free and `c`
+flashes `check out the reviewed branch to comment` — this keeps the human
+TUI inbox and the agent CLI inbox (below) provably the same set.
+
+**Committed state only, again.** Removing a comment is the signal that its
+issue is resolved, so an agent addressing your notes commits its fix first,
+then removes the comment — the review only ever shows committed code, so a
+comment removed before its fix lands would vanish while the problem is still
+on screen.
+
+Comments persist immediately to `.git/strix/comments.json` on every add, edit,
+or delete — a separate file from, and unrelated to, the `config.toml`
+write-back that `t`/`d`/`n` do (see
+[Configuration](../guides/configuration.md#runtime-changes-persist));
+nothing about comments ever touches `config.toml`. An agent (or another
+`strix` instance, in another checkout) reads and edits that same inbox via
+`strix comment list|add|rm` — see [CLI](../reference/cli.md#strix-comment) for
+the full contract.
 
 ## Inspecting a frame
 

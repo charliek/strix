@@ -1,0 +1,558 @@
+//! Comments store I/O, GC, and the re-anchor engine (plan §3.1 / §3.2, C1).
+//! Every test drives the store against an injected tempdir — never a real repo
+//! store — and the re-anchor matrix is exercised against hand-constructed
+//! `FileDiff` values, which are clearer than seeding a diff per case.
+
+mod common;
+
+use std::collections::{BTreeMap, HashSet};
+
+use common::{init_empty_repo, init_repo, init_repo_with_worktree};
+use strix::comments::{self, Branch, Comment, Side, Source, Store};
+use strix::git::{ChangeKind, CommitFile, CommitStat, DiffLine, FileDiff, LineKind, Repo};
+
+// --- builders ---
+
+fn comment(id: u64, file: &str, side: Side, line: usize, context: Option<&str>) -> Comment {
+    Comment {
+        id,
+        source: Source::Human,
+        file: file.to_string(),
+        side,
+        line,
+        text: format!("note {id}"),
+        context: context.map(str::to_string),
+        orphaned: false,
+        created_at: 1_700_000_000,
+    }
+}
+
+fn modified(path: &str) -> CommitFile {
+    CommitFile {
+        path: path.to_string(),
+        orig_path: None,
+        change: ChangeKind::Modified,
+        stat: CommitStat::default(),
+    }
+}
+
+fn renamed(from: &str, to: &str) -> CommitFile {
+    CommitFile {
+        path: to.to_string(),
+        orig_path: Some(from.to_string()),
+        change: ChangeKind::Renamed,
+        stat: CommitStat::default(),
+    }
+}
+
+/// A New-side context line at `n` with `text` (both sides numbered `n`).
+fn line(n: usize, text: &str) -> DiffLine {
+    DiffLine {
+        kind: LineKind::Context,
+        old_no: Some(n),
+        new_no: Some(n),
+        text: text.to_string(),
+    }
+}
+
+/// Re-anchor a single file's comments against one hand-built diff.
+fn reanchor_one_file(comments: &mut [Comment], file: CommitFile, diff: FileDiff) -> bool {
+    comments::reanchor(comments, std::slice::from_ref(&file), |_| diff.clone())
+}
+
+// --- store round-trip & load rules ---
+
+#[test]
+fn multi_branch_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let mut store = Store::default();
+    let mut main = Branch {
+        range: Some("origin/main".to_string()),
+        comments: vec![comment(
+            store.take_id(),
+            "a.rs",
+            Side::New,
+            3,
+            Some("fn a() {"),
+        )],
+    };
+    main.comments
+        .push(comment(store.take_id(), "b.rs", Side::Old, 7, None));
+    store.branches.insert("main".to_string(), main);
+    let feature_id = store.take_id();
+    store.branches.insert(
+        "feature".to_string(),
+        Branch {
+            range: None,
+            comments: vec![comment(feature_id, "c.rs", Side::New, 1, Some("x"))],
+        },
+    );
+
+    comments::mutate(dir.path(), |s| *s = store.clone()).unwrap();
+    let loaded = comments::load(dir.path()).unwrap();
+
+    assert_eq!(loaded, store);
+    assert_eq!(loaded.version, 1);
+    assert_eq!(loaded.next_id, 4);
+    assert_eq!(loaded.branches.len(), 2);
+}
+
+#[test]
+fn take_id_skips_past_existing_max_id() {
+    // A hand-edited store can carry a stale next_id at or below an existing id;
+    // take_id must still mint a fresh unique id (max(next_id, max_id + 1)).
+    let mut store = Store {
+        version: 1,
+        next_id: 2,
+        branches: BTreeMap::new(),
+    };
+    store.branches.insert(
+        "main".to_string(),
+        Branch {
+            range: None,
+            comments: vec![
+                comment(1, "a.rs", Side::New, 1, Some("x")),
+                comment(2, "a.rs", Side::New, 2, Some("y")),
+            ],
+        },
+    );
+
+    assert_eq!(store.take_id(), 3, "minted past the existing max id, not 2");
+    assert_eq!(store.next_id, 4, "counter advanced past the minted id");
+}
+
+#[test]
+fn source_and_side_serialize_as_lowercase_tokens() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::default();
+    let mut c = comment(store.take_id(), "a.rs", Side::Old, 2, Some(""));
+    c.source = Source::Agent;
+    store.branches.insert(
+        "main".to_string(),
+        Branch {
+            range: None,
+            comments: vec![c],
+        },
+    );
+    comments::mutate(dir.path(), |s| *s = store).unwrap();
+
+    let text = std::fs::read_to_string(dir.path().join("comments.json")).unwrap();
+    assert!(text.contains("\"source\": \"agent\""), "{text}");
+    assert!(text.contains("\"side\": \"old\""), "{text}");
+    // A blank-line context is a valid Some(""), not null.
+    assert!(text.contains("\"context\": \"\""), "{text}");
+}
+
+#[test]
+fn invalid_json_is_never_clobbered_byte_identical() {
+    let dir = tempfile::tempdir().unwrap();
+    let broken = b"{ this is not valid json ]".to_vec();
+    std::fs::write(dir.path().join("comments.json"), &broken).unwrap();
+
+    assert!(
+        comments::load(dir.path()).is_err(),
+        "load must report the parse error"
+    );
+    let mutate = comments::mutate(dir.path(), |s| s.take_id());
+    assert!(
+        mutate.is_err(),
+        "mutate must refuse to write over an unparseable store"
+    );
+
+    assert_eq!(
+        std::fs::read(dir.path().join("comments.json")).unwrap(),
+        broken,
+        "the broken file must stay byte-identical"
+    );
+    assert!(tmp_residue(dir.path()).is_empty(), "no temp residue");
+}
+
+#[test]
+fn version_two_refuses_read_and_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let future = br#"{ "version": 2, "next_id": 1, "branches": {} }"#.to_vec();
+    std::fs::write(dir.path().join("comments.json"), &future).unwrap();
+
+    let err = comments::load(dir.path()).unwrap_err();
+    assert!(
+        err.to_string().contains("version 2"),
+        "message should name the version: {err}"
+    );
+    assert!(
+        comments::mutate(dir.path(), |s| s.branches.clear()).is_err(),
+        "a newer-version store must not be written"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("comments.json")).unwrap(),
+        future,
+        "the newer-version file must stay byte-identical"
+    );
+}
+
+#[test]
+fn zero_byte_and_missing_files_are_empty_stores() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(
+        comments::load(dir.path()).unwrap(),
+        Store::default(),
+        "missing = empty"
+    );
+
+    std::fs::write(dir.path().join("comments.json"), b"").unwrap();
+    assert_eq!(
+        comments::load(dir.path()).unwrap(),
+        Store::default(),
+        "zero-byte = empty"
+    );
+}
+
+#[test]
+fn writes_leave_no_temp_residue() {
+    let dir = tempfile::tempdir().unwrap();
+    comments::mutate(dir.path(), |s| {
+        let id = s.take_id();
+        s.branches.insert(
+            "main".to_string(),
+            Branch {
+                range: None,
+                comments: vec![comment(id, "a.rs", Side::New, 1, Some("x"))],
+            },
+        );
+    })
+    .unwrap();
+    comments::mutate(dir.path(), |_| {}).unwrap();
+
+    assert!(tmp_residue(dir.path()).is_empty());
+    assert!(dir.path().join("comments.json").is_file());
+}
+
+fn tmp_residue(dir: &std::path::Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("comments.json.tmp."))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+// --- gc ---
+
+#[test]
+fn gc_drops_dead_branches_and_stale_detached_keys_only() {
+    let live_hex = "a".repeat(40);
+    let dead_hex = "b".repeat(40);
+
+    let mut store = Store::default();
+    for (key, n) in [
+        ("main", 2usize),
+        ("gone", 1),
+        (live_hex.as_str(), 3),
+        (dead_hex.as_str(), 1),
+    ] {
+        let comments: Vec<Comment> = (0..n)
+            .map(|i| comment(i as u64, "a.rs", Side::New, 1, Some("x")))
+            .collect();
+        store.branches.insert(
+            key.to_string(),
+            Branch {
+                range: None,
+                comments,
+            },
+        );
+    }
+
+    let live_branches: HashSet<String> = ["main".to_string()].into_iter().collect();
+    let result = comments::gc(&mut store, &live_branches, |key| key == live_hex);
+
+    let mut removed = result.removed_branches.clone();
+    removed.sort();
+    let mut expected = vec!["gone".to_string(), dead_hex.clone()];
+    expected.sort();
+    assert_eq!(removed, expected);
+    assert_eq!(result.removed_comments, 2, "1 (gone) + 1 (dead detached)");
+    assert!(store.branches.contains_key("main"), "live branch kept");
+    assert!(
+        store.branches.contains_key(&live_hex),
+        "reachable detached kept"
+    );
+    assert!(!store.branches.contains_key("gone"));
+    assert!(!store.branches.contains_key(&dead_hex));
+}
+
+#[test]
+fn gc_keeps_a_live_branch_named_as_commit_hex() {
+    // A real branch can legally be named as 40 hex chars. Live-branch membership
+    // is checked before the commit-hex shape test, so it survives gc regardless
+    // of whether commit_exists would report it as a resolvable commit.
+    let hex_branch = "c".repeat(40);
+    let mut store = Store::default();
+    store.branches.insert(
+        hex_branch.clone(),
+        Branch {
+            range: None,
+            comments: vec![comment(1, "a.rs", Side::New, 1, Some("x"))],
+        },
+    );
+
+    let live: HashSet<String> = [hex_branch.clone()].into_iter().collect();
+    // commit_exists says "no" — irrelevant, because the key is a live branch.
+    let result = comments::gc(&mut store, &live, |_| false);
+
+    assert!(result.is_empty(), "a live branch is never dropped");
+    assert!(
+        store.branches.contains_key(&hex_branch),
+        "the hex-named live branch survives gc"
+    );
+}
+
+#[test]
+fn gc_on_a_clean_store_removes_nothing() {
+    let mut store = Store::default();
+    store.branches.insert("main".to_string(), Branch::default());
+    let live: HashSet<String> = ["main".to_string()].into_iter().collect();
+    let result = comments::gc(&mut store, &live, |_| true);
+    assert!(result.is_empty());
+    assert!(store.branches.contains_key("main"));
+}
+
+// --- repo plumbing: head_branch_key / branch_names / strix_dir ---
+
+#[test]
+fn head_branch_key_is_the_branch_name_and_unborn_head_is_well_formed() {
+    let repo = init_repo();
+    let opened = Repo::open(repo.path()).unwrap();
+    assert_eq!(opened.head_branch_key().unwrap(), "main");
+    assert_eq!(opened.branch_names().unwrap(), vec!["main".to_string()]);
+
+    // Unborn HEAD (no commits): the key is still the symbolic branch name, and
+    // it is not a commit hex — gc treats it as a live branch, not a detached key.
+    let empty = init_empty_repo();
+    let opened = Repo::open(empty.path()).unwrap();
+    assert_eq!(opened.head_branch_key().unwrap(), "main");
+    assert!(
+        opened.branch_names().unwrap().is_empty(),
+        "no branch ref exists yet"
+    );
+}
+
+#[test]
+fn detached_head_key_is_the_commit_hex() {
+    let repo = init_repo();
+    common::git(repo.path(), &["checkout", "-q", "--detach"]);
+    let opened = Repo::open(repo.path()).unwrap();
+    let key = opened.head_branch_key().unwrap();
+    assert_eq!(key.len(), 40, "detached key is a full commit hex: {key}");
+    assert!(key.bytes().all(|b| b.is_ascii_hexdigit()));
+}
+
+#[test]
+fn a_linked_worktree_resolves_the_same_store_file() {
+    let repos = init_repo_with_worktree();
+    let main = Repo::open(repos.main.path()).unwrap();
+    let side = Repo::open(&repos.worktree()).unwrap();
+
+    // The two checkouts are on different branches but share one store file.
+    assert_eq!(main.head_branch_key().unwrap(), "main");
+    assert_eq!(side.head_branch_key().unwrap(), "side");
+
+    // Write from the main checkout, read from the linked worktree.
+    comments::mutate(&main.strix_dir(), |store| {
+        let id = store.take_id();
+        store.branches.insert(
+            "main".to_string(),
+            Branch {
+                range: None,
+                comments: vec![comment(id, "a.rs", Side::New, 1, Some("x"))],
+            },
+        );
+    })
+    .unwrap();
+
+    let from_worktree = comments::load(&side.strix_dir()).unwrap();
+    assert!(
+        from_worktree.branches.contains_key("main"),
+        "the worktree sees the main checkout's write"
+    );
+    assert_eq!(
+        std::fs::canonicalize(main.strix_dir()).unwrap(),
+        std::fs::canonicalize(side.strix_dir()).unwrap(),
+        "both resolve to the same common-dir store directory"
+    );
+}
+
+// --- re-anchor matrix (plan §3.2) ---
+
+#[test]
+fn reanchor_exact_hit_anchors() {
+    let mut c = vec![comment(1, "a.rs", Side::New, 10, Some("fn keep() {"))];
+    c[0].orphaned = true;
+    let diff = FileDiff::Text(vec![
+        line(9, "before"),
+        line(10, "fn keep() {"),
+        line(11, "after"),
+    ]);
+    let changed = reanchor_one_file(&mut c, modified("a.rs"), diff);
+    assert!(!c[0].orphaned, "exact match anchors");
+    assert_eq!(c[0].line, 10, "line unchanged");
+    assert!(changed, "orphaned flipped false → reported as changed");
+}
+
+#[test]
+fn reanchor_no_change_pass_elides_the_write() {
+    let mut c = vec![comment(1, "a.rs", Side::New, 10, Some("fn keep() {"))];
+    // Already correctly anchored: orphaned=false, exact line present.
+    let diff = FileDiff::Text(vec![line(10, "fn keep() {")]);
+    let changed = reanchor_one_file(&mut c, modified("a.rs"), diff);
+    assert!(!changed, "nothing changed → write elided");
+    assert!(!c[0].orphaned);
+    assert_eq!(c[0].line, 10);
+}
+
+#[test]
+fn reanchor_moved_within_window_reanchors_and_reports_changed() {
+    let mut c = vec![comment(1, "a.rs", Side::New, 10, Some("target line"))];
+    // The line drifted to 13 (within ±10); nothing sits at 10 anymore.
+    let diff = FileDiff::Text(vec![line(12, "x"), line(13, "target line"), line(14, "y")]);
+    let changed = reanchor_one_file(&mut c, modified("a.rs"), diff);
+    assert!(changed);
+    assert_eq!(c[0].line, 13, "re-anchored to the moved line");
+    assert!(!c[0].orphaned);
+}
+
+#[test]
+fn reanchor_agent_edited_line_orphans() {
+    let mut c = vec![comment(1, "a.rs", Side::New, 10, Some("original text"))];
+    // The anchored line was rewritten; the original text appears nowhere.
+    let diff = FileDiff::Text(vec![
+        line(9, "keep"),
+        line(10, "rewritten by agent"),
+        line(11, "keep"),
+    ]);
+    let changed = reanchor_one_file(&mut c, modified("a.rs"), diff);
+    assert!(c[0].orphaned, "an edited anchor line orphans");
+    assert_eq!(c[0].line, 10, "stored line kept for display");
+    assert!(changed, "orphaned flipped false → true");
+}
+
+#[test]
+fn reanchor_match_beyond_window_orphans() {
+    let mut c = vec![comment(1, "a.rs", Side::New, 10, Some("far"))];
+    // The only match is 15 lines away (> ±10): orphan, do not teleport.
+    let diff = FileDiff::Text(vec![line(25, "far")]);
+    reanchor_one_file(&mut c, modified("a.rs"), diff);
+    assert!(c[0].orphaned);
+    assert_eq!(c[0].line, 10);
+}
+
+#[test]
+fn reanchor_tie_break_prefers_the_smaller_line() {
+    let mut c = vec![comment(1, "a.rs", Side::New, 10, Some("dup"))];
+    // Equidistant matches at 8 and 12 (distance 2 each): smaller line wins.
+    let diff = FileDiff::Text(vec![line(8, "dup"), line(12, "dup")]);
+    reanchor_one_file(&mut c, modified("a.rs"), diff);
+    assert_eq!(c[0].line, 8, "tie broken toward the smaller line");
+    assert!(!c[0].orphaned);
+}
+
+#[test]
+fn reanchor_blank_line_exact_and_moved() {
+    // Exact: a blank anchored line is a valid Some("").
+    let mut c = vec![comment(1, "a.rs", Side::New, 5, Some(""))];
+    let diff = FileDiff::Text(vec![line(4, "code"), line(5, ""), line(6, "code")]);
+    reanchor_one_file(&mut c, modified("a.rs"), diff);
+    assert!(!c[0].orphaned);
+    assert_eq!(c[0].line, 5);
+
+    // Moved: the blank line drifted to 7; nothing blank sits at 5.
+    let mut c = vec![comment(1, "a.rs", Side::New, 5, Some(""))];
+    let diff = FileDiff::Text(vec![line(5, "code"), line(6, "code"), line(7, "")]);
+    let changed = reanchor_one_file(&mut c, modified("a.rs"), diff);
+    assert!(changed);
+    assert_eq!(c[0].line, 7);
+    assert!(!c[0].orphaned);
+}
+
+#[test]
+fn reanchor_context_none_orphans_on_drift() {
+    let mut c = vec![comment(1, "a.rs", Side::New, 10, None)];
+    // Even with an identical-looking line present, unavailable context never
+    // matches: it orphans.
+    let diff = FileDiff::Text(vec![line(10, "whatever"), line(11, "else")]);
+    reanchor_one_file(&mut c, modified("a.rs"), diff);
+    assert!(c[0].orphaned, "context None never anchors");
+    assert_eq!(c[0].line, 10);
+}
+
+#[test]
+fn reanchor_file_gone_orphans() {
+    let mut c = vec![comment(1, "gone.rs", Side::New, 3, Some("x"))];
+    // The review lists a different file; the comment's file dropped out.
+    let changed = comments::reanchor(&mut c, &[modified("other.rs")], |_| unreachable!());
+    assert!(c[0].orphaned);
+    assert!(changed);
+}
+
+#[test]
+fn reanchor_rename_orphans_both_sides() {
+    // `file` stores the new-side path at authoring time; a later rename means no
+    // CommitFile matches that path, so both old- and new-side comments orphan.
+    let mut c = vec![
+        comment(1, "old.rs", Side::New, 3, Some("x")),
+        comment(2, "old.rs", Side::Old, 4, Some("y")),
+    ];
+    let files = [renamed("old.rs", "new.rs")];
+    comments::reanchor(&mut c, &files, |_| {
+        unreachable!("renamed path never matches")
+    });
+    assert!(c[0].orphaned, "new-side comment on the old path orphans");
+    assert!(c[1].orphaned, "old-side comment on the old path orphans");
+}
+
+#[test]
+fn reanchor_binary_orphans() {
+    let mut c = vec![comment(1, "img.png", Side::New, 1, Some("x"))];
+    let changed = reanchor_one_file(&mut c, modified("img.png"), FileDiff::Binary);
+    assert!(c[0].orphaned, "a binary file has no lines to anchor to");
+    assert!(changed);
+}
+
+#[test]
+fn reanchor_context_line_hunk_contraction_orphans() {
+    // A Context-line comment whose nearby change was resolved: the file is still
+    // listed but the anchored line left the diff window entirely.
+    let mut c = vec![comment(1, "a.rs", Side::New, 40, Some("context line"))];
+    // The remaining hunk covers a distant region; line 40 no longer appears and
+    // no match sits within ±10.
+    let diff = FileDiff::Text(vec![line(4, "context line"), line(5, "other")]);
+    reanchor_one_file(&mut c, modified("a.rs"), diff);
+    assert!(
+        c[0].orphaned,
+        "the contracted hunk no longer contains the line"
+    );
+    assert_eq!(c[0].line, 40);
+}
+
+#[test]
+fn reanchor_only_recomputes_each_file_diff_once() {
+    // Two comments on one file must share a single diff computation (lazy, cached).
+    let mut c = vec![
+        comment(1, "a.rs", Side::New, 3, Some("one")),
+        comment(2, "a.rs", Side::New, 6, Some("two")),
+    ];
+    let files = [modified("a.rs")];
+    let mut calls = 0;
+    let diff = FileDiff::Text(vec![line(3, "one"), line(6, "two")]);
+    comments::reanchor(&mut c, &files, |_| {
+        calls += 1;
+        diff.clone()
+    });
+    assert_eq!(
+        calls, 1,
+        "the per-file diff is computed once, not per comment"
+    );
+    assert!(!c[0].orphaned && !c[1].orphaned);
+}

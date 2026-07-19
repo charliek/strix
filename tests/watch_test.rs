@@ -10,7 +10,7 @@ use tempfile::tempdir;
 #[test]
 fn watcher_signals_on_a_file_change() {
     let dir = tempdir().expect("tempdir");
-    let rx = watch::spawn(dir.path().to_path_buf()).expect("spawn watcher");
+    let rx = watch::spawn(dir.path().to_path_buf(), Vec::new()).expect("spawn watcher");
     // Let the watch register before touching files.
     std::thread::sleep(Duration::from_millis(300));
     std::fs::write(dir.path().join("hello.txt"), "hi").expect("write");

@@ -49,6 +49,71 @@ pub enum Command {
         /// Path to the git repository (defaults to the current directory).
         path: Option<PathBuf>,
     },
+
+    /// Read and edit review comments for the checked-out branch (agent-facing).
+    ///
+    /// Every action operates on the current HEAD branch's inbox. Machine output
+    /// is JSON on stdout (`--json`); diagnostics go to stderr and any failure
+    /// exits non-zero (plan §3.3).
+    Comment {
+        #[command(subcommand)]
+        action: CommentAction,
+        /// Path to the git repository (defaults to the current directory).
+        path: Option<PathBuf>,
+    },
+}
+
+/// A `strix comment` action. All act on the current HEAD branch key.
+#[derive(Debug, Subcommand)]
+pub enum CommentAction {
+    /// List this branch's comments (re-anchoring against the stored range first).
+    List {
+        /// Emit the machine-readable JSON contract instead of a plain table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Add an agent-authored comment anchored to a line of a file's diff.
+    ///
+    /// Exactly one of `--old-line` / `--new-line` selects the side; both must be
+    /// ≥ 1. `--text` must be non-empty after trimming (its raw bytes, newlines
+    /// included, are stored verbatim).
+    Add {
+        /// The file's new-side path, as listed in the review.
+        #[arg(long)]
+        file: String,
+        /// Anchor to this 1-based line on the old (base) side.
+        #[arg(long)]
+        old_line: Option<usize>,
+        /// Anchor to this 1-based line on the new (head) side.
+        #[arg(long)]
+        new_line: Option<usize>,
+        /// The comment body (stored raw; may contain newlines).
+        #[arg(long)]
+        text: String,
+        /// Emit the machine-readable JSON contract instead of the new id.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove one comment by id from this branch.
+    Rm {
+        /// The id to remove (from `list`).
+        id: u64,
+        /// Emit the machine-readable JSON contract.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove every comment on this branch.
+    Clear {
+        /// Emit the machine-readable JSON contract.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Drop inboxes for branches/commits that no longer exist.
+    Gc {
+        /// Emit the machine-readable JSON contract.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 impl Cli {
@@ -58,6 +123,7 @@ impl Cli {
     pub fn target(&self) -> (Option<PathBuf>, Option<String>) {
         match &self.command {
             Some(Command::Diff { range, path }) => (path.clone(), Some(range.clone())),
+            Some(Command::Comment { path, .. }) => (path.clone(), None),
             None => (self.path.clone(), None),
         }
     }

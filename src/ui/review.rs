@@ -6,7 +6,7 @@
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem};
 use ratatui::Frame;
 
@@ -61,7 +61,18 @@ fn render_files(frame: &mut Frame, area: Rect, app: &App) {
 
     let items: Vec<ListItem> = files
         .iter()
-        .map(|file| ListItem::new(Line::from(file_stat_spans(file, theme))))
+        .map(|file| {
+            let mut spans = file_stat_spans(file, theme);
+            // Review-only `● n` comment badge (count includes orphans).
+            let count = app.review_comment_count(&file.path);
+            if count > 0 {
+                spans.push(Span::styled(
+                    format!("  ● {count}"),
+                    Style::new().fg(theme.comment),
+                ));
+            }
+            ListItem::new(Line::from(spans))
+        })
         .collect();
     let list = List::new(items).highlight_style(selection_style(focused, theme));
     let mut state = app.review_list_state_mut();

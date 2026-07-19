@@ -49,12 +49,18 @@ toggle_stage     = ["space", "enter"]
 stage            = ["s"]
 unstage          = ["u"]
 discard          = ["x"]
+comment          = ["c"]
+next_comment     = ["]"]
+prev_comment     = ["["]
 ```
 
 `down`/`up` and `top`/`bottom` are context-aware: they move the file cursor in
 the **Changes** pane and scroll the **Diff** pane, depending on which is focused.
 Staging actions (`stage`, `discard`, …) act on the selected file from either
-pane.
+pane. `discard` is also what deletes a comment under the cursor in a review
+session — the two views share one action, so remapping `discard` changes both;
+you can't bind Changes-pane discard and review-comment delete to different
+chords.
 
 Chord syntax: a key name (`a`, `enter`, `space`, `tab`, `esc`, `up`, `left`,
 `pageup`, …) optionally prefixed with `ctrl-`, `alt-`, or `shift-`
@@ -64,6 +70,11 @@ Chord syntax: a key name (`a`, `enter`, `space`, `tab`, `esc`, `up`, `left`,
 
 The in-app help overlay (`?`) and the footer hints list the **default** keys,
 not any you've remapped here.
+
+Assigning the same chord to two different actions in `[keys]` logs a warning
+to the log file (default verbosity; see [Environment](../reference/cli.md#environment)
+and [Logs](../reference/cli.md#logs)) rather than failing silently — the later
+assignment in the table wins.
 
 ## Runtime changes persist
 
@@ -89,6 +100,13 @@ Running multiple strix instances against the same config directory is
 **last-writer-wins**: each write replaces the whole file, so if two instances
 save around the same time, one save can be silently lost. There's no
 cross-instance locking.
+
+**Review comments are not part of this.** Adding, editing, or deleting a
+comment in a review session (`c`, `x` — see
+[Leaving review comments](../getting-started/usage.md#leaving-review-comments))
+writes to `.git/strix/comments.json` immediately, the moment you act — there's
+no "persists on next launch" delay like `t`/`d`/`n`, and nothing about it
+touches `config.toml`.
 
 See [Keybindings](../getting-started/keybindings.md) for the defaults and
 [Theming](theming.md) for theme files.
