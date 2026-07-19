@@ -28,32 +28,38 @@ pub fn run(action: &SkillAction) -> Result<()> {
 /// (keeps tests hermetic and lets callers relocate it), else the platform data
 /// dir from the `directories` crate — mirroring how `config::config_dir`
 /// resolves the config directory. An empty `$STRIX_DATA_DIR` counts as unset,
-/// the conventional treatment. A relative value is resolved against the current
-/// directory so the printed path always honours the absolute-path contract.
-fn data_dir() -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var("STRIX_DATA_DIR") {
-        if !dir.is_empty() {
+/// the conventional treatment; a set-but-non-UTF-8 value is an error, not a
+/// silent fallback. A relative value is resolved against the current directory
+/// so the printed path always honours the absolute-path contract — and if the
+/// current directory is unavailable, that is an error too.
+fn data_dir() -> Result<PathBuf> {
+    match std::env::var("STRIX_DATA_DIR") {
+        Ok(dir) if !dir.is_empty() => {
             let dir = PathBuf::from(dir);
-            let dir = if dir.is_absolute() {
-                dir
+            if dir.is_absolute() {
+                Ok(dir)
             } else {
-                std::env::current_dir()
-                    .map(|cwd| cwd.join(&dir))
-                    .unwrap_or(dir)
-            };
-            return Some(dir);
+                let cwd = std::env::current_dir()
+                    .context("resolving relative STRIX_DATA_DIR against the current directory")?;
+                Ok(cwd.join(dir))
+            }
         }
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("STRIX_DATA_DIR is not valid UTF-8")
+        }
+        _ => BaseDirs::new()
+            .map(|base| base.data_dir().to_path_buf())
+            .context(
+                "could not determine a data directory; set STRIX_DATA_DIR to choose one explicitly",
+            ),
     }
-    BaseDirs::new().map(|base| base.data_dir().to_path_buf())
 }
 
 /// Materialize the skill under `<data_dir>/strix/skills/strix-review/` and print
 /// its absolute path. Written atomically on every invocation so a stale on-disk
 /// copy is always refreshed to match this binary.
 fn path(json_out: bool) -> Result<()> {
-    let base = data_dir().context(
-        "could not determine a data directory; set STRIX_DATA_DIR to choose one explicitly",
-    )?;
+    let base = data_dir()?;
     let skill_dir = base.join("strix").join("skills").join("strix-review");
     let skill_path = skill_dir.join("SKILL.md");
 

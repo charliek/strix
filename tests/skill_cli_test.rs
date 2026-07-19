@@ -103,6 +103,78 @@ fn works_outside_any_git_repo() {
 }
 
 #[test]
+fn relative_strix_data_dir_resolves_against_cwd() {
+    let cwd = tempdir().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_strix"))
+        .args(["skill", "path"])
+        .env("STRIX_DATA_DIR", "rel-data")
+        .env("HOME", cwd.path())
+        .env("XDG_STATE_HOME", cwd.path())
+        .current_dir(cwd.path())
+        .output()
+        .expect("spawn strix");
+    assert!(
+        out.status.success(),
+        "expected success; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let printed = String::from_utf8(out.stdout).unwrap();
+    let printed = printed.trim_end();
+    let path = PathBuf::from(printed);
+    assert!(path.is_absolute(), "printed path is absolute: {printed}");
+    assert!(path.exists(), "printed path exists: {printed}");
+    // The tempdir may reach the child through a symlink (macOS /var →
+    // /private/var), so compare canonical forms rather than raw prefixes.
+    assert_eq!(
+        path.canonicalize().unwrap(),
+        expected_path(&cwd.path().join("rel-data"))
+            .canonicalize()
+            .unwrap(),
+        "relative STRIX_DATA_DIR resolves against the cwd"
+    );
+    assert!(
+        expected_path(&cwd.path().join("rel-data")).exists(),
+        "skill materialized under <cwd>/rel-data"
+    );
+}
+
+#[test]
+fn empty_strix_data_dir_falls_back_to_platform_dir() {
+    let home = tempdir().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_strix"))
+        .args(["skill", "path"])
+        .env("STRIX_DATA_DIR", "")
+        .env("HOME", home.path())
+        .env("XDG_STATE_HOME", home.path())
+        .env_remove("XDG_DATA_HOME")
+        .current_dir(home.path())
+        .output()
+        .expect("spawn strix");
+    assert!(
+        out.status.success(),
+        "expected success; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let printed = String::from_utf8(out.stdout).unwrap();
+    let printed = printed.trim_end();
+    let path = PathBuf::from(printed);
+    assert!(path.is_absolute(), "printed path is absolute: {printed}");
+    assert!(path.exists(), "printed path exists: {printed}");
+    // BaseDirs derives the data dir from $HOME (macOS: Library/Application
+    // Support, Linux: .local/share), so the path must sit under the fake HOME.
+    assert!(
+        path.starts_with(home.path()),
+        "platform data dir is under the redirected HOME: {printed}"
+    );
+    assert!(
+        path.ends_with("strix/skills/strix-review/SKILL.md"),
+        "path ends with the skill layout: {printed}"
+    );
+}
+
+#[test]
 fn json_shape_parses_and_path_matches() {
     let data = tempdir().unwrap();
     let out = run(data.path(), data.path(), &["path", "--json"]);
