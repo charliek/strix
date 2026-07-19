@@ -35,6 +35,9 @@ pub enum Action {
     Stage,
     Unstage,
     Discard,
+    /// Jump to the next / previous review comment on a listed file (review view).
+    NextComment,
+    PrevComment,
 }
 
 /// A key plus modifiers, normalised so Shift is folded into the character.
@@ -72,6 +75,11 @@ impl Keymap {
             }
         }
         if let Some(overrides) = overrides {
+            // Track which chords the *config* has already claimed, so a chord
+            // assigned to two different actions in the config surfaces a warning
+            // (silent shadowing otherwise). Overriding a default is normal
+            // remapping and stays quiet — only config-vs-config collisions warn.
+            let mut configured: HashMap<Chord, Action> = HashMap::new();
             for (name, chords) in overrides {
                 let Some(action) = parse_action(name) else {
                     tracing::warn!("unknown keybinding action {name:?}; ignored");
@@ -81,6 +89,15 @@ impl Keymap {
                 for chord in chords {
                     match parse_chord(chord) {
                         Some(chord) => {
+                            if let Some(&prev) = configured.get(&chord) {
+                                if prev != action {
+                                    tracing::warn!(
+                                        "keybinding chord {chord:?} is assigned to both \
+                                         {prev:?} and {action:?}; the later assignment wins"
+                                    );
+                                }
+                            }
+                            configured.insert(chord, action);
                             bindings.insert(chord, action);
                         }
                         None => tracing::warn!("invalid key chord {chord:?}; ignored"),
@@ -137,6 +154,8 @@ const DEFAULTS: &[(&str, Action)] = &[
     ("s", Action::Stage),
     ("u", Action::Unstage),
     ("x", Action::Discard),
+    ("]", Action::NextComment),
+    ("[", Action::PrevComment),
 ];
 
 fn parse_action(name: &str) -> Option<Action> {
@@ -164,6 +183,8 @@ fn parse_action(name: &str) -> Option<Action> {
         "stage" => Action::Stage,
         "unstage" => Action::Unstage,
         "discard" => Action::Discard,
+        "next-comment" => Action::NextComment,
+        "prev-comment" => Action::PrevComment,
         _ => return None,
     })
 }

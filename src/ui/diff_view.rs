@@ -56,6 +56,10 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(block, area);
     app.set_diff_area(inner);
 
+    // The review diff cursor row to paint with the selection background — `None`
+    // outside the review view or while its file list is focused (plan §3.4).
+    let cursor = app.review_cursor_highlight();
+
     let lines = match app.active_diff() {
         Some(FileDiff::Text(lines)) if !lines.is_empty() => lines,
         other => {
@@ -64,16 +68,32 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
                 Some(_) => "No changes to show",
                 None => "Select a file to view its diff",
             };
-            render_orphans_only(frame, inner, app, message, theme);
+            render_orphans_only(frame, inner, app, message, theme, cursor);
             return;
         }
     };
 
     let syntax = syntax_for(path.as_deref().unwrap_or(""));
     match app.diff_mode {
-        DiffMode::Unified => render_unified(frame, inner, app, lines, syntax),
-        DiffMode::SideBySide => render_side_by_side(frame, inner, app, lines, syntax),
+        DiffMode::Unified => render_unified(frame, inner, app, lines, syntax, cursor),
+        DiffMode::SideBySide => render_side_by_side(frame, inner, app, lines, syntax, cursor),
     }
+}
+
+/// When `is_cursor`, repaint every span's background with the selection colour
+/// to mark the diff cursor row, keeping each span's foreground (syntax colours)
+/// and modifiers; otherwise return the line untouched. Plan §3.4 pins
+/// selection_bg as the whole-row cursor treatment.
+fn mark_cursor_row(line: Line<'static>, is_cursor: bool, theme: &Theme) -> Line<'static> {
+    if !is_cursor {
+        return line;
+    }
+    let spans: Vec<Span<'static>> = line
+        .spans
+        .into_iter()
+        .map(|span| Span::styled(span.content, span.style.bg(theme.selection_bg)))
+        .collect();
+    Line::from(spans)
 }
 
 /// Render the diff pane when there are no diff lines to show (empty text diff,
@@ -81,22 +101,33 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
 /// still render as a top block — for such a file it's the only place they can
 /// appear (finding 2) — with the `message` hint beneath. With no orphans this is
 /// the plain centered hint, exactly as before.
-fn render_orphans_only(frame: &mut Frame, inner: Rect, app: &App, message: &str, theme: &Theme) {
+fn render_orphans_only(
+    frame: &mut Frame,
+    inner: Rect,
+    app: &App,
+    message: &str,
+    theme: &Theme,
+    cursor: Option<usize>,
+) {
     let orphans = app.selected_file_orphans();
     if orphans.is_empty() {
         app.set_diff_metrics(inner.height, 0);
         centered_hint(frame, inner, message, Style::new().fg(theme.dim));
         return;
     }
-    // Metrics count only the selectable orphan rows so a future cursor rests on a
+    // Metrics count only the selectable orphan rows so the cursor rests on a
     // comment, not the trailing hint.
     app.set_diff_metrics(inner.height, clamp_u16(orphans.len()));
     let offset = app.diff_scroll.min(app.diff_max_scroll()) as usize;
     let mut rows: Vec<Line> = orphans
         .iter()
+        .enumerate()
         .skip(offset)
         .take(inner.height as usize)
-        .map(|&id| comment_row(app, id, theme, inner.width as usize, true))
+        .map(|(i, &id)| {
+            let row = comment_row(app, id, theme, inner.width as usize, true);
+            mark_cursor_row(row, cursor == Some(i), theme)
+        })
         .collect();
     // The no-diff hint follows the orphan rows when there's vertical room left.
     if rows.len() < inner.height as usize {
@@ -114,6 +145,7 @@ fn render_unified(
     app: &App,
     lines: &[DiffLine],
     syntax: &SyntaxReference,
+    cursor: Option<usize>,
 ) {
     // Unified is row-driven: diff lines plus injected comment/orphan rows. Metrics
     // count rows (not lines), so scrolling reaches an injected last row.
@@ -126,12 +158,16 @@ fn render_unified(
 
     let out: Vec<Line> = rows
         .iter()
+        .enumerate()
         .skip(offset)
         .take(inner.height as usize)
-        .map(|row| match row {
-            URow::Line(i) => unified_line(app, &lines[*i], theme, syntax, body_width),
-            URow::Comment(id) => comment_row(app, *id, theme, inner.width as usize, false),
-            URow::Orphan(id) => comment_row(app, *id, theme, inner.width as usize, true),
+        .map(|(i, row)| {
+            let line = match row {
+                URow::Line(li) => unified_line(app, &lines[*li], theme, syntax, body_width),
+                URow::Comment(id) => comment_row(app, *id, theme, inner.width as usize, false),
+                URow::Orphan(id) => comment_row(app, *id, theme, inner.width as usize, true),
+            };
+            mark_cursor_row(line, cursor == Some(i), theme)
         })
         .collect();
     frame.render_widget(Paragraph::new(out), inner);
@@ -177,6 +213,7 @@ fn render_side_by_side(
     app: &App,
     lines: &[DiffLine],
     syntax: &SyntaxReference,
+    cursor: Option<usize>,
 ) {
     let rows = app.sbs_rows(lines);
     app.set_diff_metrics(inner.height, clamp_u16(rows.len()));
@@ -188,10 +225,11 @@ fn render_side_by_side(
 
     let out: Vec<Line> = rows
         .iter()
+        .enumerate()
         .skip(offset)
         .take(inner.height as usize)
-        .map(|row| {
-            side_by_side_line(
+        .map(|(i, row)| {
+            let line = side_by_side_line(
                 app,
                 row,
                 lines,
@@ -200,7 +238,8 @@ fn render_side_by_side(
                 left_w as usize,
                 right_w as usize,
                 inner.width as usize,
-            )
+            );
+            mark_cursor_row(line, cursor == Some(i), theme)
         })
         .collect();
     frame.render_widget(Paragraph::new(out), inner);

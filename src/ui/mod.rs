@@ -193,17 +193,26 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             (" ? ", "help  "),
             (" q ", "quit"),
         ],
-        ViewMode::Review => vec![
-            (" j/k ", "move  "),
-            (" tab ", "pane  "),
-            (" d ", "split  "),
-            (" n ", "line #s  "),
-            (" t ", "theme  "),
-            (" b ", changes_label),
-            (" i ", "history  "),
-            (" ? ", "help  "),
-            (" q ", "quit"),
-        ],
+        ViewMode::Review => {
+            // Comment-navigation hints join the review footer; `x` deletes the
+            // comment under the cursor, so it only shows when the diff pane (where
+            // the cursor lives) is focused. The `c` authoring hint arrives with
+            // the comment action in C5.
+            let mut hints = vec![(" j/k ", "move  "), (" ]/[ ", "notes  ")];
+            if app.diff_focused() {
+                hints.push((" x ", "delete  "));
+            }
+            hints.extend([
+                (" tab ", "pane  "),
+                (" d ", "split  "),
+                (" t ", "theme  "),
+                (" b ", changes_label),
+                (" i ", "history  "),
+                (" ? ", "help  "),
+                (" q ", "quit"),
+            ]);
+            hints
+        }
     };
     let mut spans = Vec::new();
     // Review-only: orphaned comments that no diff block can show (files gone from

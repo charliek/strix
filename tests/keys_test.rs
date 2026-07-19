@@ -48,6 +48,42 @@ fn config_overrides_replace_an_actions_chords() {
 }
 
 #[test]
+fn comment_actions_have_default_chords() {
+    let keymap = Keymap::default();
+    assert_eq!(keymap.action(key(']')), Some(Action::NextComment));
+    assert_eq!(keymap.action(key('[')), Some(Action::PrevComment));
+}
+
+#[test]
+fn next_comment_is_remappable_via_the_keymap() {
+    let mut overrides = HashMap::new();
+    overrides.insert("next-comment".to_string(), vec!["p".to_string()]);
+    let keymap = Keymap::from_config(Some(&overrides));
+    assert_eq!(keymap.action(key('p')), Some(Action::NextComment));
+    // The default ']' was released by the remap.
+    assert_eq!(keymap.action(key(']')), None);
+}
+
+#[test]
+fn a_chord_assigned_to_two_actions_in_config_resolves_to_one() {
+    // Assigning the same chord to two different actions is a config collision:
+    // it must warn (exercised here) and last-writer-wins leaves exactly one
+    // action on the chord — never a silent double binding.
+    let mut overrides = HashMap::new();
+    overrides.insert("next-comment".to_string(), vec!["p".to_string()]);
+    overrides.insert("prev-comment".to_string(), vec!["p".to_string()]);
+    let keymap = Keymap::from_config(Some(&overrides));
+    let resolved = keymap.action(key('p'));
+    assert!(
+        matches!(
+            resolved,
+            Some(Action::NextComment) | Some(Action::PrevComment)
+        ),
+        "the chord resolves to exactly one of the colliding actions: {resolved:?}"
+    );
+}
+
+#[test]
 fn invalid_overrides_are_ignored() {
     let mut overrides = HashMap::new();
     overrides.insert("nonsense-action".to_string(), vec!["a".to_string()]);
