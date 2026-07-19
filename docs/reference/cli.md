@@ -4,6 +4,7 @@
 strix [OPTIONS] [PATH]
 strix diff <RANGE> [PATH]
 strix comment [PATH] <list|add|rm|clear|gc>
+strix skill path [--json]
 ```
 
 The root form opens the staging view. `strix diff <RANGE>` opens a read-only
@@ -12,7 +13,8 @@ review session comparing two commits instead — see
 `strix comment` reads and edits the review-comments inbox for the checked-out
 branch without opening the TUI at all — the agent-facing surface for the
 comments a human leaves in a review session — see
-[`strix comment`](#strix-comment) below.
+[`strix comment`](#strix-comment) below. `strix skill` manages the bundled
+agent skill that teaches that workflow — see [`strix skill`](#strix-skill).
 
 ## Root: `strix [PATH]`
 
@@ -194,6 +196,42 @@ per-store lock's stale-lock-on-crash failure mode was judged worse than a
 millisecond race for a two-party (one human, one agent) workflow. The store
 itself stays parseable and self-consistent either way.
 
+## `strix skill`
+
+```text
+strix skill path [--json]
+```
+
+Manages the bundled `strix-review` agent skill — the document that teaches an
+agent the review-comment loop (see the
+[review loop guide](../guides/review-loop.md)). One action so far: `path`.
+
+### `path`
+
+Writes the skill embedded in this binary to
+
+```text
+<data_dir>/strix/skills/strix-review/SKILL.md
+```
+
+and prints that absolute path. The file is rewritten (atomically) on **every
+invocation**, so the on-disk copy always matches the binary that printed the
+path — after upgrading strix, the next `strix skill path` refreshes any stale
+copy.
+
+`data_dir` resolves as:
+
+| Condition | `data_dir` |
+|---|---|
+| `$STRIX_DATA_DIR` set to a non-empty value | that value; a relative path is resolved against the current directory, so the printed path is always absolute |
+| otherwise | the platform data directory — `~/Library/Application Support` on macOS, `$XDG_DATA_HOME` (default `~/.local/share`) on Linux |
+
+An empty `$STRIX_DATA_DIR` counts as unset. Unlike the other subcommands,
+`strix skill` takes no `[PATH]` and never touches a repository — it works
+from any directory, inside a checkout or not.
+
+With `--json`, stdout is `{"path": "…"}` instead of the bare path.
+
 ## Global options
 
 Available on both the root command and `strix diff`.
@@ -212,6 +250,7 @@ Available on both the root command and `strix diff`.
 | Variable    | Description                                                          |
 |-------------|----------------------------------------------------------------------|
 | `STRIX_LOG` | Log verbosity, same syntax as `RUST_LOG` (e.g. `info`, `debug`, `strix=trace`). Logs are written to a file, never to the terminal. |
+| `STRIX_DATA_DIR` | Overrides the data directory `strix skill path` materializes into (empty counts as unset; relative resolves against the current directory). |
 
 ## Logs
 

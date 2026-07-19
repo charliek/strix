@@ -83,6 +83,7 @@ nav:
       - Usage: getting-started/usage.md
       - Keybindings: getting-started/keybindings.md
   - Guides:
+      - Review loop: guides/review-loop.md
       - Theming: guides/theming.md
       - Configuration: guides/configuration.md
   - Reference:

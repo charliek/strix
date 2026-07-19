@@ -35,6 +35,7 @@ assertions.
 | `keys`        | The configurable keymap: `Action`, default chords, `[keys]` overrides; dispatch itself lives in `App::on_key`/`App::on_mouse`. |
 | `comments`    | Review-comment model, JSON store I/O, and the re-anchor engine (pure; see [comments store](#comments-store)). |
 | `comments_cli`| `strix comment list\|add\|rm\|clear\|gc` — the agent-facing CLI over the same store. |
+| `skill`       | `strix skill path` — materializes the bundled `strix-review` skill (see [skill distribution](#skill-distribution)). |
 
 ## Git layer
 
@@ -97,6 +98,19 @@ The watcher (`watch.rs`) recursively watches the workdir as usual, plus
 worktree the shared store lives *outside* the watched workdir entirely, so
 without that extra root an agent's CLI writes there would never trigger a
 live refresh.
+
+### Skill distribution
+
+The `strix-review` agent skill lives in the repo at
+`skills/strix-review/SKILL.md` — the single source of truth, from which
+skills.sh and the Claude Code plugin manifests (`.claude-plugin/`) install
+directly — and is *also* embedded into the binary at compile time
+(`include_str!` in `src/skill.rs`). `strix skill path` materializes that
+embedded copy on demand under the user's data directory and prints the
+absolute path, overwriting on every invocation so the on-disk file can never
+drift from the binary that ships it. This is what lets any agent, plugin
+system or not, be pointed at a current copy of the skill with one command —
+see [`strix skill`](cli.md#strix-skill).
 
 ## Diff model
 
@@ -207,8 +221,9 @@ Reviewing a branch against its base (`strix diff <base>`) is explicitly **in
 scope** — it's the foundation for strix becoming the review surface for
 agent-written code. Inline review comments (`c`/`x`/`]`/`[` in a review
 session, plus `strix comment` for agents — see [Review view](#review-view)
-and [comments store](#comments-store) above) build directly on it; an
-agent-facing skill is the next piece on that track, not a future-phase item.
+and [comments store](#comments-store) above) build directly on it, and the
+bundled `strix-review` skill (see
+[skill distribution](#skill-distribution)) teaches agents that loop.
 
 Keeping the surface area narrow otherwise is the point: strix earns its place
 by doing "review a changeset and stage it," "browse history," and now
