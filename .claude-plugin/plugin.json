@@ -1,0 +1,13 @@
+{
+  "name": "strix",
+  "version": "0.0.2",
+  "description": "Address inline review comments left in a strix diff: read the inbox with strix comment list, fix, commit, then rm.",
+  "author": {
+    "name": "Charlie Knudsen",
+    "url": "https://github.com/charliek"
+  },
+  "homepage": "https://github.com/charliek/strix",
+  "repository": "https://github.com/charliek/strix",
+  "license": "MIT",
+  "keywords": ["strix", "skills", "git", "review", "diff"]
+}

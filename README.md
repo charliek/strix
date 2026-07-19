@@ -75,6 +75,31 @@ the two revisions directly. See
 range grammar and [keybindings](docs/getting-started/keybindings.md) for the
 full key set.
 
+## Agent review loop
+
+The review comments close a loop: you review a branch with `strix diff main`,
+press `c` to leave inline notes on the diff, then tell your agent to "address
+my strix comments". The agent reads the inbox with `strix comment list --json`,
+fixes each note, commits, and removes it — resolved comments vanish from your
+open review as it works. The bundled `strix-review` skill teaches an agent
+that contract. Install it via [skills.sh](https://skills.sh), which targets
+Claude Code, GitHub Copilot, OpenCode, and many other agents:
+
+```bash
+npx skills add charliek/strix
+```
+
+For Claude Code, a native plugin is also available:
+
+```
+/plugin marketplace add charliek/strix
+/plugin install strix@strix
+```
+
+Any other agent can be pointed at the skill file directly: `strix skill path`
+writes the bundled skill to disk and prints its absolute path. See the
+[review loop guide](docs/guides/review-loop.md) for the full workflow.
+
 ## Documentation
 
 The full site lives under `docs/` and builds with `mkdocs-material`
@@ -82,6 +107,7 @@ The full site lives under `docs/` and builds with `mkdocs-material`
 
 - [Installation](docs/getting-started/installation.md)
 - [Usage](docs/getting-started/usage.md) and [Keybindings](docs/getting-started/keybindings.md)
+- [Review loop](docs/guides/review-loop.md) — the human-comments → agent-fixes workflow
 - [Theming](docs/guides/theming.md) and [Configuration](docs/guides/configuration.md)
 - [CLI reference](docs/reference/cli.md) and [Architecture](docs/reference/architecture.md)
 

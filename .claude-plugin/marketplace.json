@@ -1,0 +1,15 @@
+{
+  "name": "strix",
+  "description": "strix skill for the agent review loop: address inline review comments a human left on a strix diff.",
+  "owner": {
+    "name": "Charlie Knudsen",
+    "url": "https://github.com/charliek"
+  },
+  "plugins": [
+    {
+      "name": "strix",
+      "source": "./",
+      "description": "Address inline review comments left in a strix diff: read the inbox with strix comment list, fix, commit, then rm."
+    }
+  ]
+}

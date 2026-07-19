@@ -13,6 +13,7 @@ pub mod git;
 pub mod graph;
 pub mod keys;
 pub mod logging;
+pub mod skill;
 pub mod terminal;
 pub mod ui;
 pub mod util;
@@ -39,6 +40,12 @@ pub fn run() -> Result<()> {
             None => std::env::current_dir()?,
         };
         return comments_cli::run(&repo_path, action);
+    }
+
+    // `skill` is likewise CLI-only and repo-independent (it materializes a file
+    // under the data dir): route it before any App construction.
+    if let Some(cli::Command::Skill { action }) = &cli.command {
+        return skill::run(action);
     }
 
     let (path, range) = cli.target();
