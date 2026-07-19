@@ -6,48 +6,124 @@
 //! stderr message (no JSON error envelope). Every action operates on the current
 //! HEAD branch key; a corrupt store fails the action non-zero and leaves the file
 //! untouched (the store's fresh-read-before-write guard, [`comments::mutate`]).
+//!
+//! `list`/`add` are scope-aware (plan §3.3): a comment lives either on the
+//! uncommitted working tree (`Scope::WorkTree`) or on a committed range
+//! (`Scope::Range`), and each headless call first re-anchors/sweeps the
+//! relevant scope so the result is never stale. The worktree pass reuses
+//! [`crate::app::worktree_facts`] — the exact engine a live TUI session runs
+//! (`App::sync_status_comments`, C3) — so there is one sweep engine, not two.
 
 use std::collections::HashSet;
 use std::path::Path;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use serde_json::json;
 
-use crate::cli::CommentAction;
+use crate::app::worktree_facts;
+use crate::cli::{CommentAction, ScopeArg};
 use crate::comments::{self, Comment, Scope, Side, Source};
-use crate::git::{DiffLine, FileDiff, Repo};
+use crate::git::{Change, CommitFile, DiffLine, FileDiff, FileEntry, Repo, ReviewSpec, Status};
 
 /// Dispatch a `strix comment` action against the repository at `repo_path`.
+///
+/// `rm`/`clear`/`gc` derive the inbox key with a single `head_branch_key()`
+/// read — they never also read `Status`, so there's no second read to
+/// disagree with. `list` and worktree `add` *do* read `Status` (for the
+/// dirty-check default and the worktree sweep facts), so they derive the key
+/// from that same snapshot instead (`status_branch_key`, codex-C4 #2): a
+/// separate `head_branch_key()` call there would be a second, independent git
+/// read that could momentarily disagree with `Status` under an external
+/// checkout race, keying the inbox to one branch while sweeping with another
+/// branch's facts.
 pub fn run(repo_path: &Path, action: &CommentAction) -> Result<()> {
     let repo = Repo::open(repo_path)?;
     let dir = repo.strix_dir();
-    let branch = repo.head_branch_key()?;
     match action {
-        CommentAction::List { json } => list(&repo, &dir, &branch, *json),
+        CommentAction::List { scope, json } => list(&repo, &dir, *scope, *json),
         CommentAction::Add {
             file,
             old_line,
             new_line,
             text,
+            scope,
+            range,
             json,
         } => add(
-            &repo, &dir, &branch, file, *old_line, *new_line, text, *json,
+            &repo,
+            &dir,
+            file,
+            *old_line,
+            *new_line,
+            text,
+            *scope,
+            range.as_deref(),
+            *json,
         ),
-        CommentAction::Rm { id, json } => rm(&dir, &branch, *id, *json),
-        CommentAction::Clear { json } => clear(&dir, &branch, *json),
+        CommentAction::Rm { id, json } => {
+            let branch = repo.head_branch_key()?;
+            rm(&dir, &branch, *id, *json)
+        }
+        CommentAction::Clear { scope, all, json } => {
+            let branch = repo.head_branch_key()?;
+            clear(&dir, &branch, *scope, *all, *json)
+        }
         CommentAction::Gc { json } => gc(&repo, &dir, *json),
     }
 }
 
-fn list(repo: &Repo, dir: &Path, branch: &str, json_out: bool) -> Result<()> {
-    // A corrupt/unsupported store fails here (non-zero) before any write.
-    let store = comments::load(dir)?;
-    let entry = store.branches.get(branch);
-    let range = entry.and_then(|b| b.active_range.clone());
-    let mut comments = entry.map(|b| b.comments.clone()).unwrap_or_default();
+/// The inbox key implied by a `Status` snapshot, via [`Status::branch_key`] —
+/// the branch name (normal or unborn) or, when `HEAD` is detached, the full
+/// commit hex, exactly matching [`Repo::head_branch_key`]'s semantics but
+/// derived from *this* read rather than a second one (codex-C4 #2). `None`
+/// only if `git status` reported neither a branch name nor an oid, which
+/// shouldn't happen in practice; surfaced as an error rather than silently
+/// guessing a key.
+fn status_branch_key(status: &Status) -> Result<String> {
+    status
+        .branch_key()
+        .context("could not determine the checked-out branch from `git status`")
+}
 
-    // Re-anchor first, best-effort (plan §3.2c).
-    reanchor_pass(repo, dir, branch, range.as_deref(), &mut comments);
+fn list(repo: &Repo, dir: &Path, scope: Option<ScopeArg>, json_out: bool) -> Result<()> {
+    let status = repo.status()?;
+    let branch = status_branch_key(&status)?;
+    // A corrupt/unsupported store fails here (non-zero) before any write.
+    let stored_range = comments::load(dir)?
+        .branches
+        .get(&branch)
+        .and_then(|b| b.active_range.clone());
+
+    // Default per plan §3.3: worktree when the repo is dirty (the common agent
+    // case), else the branch's active reviewed range.
+    let effective = scope.unwrap_or(if status.is_clean() {
+        ScopeArg::Range
+    } else {
+        ScopeArg::Worktree
+    });
+
+    // Scope-filtered re-anchor + sweep first (write-elided), so a headless list
+    // is never stale.
+    if matches!(effective, ScopeArg::Worktree | ScopeArg::All) {
+        sync_worktree_scope(repo, dir, &branch, &status)?;
+    }
+    if matches!(effective, ScopeArg::Range | ScopeArg::All) {
+        if let Some(range) = &stored_range {
+            sync_range_scope(repo, dir, &branch, range)?;
+        }
+    }
+
+    // Re-read after the pass(es) above (each already persisted its own change,
+    // if any) for the final, scope-filtered set.
+    let store = comments::load(dir)?;
+    let entry = store.branches.get(&branch);
+    let range = entry.and_then(|b| b.active_range.clone());
+    let comments: Vec<Comment> = entry
+        .map(|b| b.comments.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|c| scope_matches(c, effective))
+        .collect();
 
     if json_out {
         let value = json!({
@@ -66,11 +142,12 @@ fn list(repo: &Repo, dir: &Path, branch: &str, json_out: bool) -> Result<()> {
 fn add(
     repo: &Repo,
     dir: &Path,
-    branch: &str,
     file: &str,
     old_line: Option<usize>,
     new_line: Option<usize>,
     text: &str,
+    scope: Option<ScopeArg>,
+    range: Option<&str>,
     json_out: bool,
 ) -> Result<()> {
     let (side, line) = match (old_line, new_line) {
@@ -85,45 +162,120 @@ fn add(
     if text.trim().is_empty() {
         bail!("--text must not be empty");
     }
+    let scope = scope.unwrap_or(ScopeArg::Worktree);
+    if scope == ScopeArg::All {
+        bail!("--scope all is not valid for `add`; use worktree or range");
+    }
 
-    // Fresh read for the stored range (also fails fast on a corrupt store).
-    let store = comments::load(dir)?;
-    let range = store
-        .branches
-        .get(branch)
-        .and_then(|b| b.active_range.clone());
-
-    // Re-anchor the branch's existing comments too — the pass runs on `add` as
-    // well as `list` (plan §3.2c), so an agent annotating also refreshes the set.
-    let mut existing = store
-        .branches
-        .get(branch)
-        .map(|b| b.comments.clone())
-        .unwrap_or_default();
-    reanchor_pass(repo, dir, branch, range.as_deref(), &mut existing);
-
-    // The new comment's anchor is resolved against the stored range: line found →
-    // context captured, not orphaned; range resolves but the line is absent (file
-    // gone/binary/no such line) → orphaned honestly with no context; range
-    // unresolvable or absent → context null and *not* orphaned (unknown, not
-    // orphaned — plan §3.2/§3.3).
-    let (context, orphaned) = match range.as_deref() {
-        None => (None, false),
-        Some(range_str) => match capture_context(repo, range_str, file, side, line) {
-            Ok(Some(text)) => (Some(text), false),
-            Ok(None) => (None, true),
-            Err(_) => (None, false),
-        },
+    let comment = match scope {
+        // Worktree needs `Status` (for the baseline OID + sweep facts), so its
+        // inbox key is derived from that same snapshot (codex-C4 #2) rather
+        // than a second, separate `head_branch_key()` read.
+        ScopeArg::Worktree => {
+            let status = repo.status()?;
+            let branch = status_branch_key(&status)?;
+            add_worktree(repo, dir, &branch, file, side, line, text, &status)?
+        }
+        // Range never touches `Status`, so a single `head_branch_key()` read
+        // has nothing to disagree with.
+        ScopeArg::Range => {
+            let branch = repo.head_branch_key()?;
+            add_range(repo, dir, &branch, file, side, line, text, range)?
+        }
+        ScopeArg::All => unreachable!("rejected above"),
     };
 
+    if json_out {
+        print_json(&json!({ "comment": comment }));
+    } else {
+        println!("{}", comment.id);
+    }
+    Ok(())
+}
+
+/// `add`'s worktree-scope path: re-anchor/sweep the branch's existing worktree
+/// comments first (the same pass `list --scope worktree` runs), then push the
+/// new comment stamped with the current HEAD as its baseline (plan §3.3).
+/// Takes `status` from the caller (rather than reading it again) so the
+/// branch key, the sweep facts, and the baseline OID all come from one
+/// snapshot (codex-C4 #2).
+#[allow(clippy::too_many_arguments)]
+fn add_worktree(
+    repo: &Repo,
+    dir: &Path,
+    branch: &str,
+    file: &str,
+    side: Side,
+    line: usize,
+    text: &str,
+    status: &Status,
+) -> Result<Comment> {
+    sync_worktree_scope(repo, dir, branch, status)?;
+
+    let context = capture_context_worktree(repo, status, file, side, line);
+    let orphaned = context.is_none();
+    let base = status.head_oid.clone();
     let created_at = comments::now_secs();
-    let comment = comments::mutate(dir, |store| {
+
+    comments::mutate(dir, |store| {
         let id = store.take_id();
+        let entry = store.branches.entry(branch.to_string()).or_default();
         let comment = Comment {
-            // The milestone-6 CLI is range-oriented; the branch's active range is
-            // the scope source. `--scope`/`--range` selection lands in C4.
+            scope: Scope::WorkTree,
+            id,
+            source: Source::Agent,
+            file: file.to_string(),
+            side,
+            line,
+            text: text.to_string(),
+            context,
+            orphaned,
+            created_at,
+            base,
+            stale: false,
+        };
+        entry.comments.push(comment.clone());
+        comment
+    })
+}
+
+/// `add`'s range-scope path: resolve the target range (`--range`, else the
+/// branch's active range — an error if neither exists, so an invalid empty
+/// range is never persisted), re-anchor the branch's existing range comments
+/// against it, then push the new comment.
+#[allow(clippy::too_many_arguments)]
+fn add_range(
+    repo: &Repo,
+    dir: &Path,
+    branch: &str,
+    file: &str,
+    side: Side,
+    line: usize,
+    text: &str,
+    range: Option<&str>,
+) -> Result<Comment> {
+    let target = resolve_add_range(dir, branch, range)?;
+    sync_range_scope(repo, dir, branch, &target)?;
+
+    let (context, orphaned) = match capture_context(repo, &target, file, side, line) {
+        Ok(Some(text)) => (Some(text), false),
+        Ok(None) => (None, true),
+        Err(_) => (None, false),
+    };
+    let created_at = comments::now_secs();
+
+    comments::mutate(dir, |store| {
+        let id = store.take_id();
+        let entry = store.branches.entry(branch.to_string()).or_default();
+        // The session-open pass (`strix diff`) records a review range; do it
+        // defensively here too, mirroring `App::submit_comment_input` — an
+        // `--range` given explicitly with none stored yet becomes the active one.
+        if entry.active_range.is_none() {
+            entry.active_range = Some(target.clone());
+        }
+        let comment = Comment {
             scope: Scope::Range {
-                range: range.clone().unwrap_or_default(),
+                range: target.clone(),
             },
             id,
             source: Source::Agent,
@@ -137,27 +289,35 @@ fn add(
             base: None,
             stale: false,
         };
-        store
-            .branches
-            .entry(branch.to_string())
-            .or_default()
-            .comments
-            .push(comment.clone());
+        entry.comments.push(comment.clone());
         comment
-    })?;
+    })
+}
 
-    if json_out {
-        print_json(&json!({ "comment": comment }));
-    } else {
-        println!("{}", comment.id);
+/// The target range for a `--scope range add`: `--range` when given, else the
+/// branch's stored `active_range`. Errors when neither is available — a range
+/// comment always needs a range to anchor against, so this never persists the
+/// empty-range placeholder the milestone-6 CLI used to write (codex-C2a
+/// finding #8).
+fn resolve_add_range(dir: &Path, branch: &str, range: Option<&str>) -> Result<String> {
+    if let Some(range) = range {
+        return Ok(range.to_string());
     }
-    Ok(())
+    let stored = comments::load(dir)?
+        .branches
+        .get(branch)
+        .and_then(|b| b.active_range.clone());
+    stored.context(
+        "range scope needs a range: pass --range <RANGE>, or run `strix diff <RANGE>` \
+         first to record this branch's active range",
+    )
 }
 
 fn rm(dir: &Path, branch: &str, id: u64, json_out: bool) -> Result<()> {
     // Detect a missing id from a fresh read *before* mutating: an unknown id must
     // surface "not found on branch <key>", not a spurious write error under an
-    // unwritable store, and must not touch the file at all (plan §3.3).
+    // unwritable store, and must not touch the file at all (plan §3.3). Ids are
+    // store-global, so this looks across every scope on the branch.
     let present = comments::load(dir)?
         .branches
         .get(branch)
@@ -184,12 +344,29 @@ fn rm(dir: &Path, branch: &str, id: u64, json_out: bool) -> Result<()> {
     }
 }
 
-fn clear(dir: &Path, branch: &str, json_out: bool) -> Result<()> {
+/// `clear` never wipes everything implicitly (plan §3.3): exactly one of
+/// `--scope` or `--all` is required, and combining both is a usage error.
+fn clear(
+    dir: &Path,
+    branch: &str,
+    scope: Option<ScopeArg>,
+    all: bool,
+    json_out: bool,
+) -> Result<()> {
+    let effective = match (scope, all) {
+        (Some(_), true) => bail!("pass either --scope or --all, not both"),
+        (Some(scope), false) => scope,
+        (None, true) => ScopeArg::All,
+        (None, false) => bail!(
+            "clear requires a scope: pass --scope worktree|range|all, or --all — \
+             a bare `clear` never wipes everything implicitly"
+        ),
+    };
     let cleared = comments::mutate(dir, |store| match store.branches.get_mut(branch) {
         Some(entry) => {
-            let n = entry.comments.len();
-            entry.comments.clear();
-            n
+            let before = entry.comments.len();
+            entry.comments.retain(|c| !scope_matches(c, effective));
+            before - entry.comments.len()
         }
         None => 0,
     })?;
@@ -206,7 +383,8 @@ fn gc(repo: &Repo, dir: &Path, json_out: bool) -> Result<()> {
     // The checked-out inbox is always live: an unborn HEAD names a branch that
     // `branch_names()` can't see yet (no ref), and a detached HEAD's commit key
     // is its own liveness — either way GC must never drop the current session's
-    // comments (plan §3.1).
+    // comments (plan §3.1). Both scopes on a dropped branch key go together —
+    // `comments::gc` retires the whole branch entry, not one scope of it.
     live.insert(repo.head_branch_key()?);
     let result = comments::mutate_if_changed(dir, |store| {
         let result = comments::gc(store, &live, |key| repo.commit_exists(key));
@@ -228,49 +406,123 @@ fn gc(repo: &Repo, dir: &Path, json_out: bool) -> Result<()> {
     Ok(())
 }
 
-/// The shared best-effort re-anchor pass for `list` and `add` (plan §3.2c): when
-/// the stored `range` resolves, re-anchor `comments` in place and persist if
-/// anything changed. A range that no longer resolves serves the persisted state
-/// (warning on stderr); a persist failure never fails the caller (warning only).
-fn reanchor_pass(
-    repo: &Repo,
-    dir: &Path,
-    branch: &str,
-    range: Option<&str>,
-    comments: &mut [Comment],
-) {
-    let Some(range_str) = range else { return };
-    match reanchor(repo, range_str, comments) {
-        Ok(true) => {
-            if let Err(err) = persist_reanchor(dir, branch, comments) {
-                eprintln!("strix: warning: could not persist re-anchored comments: {err:#}");
-            }
-        }
-        Ok(false) => {}
-        Err(err) => {
-            eprintln!("strix: warning: could not re-anchor against range '{range_str}': {err:#}");
-        }
+/// Whether `comment` belongs to the requested CLI `scope` selector.
+fn scope_matches(comment: &Comment, scope: ScopeArg) -> bool {
+    match scope {
+        ScopeArg::All => true,
+        ScopeArg::Worktree => matches!(comment.scope, Scope::WorkTree),
+        ScopeArg::Range => matches!(comment.scope, Scope::Range { .. }),
     }
 }
 
-/// Run the re-anchor pass against the resolved `range`, returning whether any
-/// comment moved or orphaned. Errors only when the range can't be resolved.
-fn reanchor(repo: &Repo, range: &str, comments: &mut [Comment]) -> Result<bool> {
-    let spec = repo.resolve_range(range)?;
-    let files = repo.range_files(&spec)?;
-    Ok(comments::reanchor(comments, &files, |file| {
-        repo.range_file_diff(&spec, file)
-    }))
+/// Fresh-read the store, run `apply` against this branch's freshly loaded
+/// comments `Vec` in place, and persist only when `apply` reports a change
+/// (write-elided) — the shared shell behind [`sync_worktree_scope`] and
+/// [`sync_range_scope`], which differ only in *which* engine they run over
+/// that `Vec` (sweep vs. scoped re-anchor).
+///
+/// `apply` runs *inside* this one `mutate_if_changed` closure against the
+/// freshly loaded store: earlier the CLI computed a re-anchor against an
+/// already-stale clone and then unconditionally overwrote the freshly-read
+/// entry with it, silently dropping any comment a concurrent writer had added
+/// in between (codex-C2a finding #3). Mutating the freshly-loaded entry's
+/// `Vec` in place, as done here, can't lose a concurrent write that way.
+fn sync_scope(
+    dir: &Path,
+    branch: &str,
+    apply: impl FnOnce(&mut Vec<Comment>) -> bool,
+) -> Result<()> {
+    comments::mutate_if_changed(dir, |store| {
+        let entry = store.branches.entry(branch.to_string()).or_default();
+        let changed = apply(&mut entry.comments);
+        ((), changed)
+    })
 }
 
-/// Persist re-anchored comments for `branch` — a fresh read-modify-write, so a
-/// concurrent agent edit is read before we overwrite this branch's set.
-fn persist_reanchor(dir: &Path, branch: &str, comments: &[Comment]) -> Result<()> {
-    comments::mutate(dir, |store| {
-        if let Some(entry) = store.branches.get_mut(branch) {
-            entry.comments = comments.to_vec();
+/// Apply the worktree lifecycle pass (re-anchor + sweep, plan §3.2) to
+/// `branch`'s comments — the exact engine [`crate::app`]'s
+/// `sync_status_comments` runs for a live TUI session (C3), via the shared
+/// [`worktree_facts`], so a headless `list`/`add` sees the same lifecycle a
+/// human's session would, not a second copy of it.
+fn sync_worktree_scope(repo: &Repo, dir: &Path, branch: &str, status: &Status) -> Result<()> {
+    sync_scope(dir, branch, |comments| {
+        comments::sweep_worktree(comments, status.head_oid.as_deref(), |comment| {
+            worktree_facts(repo, status, comment)
+        })
+    })
+}
+
+/// Re-anchor `branch`'s `Scope::Range` comments matching `target` against
+/// `target`'s diff — the milestone-6 range re-anchor, scoped so a worktree
+/// comment or a comment from a *different* stored range is never touched. A
+/// `target` that fails to resolve warns on stderr and changes nothing
+/// (matches the milestone-6 `list`/`add` behavior: an unreadable range never
+/// fails the caller, since the caller may just be re-listing a stale/deleted
+/// range).
+fn sync_range_scope(repo: &Repo, dir: &Path, branch: &str, target: &str) -> Result<()> {
+    sync_scope(dir, branch, |comments| {
+        match resolve_range_files(repo, target) {
+            Ok((spec, files)) => comments::reanchor_scoped(
+                comments,
+                |c| matches_range_scope(c, target),
+                &files,
+                |file| repo.range_file_diff(&spec, file),
+            ),
+            Err(err) => {
+                eprintln!("strix: warning: could not re-anchor against range '{target}': {err:#}");
+                false
+            }
         }
     })
+}
+
+/// Whether `comment` is a range comment belonging to `target`: an empty
+/// recorded range (a legacy/CLI placeholder predating scoped ranges) matches
+/// any target — same leniency as `App`'s review-side re-anchor
+/// (`is_review_scope`) — a worktree comment never matches.
+fn matches_range_scope(comment: &Comment, target: &str) -> bool {
+    matches!(&comment.scope, Scope::Range { range } if range.is_empty() || range == target)
+}
+
+fn resolve_range_files(repo: &Repo, range: &str) -> Result<(ReviewSpec, Vec<CommitFile>)> {
+    let spec = repo.resolve_range(range)?;
+    let files = repo.range_files(&spec)?;
+    Ok((spec, files))
+}
+
+/// The anchored line's text at `line` on `side` in `file`'s **worktree** net
+/// diff (HEAD→worktree, plan §3.1), or `None` when the file/line isn't present
+/// there (deleted, untracked-but-absent, or simply not part of the current
+/// diff). Mirrors [`capture_context`]'s range counterpart but over the
+/// worktree surface; unlike the sweep engine's lifecycle pass, no
+/// rename-following is needed — the caller names the file directly, and a
+/// nonexistent path's HEAD/worktree bytes both resolve empty, yielding an
+/// empty (not-found) diff on their own.
+fn capture_context_worktree(
+    repo: &Repo,
+    status: &Status,
+    file: &str,
+    side: Side,
+    line: usize,
+) -> Option<String> {
+    let entry = status
+        .staged
+        .iter()
+        .chain(status.unstaged.iter())
+        .find(|e| e.path == file)
+        .cloned()
+        .unwrap_or_else(|| FileEntry {
+            path: file.to_string(),
+            orig_path: None,
+            change: Change::Modified,
+        });
+    let FileDiff::Text(lines) = repo.file_diff_head_vs_worktree(&entry) else {
+        return None; // binary
+    };
+    lines
+        .iter()
+        .find(|dl| line_no(dl, side) == Some(line))
+        .map(|dl| dl.text.clone())
 }
 
 /// The anchored line's text at `line` on `side` in the range's diff of `file`,
@@ -282,8 +534,7 @@ fn capture_context(
     side: Side,
     line: usize,
 ) -> Result<Option<String>> {
-    let spec = repo.resolve_range(range)?;
-    let files = repo.range_files(&spec)?;
+    let (spec, files) = resolve_range_files(repo, range)?;
     let Some(commit_file) = files.iter().find(|f| f.path == file) else {
         return Ok(None);
     };
@@ -312,8 +563,8 @@ fn print_json(value: &serde_json::Value) {
     }
 }
 
-/// The plain-text table: `⚠` marks orphans, columns aligned. An empty set prints
-/// nothing (exit 0).
+/// The plain-text table: `⚠` marks orphans, `w`/`r` the scope, columns aligned.
+/// An empty set prints nothing (exit 0).
 fn print_table(comments: &[Comment]) {
     if comments.is_empty() {
         return;
@@ -327,8 +578,15 @@ fn print_table(comments: &[Comment]) {
     let loc_w = locs.iter().map(String::len).max().unwrap_or(0);
     for (comment, loc) in comments.iter().zip(&locs) {
         let mark = if comment.orphaned { '⚠' } else { ' ' };
+        let scope = match &comment.scope {
+            Scope::WorkTree => 'w',
+            Scope::Range { .. } => 'r',
+        };
         let first = comment.text.lines().next().unwrap_or("");
-        println!("{mark} {:>id_w$}  {:<loc_w$}  {first}", comment.id, loc,);
+        println!(
+            "{mark} {scope} {:>id_w$}  {:<loc_w$}  {first}",
+            comment.id, loc,
+        );
     }
 }
 

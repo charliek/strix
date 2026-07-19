@@ -1,4 +1,4 @@
-//! Binary-level tests for `strix comment <list|add|rm|clear|gc>` (plan §3.3, C2).
+//! Binary-level tests for `strix comment <list|add|rm|clear|gc>` (plan §3.3, C4).
 //!
 //! Each test drives the real binary against a temp repo fixture, invoking it with
 //! the repo as the working directory (the natural agent form — `cd repo && strix
@@ -10,9 +10,9 @@ mod common;
 use std::path::Path;
 use std::process::{Command, Output};
 
-use common::{git, init_empty_repo, init_repo, init_repo_with_history};
+use common::{git, init_empty_repo, init_repo, init_repo_with_history, write};
 use serde_json::Value;
-use strix::cli::{Cli, Command as CliCommand, CommentAction};
+use strix::cli::{Cli, Command as CliCommand, CommentAction, ScopeArg};
 
 fn run(dir: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_strix"))
@@ -39,7 +39,35 @@ fn json_ok(dir: &Path, args: &[&str]) -> Value {
     })
 }
 
-/// Assert a comment object carries every §3.3 key with the right JSON types.
+/// The full commit hex `rev` resolves to, via `git rev-parse`.
+fn git_rev_parse(dir: &Path, rev: &str) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", rev])
+        .output()
+        .expect("spawn git rev-parse");
+    assert!(out.status.success(), "git rev-parse {rev} failed");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Write a comments store with a stored `active_range` for `main`, for tests
+/// that need range-scoped comments without a live `strix diff` session.
+fn seed_active_range(repo: &Path, range: &str) {
+    let store_dir = repo.join(".git").join("strix");
+    std::fs::create_dir_all(&store_dir).unwrap();
+    std::fs::write(
+        store_dir.join("comments.json"),
+        format!(
+            r#"{{ "version": 2, "next_id": 1, "branches": {{ "main": {{ "active_range": "{range}", "comments": [] }} }} }}"#
+        ),
+    )
+    .unwrap();
+}
+
+/// Assert a comment object carries every §3.3 key with the right JSON types,
+/// including the C4-added flat `scope` tag (additive: every milestone-6 key
+/// stays present and typed the same).
 fn assert_comment_schema(c: &Value) {
     assert!(c["id"].is_u64(), "id is a number: {c}");
     assert!(c["source"].is_string(), "source is a string: {c}");
@@ -53,6 +81,17 @@ fn assert_comment_schema(c: &Value) {
     );
     assert!(c["orphaned"].is_boolean(), "orphaned is a bool: {c}");
     assert!(c["created_at"].is_u64(), "created_at is a number: {c}");
+    match c["scope"].as_str() {
+        Some("worktree") => assert!(
+            c["range"].is_null(),
+            "worktree comments carry no range: {c}"
+        ),
+        Some("range") => assert!(
+            c["range"].is_string(),
+            "range comments carry their range: {c}"
+        ),
+        other => panic!("scope must be \"worktree\" or \"range\": {other:?} in {c}"),
+    }
 }
 
 // --- parse-level (mirrors tests/cli_test.rs) ---
@@ -62,10 +101,14 @@ fn comment_subcommand_tree_parses() {
     let cli = Cli::try_parse(&["strix", "comment", "list", "--json"]).expect("parse");
     match cli.command {
         Some(CliCommand::Comment {
-            action: CommentAction::List { json },
+            action: CommentAction::List { scope, json },
             path,
         }) => {
             assert!(json, "--json set");
+            assert_eq!(
+                scope, None,
+                "no --scope: resolved later per the dirty state"
+            );
             assert_eq!(path, None);
         }
         other => panic!("expected comment list, got {other:?}"),
@@ -91,6 +134,8 @@ fn comment_subcommand_tree_parses() {
                     old_line,
                     new_line,
                     text,
+                    scope,
+                    range,
                     json,
                 },
             ..
@@ -99,6 +144,8 @@ fn comment_subcommand_tree_parses() {
             assert_eq!(old_line, None);
             assert_eq!(new_line, Some(7));
             assert_eq!(text, "hi");
+            assert_eq!(scope, None, "no --scope: defaults to worktree at dispatch");
+            assert_eq!(range, None);
             assert!(!json);
         }
         other => panic!("expected comment add, got {other:?}"),
@@ -117,6 +164,86 @@ fn comment_subcommand_tree_parses() {
 
     // The action is required.
     assert!(Cli::try_parse(&["strix", "comment"]).is_err());
+}
+
+#[test]
+fn scope_and_range_flags_parse() {
+    let cli = Cli::try_parse(&["strix", "comment", "list", "--scope", "worktree", "--json"])
+        .expect("parse");
+    match cli.command {
+        Some(CliCommand::Comment {
+            action: CommentAction::List { scope, json },
+            ..
+        }) => {
+            assert_eq!(scope, Some(ScopeArg::Worktree));
+            assert!(json);
+        }
+        other => panic!("expected comment list, got {other:?}"),
+    }
+
+    let cli = Cli::try_parse(&[
+        "strix",
+        "comment",
+        "add",
+        "--file",
+        "a.rs",
+        "--new-line",
+        "1",
+        "--text",
+        "x",
+        "--scope",
+        "range",
+        "--range",
+        "main",
+    ])
+    .expect("parse");
+    match cli.command {
+        Some(CliCommand::Comment {
+            action: CommentAction::Add { scope, range, .. },
+            ..
+        }) => {
+            assert_eq!(scope, Some(ScopeArg::Range));
+            assert_eq!(range.as_deref(), Some("main"));
+        }
+        other => panic!("expected comment add, got {other:?}"),
+    }
+
+    let cli = Cli::try_parse(&["strix", "comment", "clear", "--all"]).expect("parse");
+    match cli.command {
+        Some(CliCommand::Comment {
+            action: CommentAction::Clear { scope, all, .. },
+            ..
+        }) => {
+            assert_eq!(scope, None);
+            assert!(all);
+        }
+        other => panic!("expected comment clear, got {other:?}"),
+    }
+
+    // clap accepts `--scope all` for `add` at parse time (it's a value shared
+    // with list/clear); the CLI rejects it at dispatch instead (see
+    // `add_scope_all_is_rejected` below).
+    let cli = Cli::try_parse(&[
+        "strix",
+        "comment",
+        "add",
+        "--file",
+        "a.rs",
+        "--new-line",
+        "1",
+        "--text",
+        "x",
+        "--scope",
+        "all",
+    ])
+    .expect("parses; rejected at dispatch, not parse time");
+    match cli.command {
+        Some(CliCommand::Comment {
+            action: CommentAction::Add { scope, .. },
+            ..
+        }) => assert_eq!(scope, Some(ScopeArg::All)),
+        other => panic!("expected comment add, got {other:?}"),
+    }
 }
 
 #[test]
@@ -164,8 +291,10 @@ fn never_reviewed_branch_lists_empty_range_null() {
 #[test]
 fn add_list_rm_list_lifecycle_matches_schema() {
     let repo = init_repo();
+    // Dirty the tracked file so the default (worktree) scope has a real anchor.
+    write(repo.path(), "README.md", "# test\nedited\n");
 
-    // add → { "comment": {…} }, always agent-source.
+    // add → { "comment": {…} }, always agent-source, worktree scope by default.
     let added = json_ok(
         repo.path(),
         &[
@@ -173,7 +302,7 @@ fn add_list_rm_list_lifecycle_matches_schema() {
             "--file",
             "README.md",
             "--new-line",
-            "1",
+            "2",
             "--text",
             "fix this",
             "--json",
@@ -182,20 +311,27 @@ fn add_list_rm_list_lifecycle_matches_schema() {
     let comment = &added["comment"];
     assert_comment_schema(comment);
     assert_eq!(comment["source"], "agent", "CLI always authors agent notes");
+    assert_eq!(
+        comment["scope"], "worktree",
+        "add defaults to worktree scope"
+    );
     assert_eq!(comment["file"], "README.md");
     assert_eq!(comment["side"], "new");
-    assert_eq!(comment["line"], 1);
+    assert_eq!(comment["line"], 2);
     assert_eq!(comment["text"], "fix this");
-    assert_eq!(comment["orphaned"], false);
     assert_eq!(
-        comment["context"],
-        Value::Null,
-        "no stored range → context null"
+        comment["orphaned"], false,
+        "the anchor is present in the worktree diff"
+    );
+    assert_eq!(comment["context"], "edited");
+    assert!(
+        comment["base"].is_string(),
+        "a worktree comment stamps the current HEAD as its baseline"
     );
     let id = comment["id"].as_u64().unwrap();
 
     // list → the one comment, same schema.
-    let listed = json_ok(repo.path(), &["list", "--json"]);
+    let listed = json_ok(repo.path(), &["list", "--scope", "worktree", "--json"]);
     let comments = listed["comments"].as_array().unwrap();
     assert_eq!(comments.len(), 1);
     assert_eq!(comments[0]["id"].as_u64().unwrap(), id);
@@ -207,8 +343,144 @@ fn add_list_rm_list_lifecycle_matches_schema() {
     assert_eq!(removed["remaining"], 0);
 
     // list → empty again.
-    let listed = json_ok(repo.path(), &["list", "--json"]);
+    let listed = json_ok(repo.path(), &["list", "--scope", "worktree", "--json"]);
     assert_eq!(listed["comments"], Value::Array(vec![]));
+}
+
+#[test]
+fn list_defaults_to_worktree_when_dirty_and_shows_flat_scope() {
+    let repo = init_repo();
+    write(repo.path(), "README.md", "# test\nedited\n");
+    let added = json_ok(
+        repo.path(),
+        &[
+            "add",
+            "--file",
+            "README.md",
+            "--new-line",
+            "2",
+            "--text",
+            "note",
+            "--json",
+        ],
+    );
+    assert_eq!(added["comment"]["scope"], "worktree");
+
+    // No --scope: the repo is dirty, so the default is worktree.
+    let listed = json_ok(repo.path(), &["list", "--json"]);
+    let comments = listed["comments"].as_array().unwrap();
+    assert_eq!(
+        comments.len(),
+        1,
+        "default list scope must be worktree here"
+    );
+    assert_eq!(comments[0]["scope"], "worktree");
+
+    // Explicit --scope worktree agrees with the default.
+    let explicit = json_ok(repo.path(), &["list", "--scope", "worktree", "--json"]);
+    assert_eq!(explicit["comments"], listed["comments"]);
+}
+
+#[test]
+fn list_scope_range_and_all_partition_by_scope() {
+    let repo = init_repo_with_history();
+    seed_active_range(repo.path(), "HEAD~2");
+
+    // A range comment, anchored against the stored active range.
+    let range_added = json_ok(
+        repo.path(),
+        &[
+            "add",
+            "--file",
+            "README.md",
+            "--new-line",
+            "2",
+            "--text",
+            "range note",
+            "--scope",
+            "range",
+            "--json",
+        ],
+    );
+    assert_eq!(range_added["comment"]["scope"], "range");
+    assert_eq!(range_added["comment"]["range"], "HEAD~2");
+
+    // Dirty an unrelated tracked file and add a worktree comment too.
+    write(repo.path(), "a.txt", "alpha\nbeta\n");
+    let wt_added = json_ok(
+        repo.path(),
+        &[
+            "add",
+            "--file",
+            "a.txt",
+            "--new-line",
+            "2",
+            "--text",
+            "wt note",
+            "--json",
+        ],
+    );
+    assert_eq!(wt_added["comment"]["scope"], "worktree");
+
+    let range_only = json_ok(repo.path(), &["list", "--scope", "range", "--json"]);
+    let comments = range_only["comments"].as_array().unwrap();
+    assert_eq!(comments.len(), 1, "range scope excludes the worktree note");
+    assert_eq!(comments[0]["scope"], "range");
+
+    let worktree_only = json_ok(repo.path(), &["list", "--scope", "worktree", "--json"]);
+    let comments = worktree_only["comments"].as_array().unwrap();
+    assert_eq!(comments.len(), 1, "worktree scope excludes the range note");
+    assert_eq!(comments[0]["scope"], "worktree");
+
+    let all = json_ok(repo.path(), &["list", "--scope", "all", "--json"]);
+    assert_eq!(
+        all["comments"].as_array().unwrap().len(),
+        2,
+        "all shows both"
+    );
+}
+
+#[test]
+fn worktree_add_and_list_key_the_inbox_by_status_branch_key_on_detached_head() {
+    // codex-C4 #2: `list` and worktree `add` must derive the inbox key from
+    // the *same* `Status` snapshot used for the dirty-check/sweep, not a
+    // separate `head_branch_key()` read — two independent git reads could
+    // momentarily disagree under an external checkout race, keying the inbox
+    // to one branch while sweeping with another branch's facts (comment-loss).
+    //
+    // Detached HEAD is the trickiest case for that derivation: the key falls
+    // back to the full commit hex instead of a branch name. This pins that
+    // `list`/worktree `add` still land on exactly that hex — i.e. the
+    // status-derived key agrees with `Repo::head_branch_key()`'s documented
+    // semantics — after routing through `Status::branch_key()`. The race
+    // itself needs an external checkout mid-call and isn't deterministically
+    // reproducible at the binary level, so it isn't asserted here.
+    let repo = init_repo_with_history();
+    let head = git_rev_parse(repo.path(), "HEAD");
+    git(repo.path(), &["checkout", "-q", "--detach", &head]);
+    write(repo.path(), "README.md", "# test\nsecond line\nedited\n");
+
+    let added = json_ok(
+        repo.path(),
+        &[
+            "add",
+            "--file",
+            "README.md",
+            "--new-line",
+            "3",
+            "--text",
+            "note",
+            "--json",
+        ],
+    );
+    assert_eq!(added["comment"]["scope"], "worktree");
+
+    let listed = json_ok(repo.path(), &["list", "--scope", "worktree", "--json"]);
+    assert_eq!(
+        listed["branch"], head,
+        "detached HEAD keys the inbox by the full commit hex"
+    );
+    assert_eq!(listed["comments"].as_array().unwrap().len(), 1);
 }
 
 #[test]
@@ -271,6 +543,29 @@ fn add_rejects_whitespace_only_text() {
 }
 
 #[test]
+fn add_scope_all_is_rejected() {
+    let repo = init_repo();
+    let out = run(
+        repo.path(),
+        &[
+            "add",
+            "--file",
+            "README.md",
+            "--new-line",
+            "1",
+            "--text",
+            "x",
+            "--scope",
+            "all",
+        ],
+    );
+    assert!(
+        !out.status.success(),
+        "--scope all must be rejected for add"
+    );
+}
+
+#[test]
 fn add_stores_multiline_text_raw() {
     let repo = init_repo();
     let body = "line one\nline two\n  indented three";
@@ -289,9 +584,49 @@ fn add_stores_multiline_text_raw() {
     );
     assert_eq!(added["comment"]["text"], body, "newlines stored verbatim");
 
-    // And it round-trips through list unchanged.
-    let listed = json_ok(repo.path(), &["list", "--json"]);
+    // And it round-trips through list unchanged (explicit scope: the repo is
+    // clean, so the default list scope would be `range`, not the worktree
+    // comment just added).
+    let listed = json_ok(repo.path(), &["list", "--scope", "worktree", "--json"]);
     assert_eq!(listed["comments"][0]["text"], body);
+}
+
+#[test]
+fn add_scope_range_without_range_or_active_range_errors() {
+    // Neither --range nor a stored active_range: range scope has nothing to
+    // anchor against, so `add` must error rather than persist the milestone-6
+    // empty-range placeholder (codex-C2a finding #8).
+    let repo = init_repo();
+    let out = run(
+        repo.path(),
+        &[
+            "add",
+            "--file",
+            "whatever.rs",
+            "--new-line",
+            "42",
+            "--text",
+            "x",
+            "--scope",
+            "range",
+        ],
+    );
+    assert!(
+        !out.status.success(),
+        "range scope with no range source must error"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("range"),
+        "stderr should mention the missing range: {stderr}"
+    );
+
+    // Nothing was written: a failed add must not even create the store.
+    let store_path = repo.path().join(".git").join("strix").join("comments.json");
+    assert!(
+        !store_path.exists(),
+        "a failed add must not create the store"
+    );
 }
 
 #[test]
@@ -328,11 +663,135 @@ fn clear_reports_the_count() {
             ],
         );
     }
-    let cleared = json_ok(repo.path(), &["clear", "--json"]);
+    let cleared = json_ok(repo.path(), &["clear", "--all", "--json"]);
     assert_eq!(cleared["cleared"], 3);
 
-    let listed = json_ok(repo.path(), &["list", "--json"]);
+    let listed = json_ok(repo.path(), &["list", "--scope", "all", "--json"]);
     assert_eq!(listed["comments"], Value::Array(vec![]));
+}
+
+#[test]
+fn clear_without_scope_or_all_errors() {
+    let repo = init_repo();
+    json_ok(
+        repo.path(),
+        &[
+            "add",
+            "--file",
+            "README.md",
+            "--new-line",
+            "1",
+            "--text",
+            "x",
+            "--json",
+        ],
+    );
+
+    let out = run(repo.path(), &["clear"]);
+    assert!(!out.status.success(), "clear with no scope must error");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("scope"),
+        "stderr should mention the missing scope: {stderr}"
+    );
+
+    // The comment must still be there — clear never wipes implicitly.
+    let listed = json_ok(repo.path(), &["list", "--scope", "all", "--json"]);
+    assert_eq!(listed["comments"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn clear_scope_and_all_flag_together_errors() {
+    let repo = init_repo();
+    let out = run(repo.path(), &["clear", "--scope", "worktree", "--all"]);
+    assert!(
+        !out.status.success(),
+        "combining --scope and --all must be rejected"
+    );
+}
+
+#[test]
+fn clear_scope_worktree_and_all_clear_the_right_set() {
+    let repo = init_repo_with_history();
+    seed_active_range(repo.path(), "HEAD~2");
+    json_ok(
+        repo.path(),
+        &[
+            "add",
+            "--file",
+            "README.md",
+            "--new-line",
+            "2",
+            "--text",
+            "range note",
+            "--scope",
+            "range",
+            "--json",
+        ],
+    );
+    write(repo.path(), "a.txt", "alpha\nbeta\n");
+    json_ok(
+        repo.path(),
+        &[
+            "add",
+            "--file",
+            "a.txt",
+            "--new-line",
+            "2",
+            "--text",
+            "wt note",
+            "--json",
+        ],
+    );
+
+    // Clearing only the worktree scope leaves the range comment untouched.
+    let cleared = json_ok(repo.path(), &["clear", "--scope", "worktree", "--json"]);
+    assert_eq!(cleared["cleared"], 1);
+    let remaining = json_ok(repo.path(), &["list", "--scope", "all", "--json"]);
+    let comments = remaining["comments"].as_array().unwrap();
+    assert_eq!(comments.len(), 1);
+    assert_eq!(comments[0]["scope"], "range");
+
+    // --all clears whatever is left.
+    let cleared_all = json_ok(repo.path(), &["clear", "--all", "--json"]);
+    assert_eq!(cleared_all["cleared"], 1);
+    let remaining = json_ok(repo.path(), &["list", "--scope", "all", "--json"]);
+    assert_eq!(remaining["comments"], Value::Array(vec![]));
+}
+
+#[test]
+fn headless_list_sweeps_a_worktree_comment_after_its_commit_lands() {
+    let repo = init_repo();
+    write(repo.path(), "README.md", "# test\nedited\n");
+    let added = json_ok(
+        repo.path(),
+        &[
+            "add",
+            "--file",
+            "README.md",
+            "--new-line",
+            "2",
+            "--text",
+            "note",
+            "--json",
+        ],
+    );
+    let id = added["comment"]["id"].as_u64().unwrap();
+    assert_eq!(added["comment"]["orphaned"], false);
+
+    // Commit exactly the change the comment anchors to.
+    git(repo.path(), &["add", "README.md"]);
+    git(repo.path(), &["commit", "-q", "-m", "land it"]);
+
+    // A headless `list` (no live TUI session ever ran) must still reflect the
+    // sweep the plan §3.2 lifecycle prescribes once HEAD moves past the note's
+    // baseline and the change resolves there.
+    let listed = json_ok(repo.path(), &["list", "--scope", "worktree", "--json"]);
+    let comments = listed["comments"].as_array().unwrap();
+    assert!(
+        comments.iter().all(|c| c["id"].as_u64() != Some(id)),
+        "the committed comment should have swept: {comments:?}"
+    );
 }
 
 #[test]
@@ -445,7 +904,14 @@ fn rm_unknown_id_leaves_the_store_byte_identical() {
 fn gc_keeps_the_unborn_head_inbox() {
     // On an unborn HEAD the checked-out branch ("main") has no ref, so it is
     // absent from `branch_names()`; GC must still keep its inbox (plan §3.1).
+    //
+    // The file must actually exist on disk: a worktree comment anchored to a
+    // path absent from *both* HEAD and the worktree reads as "vanished" under
+    // an unchanged baseline (both `None` on an unborn HEAD) and the very next
+    // sweep pass (this test's own `gc`/`list`) would legitimately retire it —
+    // a real anchor, not GC, is what this test means to exercise.
     let repo = init_empty_repo();
+    write(repo.path(), "README.md", "# test\n");
     json_ok(
         repo.path(),
         &[
@@ -468,7 +934,9 @@ fn gc_keeps_the_unborn_head_inbox() {
     );
     assert_eq!(result["removed_comments"], 0);
 
-    let listed = json_ok(repo.path(), &["list", "--json"]);
+    // `--scope all`: an unborn, file-less repo is clean, so the plain default
+    // would resolve to `range` and miss the worktree-scoped comment added above.
+    let listed = json_ok(repo.path(), &["list", "--scope", "all", "--json"]);
     assert_eq!(
         listed["comments"].as_array().unwrap().len(),
         1,
@@ -479,8 +947,10 @@ fn gc_keeps_the_unborn_head_inbox() {
 #[test]
 fn startup_gc_keeps_the_unborn_head_inbox() {
     // The startup GC (`App::build`) runs on every launch; on an unborn HEAD it
-    // must not drop the current session's own comments (plan §3.1).
+    // must not drop the current session's own comments (plan §3.1). The file
+    // must exist on disk — see `gc_keeps_the_unborn_head_inbox` for why.
     let repo = init_empty_repo();
+    write(repo.path(), "README.md", "# test\n");
     json_ok(
         repo.path(),
         &[
@@ -507,7 +977,7 @@ fn startup_gc_keeps_the_unborn_head_inbox() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let listed = json_ok(repo.path(), &["list", "--json"]);
+    let listed = json_ok(repo.path(), &["list", "--scope", "all", "--json"]);
     assert_eq!(
         listed["comments"].as_array().unwrap().len(),
         1,
@@ -521,15 +991,9 @@ fn add_orphans_when_line_absent_on_a_resolvable_range() {
     // diff is orphaned honestly (context null); an anchor that is present captures
     // context and is not orphaned (plan §3.2/§3.3).
     let repo = init_repo_with_history();
-    let store_dir = repo.path().join(".git").join("strix");
-    std::fs::create_dir_all(&store_dir).unwrap();
     // `HEAD~2` resolves (base = init, head = HEAD), so the pass has a diff to
     // anchor against; `README.md` is edited in it, `nope.rs` is absent.
-    std::fs::write(
-        store_dir.join("comments.json"),
-        r#"{ "version": 2, "next_id": 1, "branches": { "main": { "active_range": "HEAD~2", "comments": [] } } }"#,
-    )
-    .unwrap();
+    seed_active_range(repo.path(), "HEAD~2");
 
     let orphan = json_ok(
         repo.path(),
@@ -541,9 +1005,12 @@ fn add_orphans_when_line_absent_on_a_resolvable_range() {
             "999",
             "--text",
             "x",
+            "--scope",
+            "range",
             "--json",
         ],
     );
+    assert_eq!(orphan["comment"]["scope"], "range");
     assert_eq!(
         orphan["comment"]["orphaned"], true,
         "an absent anchor on a resolvable range orphans"
@@ -564,6 +1031,8 @@ fn add_orphans_when_line_absent_on_a_resolvable_range() {
             "2",
             "--text",
             "y",
+            "--scope",
+            "range",
             "--json",
         ],
     );
@@ -575,30 +1044,6 @@ fn add_orphans_when_line_absent_on_a_resolvable_range() {
         anchored["comment"]["context"].is_string(),
         "a present anchor captures its line's context"
     );
-}
-
-#[test]
-fn add_does_not_orphan_when_no_range_recorded() {
-    // No stored range → the anchor is unknown, not orphaned (plan §3.2/§3.3).
-    let repo = init_repo();
-    let added = json_ok(
-        repo.path(),
-        &[
-            "add",
-            "--file",
-            "whatever.rs",
-            "--new-line",
-            "42",
-            "--text",
-            "x",
-            "--json",
-        ],
-    );
-    assert_eq!(
-        added["comment"]["orphaned"], false,
-        "unknown (no range) is not orphaned"
-    );
-    assert_eq!(added["comment"]["context"], Value::Null);
 }
 
 #[test]
@@ -622,7 +1067,7 @@ fn corrupt_store_fails_every_action_and_leaves_the_file_untouched() {
             "x",
         ],
         &["rm", "1"],
-        &["clear"],
+        &["clear", "--all"],
         &["gc"],
     ];
     for action in actions {

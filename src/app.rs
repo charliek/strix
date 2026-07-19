@@ -3375,7 +3375,11 @@ struct SubmitPlan {
 ///      a committed rename-away (`context ∉ HEAD:file` → `resolved_in_head =
 ///      false`) stays **stale/retained** — never a blind sweep — while a committed
 ///      Old-side deletion (`context ∈ base ∧ ∉ HEAD`) + orphaned sweeps.
-fn worktree_facts(repo: &Repo, status: &Status, comment: &Comment) -> FileFacts {
+///
+/// `pub(crate)` so `comments_cli`'s headless `list`/`add` (C4) can run the exact
+/// same sweep engine as this module's `sync_status_comments` — no second copy
+/// of the resolution order above.
+pub(crate) fn worktree_facts(repo: &Repo, status: &Status, comment: &Comment) -> FileFacts {
     let all = || status.staged.iter().chain(status.unstaged.iter());
     // Direct hit: the file is a listed change under its current path.
     if let Some(entry) = all().find(|e| e.path == comment.file) {
