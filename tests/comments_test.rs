@@ -8,7 +8,7 @@ mod common;
 use std::collections::{BTreeMap, HashSet};
 
 use common::{init_empty_repo, init_repo, init_repo_with_worktree};
-use strix::comments::{self, Branch, Comment, Scope, Side, Source, Store};
+use strix::comments::{self, Branch, Comment, FileFacts, Scope, Side, Source, Store};
 use strix::git::{ChangeKind, CommitFile, CommitStat, DiffLine, FileDiff, LineKind, Repo};
 
 // --- builders ---
@@ -754,4 +754,304 @@ fn reanchor_scoped_only_touches_the_selected_scope() {
     assert_eq!(c[0].line, 10, "the worktree comment was skipped this time");
     assert_eq!(c[1].line, 13, "range comment re-anchored to the moved line");
     assert!(!c[1].orphaned);
+}
+
+// --- worktree lifecycle / sweep engine (plan §3.2, C2c) ---
+
+// Two distinct baseline HEADs; `base == current_head` means "HEAD unchanged".
+const HEAD_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const HEAD_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+/// A worktree comment with an explicit baseline HEAD (`base`), as C3 records it.
+fn wt(id: u64, file: &str, side: Side, line: usize, context: Option<&str>, base: &str) -> Comment {
+    Comment {
+        base: Some(base.to_string()),
+        ..comment(id, file, side, line, context)
+    }
+}
+
+/// The common facts case: file present, not renamed, change not yet in HEAD.
+fn present(diff: FileDiff) -> FileFacts {
+    FileFacts::Present {
+        diff,
+        renamed_to: None,
+        resolved_in_head: false,
+    }
+}
+
+#[test]
+fn sweep_git_add_only_leaves_the_comment_unchanged() {
+    // Staging index-only: the net HEAD→worktree diff is unchanged, so the exact
+    // anchor still holds — retained, and nothing to write.
+    let mut c = vec![wt(1, "a.rs", Side::New, 10, Some("fn keep() {"), HEAD_A)];
+    let diff = FileDiff::Text(vec![line(9, "x"), line(10, "fn keep() {"), line(11, "y")]);
+    let changed = comments::sweep_worktree(&mut c, Some(HEAD_A), |_| present(diff.clone()));
+    assert!(
+        !changed,
+        "an index-only change moves nothing → write elided"
+    );
+    assert_eq!(c.len(), 1);
+    assert_eq!(c[0].line, 10);
+    assert!(!c[0].stale && !c[0].orphaned);
+}
+
+#[test]
+fn sweep_unrelated_edit_reanchors_within_window() {
+    let mut c = vec![wt(1, "a.rs", Side::New, 10, Some("target"), HEAD_A)];
+    // An edit elsewhere pushed the target down to 13 (within ±10).
+    let diff = FileDiff::Text(vec![line(12, "x"), line(13, "target"), line(14, "y")]);
+    let changed = comments::sweep_worktree(&mut c, Some(HEAD_A), |_| present(diff.clone()));
+    assert!(changed);
+    assert_eq!(c[0].line, 13, "re-anchored to the moved line");
+    assert!(!c[0].stale && !c[0].orphaned);
+    assert_eq!(c.len(), 1);
+}
+
+#[test]
+fn sweep_in_place_edit_marks_stale_not_deleted() {
+    let mut c = vec![wt(1, "a.rs", Side::New, 10, Some("original"), HEAD_A)];
+    // The anchored line's text was rewritten while HEAD is unchanged; "original"
+    // appears nowhere.
+    let diff = FileDiff::Text(vec![
+        line(9, "keep"),
+        line(10, "rewritten"),
+        line(11, "keep"),
+    ]);
+    let changed = comments::sweep_worktree(&mut c, Some(HEAD_A), |_| present(diff.clone()));
+    assert!(changed);
+    assert_eq!(c.len(), 1, "an in-place edit is staled, never swept");
+    assert!(c[0].stale, "drift under an unchanged HEAD marks stale");
+    assert_eq!(c[0].line, 10, "the stored line is kept for display");
+}
+
+#[test]
+fn sweep_context_regroup_never_sweeps() {
+    let mut c = vec![wt(1, "a.rs", Side::New, 10, Some("ctx"), HEAD_A)];
+    // A nearby hunk regrouped, moving the still-present context line to 12.
+    let diff = FileDiff::Text(vec![line(11, "a"), line(12, "ctx"), line(13, "b")]);
+    let changed = comments::sweep_worktree(&mut c, Some(HEAD_A), |_| present(diff.clone()));
+    assert_eq!(
+        c.len(),
+        1,
+        "a context comment is never swept for regrouping"
+    );
+    assert_eq!(c[0].line, 12);
+    assert!(!c[0].stale);
+    assert!(changed);
+}
+
+#[test]
+fn sweep_unrelated_commit_retains_verbatim() {
+    // HEAD advanced (A → B) but this file's change is still pending and not
+    // resolved in HEAD: the note is retained exactly as-is (no write).
+    let mut c = vec![wt(1, "a.rs", Side::New, 10, Some("pending"), HEAD_A)];
+    let diff = FileDiff::Text(vec![line(9, "x"), line(10, "pending"), line(11, "y")]);
+    let changed = comments::sweep_worktree(&mut c, Some(HEAD_B), |_| present(diff.clone()));
+    assert_eq!(c.len(), 1);
+    assert_eq!(c[0].line, 10);
+    assert!(!c[0].stale && !c[0].orphaned);
+    assert!(
+        !changed,
+        "an unrelated commit changes nothing about the note"
+    );
+}
+
+#[test]
+fn sweep_partial_commit_reanchors_pending_target() {
+    // A partial commit landed earlier lines (HEAD moved) but the target is still
+    // pending — not resolved in HEAD — and drifted to 6.
+    let mut c = vec![wt(1, "a.rs", Side::New, 10, Some("still pending"), HEAD_A)];
+    let diff = FileDiff::Text(vec![line(5, "x"), line(6, "still pending"), line(7, "y")]);
+    let changed = comments::sweep_worktree(&mut c, Some(HEAD_B), |cm| {
+        assert!(matches!(cm.scope, Scope::WorkTree));
+        present(diff.clone())
+    });
+    assert_eq!(
+        c.len(),
+        1,
+        "a partial commit keeps the still-pending target"
+    );
+    assert_eq!(c[0].line, 6, "re-anchored to the moved line");
+    assert!(!c[0].stale && !c[0].orphaned);
+    assert!(changed);
+}
+
+#[test]
+fn sweep_commit_including_the_target_sweeps() {
+    let mut c = vec![wt(1, "a.rs", Side::New, 10, Some("landed"), HEAD_A)];
+    // HEAD advanced and the anchored change resolved into it (file now clean).
+    let changed = comments::sweep_worktree(&mut c, Some(HEAD_B), |_| FileFacts::Present {
+        diff: FileDiff::Text(vec![]),
+        renamed_to: None,
+        resolved_in_head: true,
+    });
+    assert!(changed);
+    assert!(c.is_empty(), "the committed target is swept");
+}
+
+#[test]
+fn sweep_keeps_a_still_pending_add_when_identical_text_committed_elsewhere() {
+    // Critical false-positive guard: a New-side note on an added line `T`. A
+    // partial commit advanced HEAD by adding an IDENTICAL `T` *elsewhere*, so the
+    // whole-file membership signal (`resolved_in_head`) is true — but the
+    // *commented* add is still pending in the net diff. The orphaned-after-reanchor
+    // gate must keep it (re-anchored), never sweep it: deleting a human's note is
+    // the worst outcome.
+    let mut c = vec![wt(1, "a.rs", Side::New, 20, Some("dup"), HEAD_A)];
+    // The commented add of "dup" is still pending, drifted to 21.
+    let diff = FileDiff::Text(vec![line(20, "x"), line(21, "dup"), line(22, "y")]);
+    let changed = comments::sweep_worktree(&mut c, Some(HEAD_B), |_| FileFacts::Present {
+        diff: diff.clone(),
+        renamed_to: None,
+        resolved_in_head: true, // membership true: an identical `T` landed elsewhere
+    });
+    assert_eq!(
+        c.len(),
+        1,
+        "a still-pending add is never swept on a duplicate-text commit"
+    );
+    assert_eq!(c[0].line, 21, "re-anchored to its still-pending line");
+    assert!(!c[0].stale && !c[0].orphaned);
+    assert!(changed);
+}
+
+#[test]
+fn sweep_vanished_file_sweeps() {
+    let mut c = vec![wt(1, "gone.rs", Side::New, 3, Some("x"), HEAD_A)];
+    let changed = comments::sweep_worktree(&mut c, Some(HEAD_A), |_| FileFacts::Gone);
+    assert!(changed);
+    assert!(c.is_empty(), "a vanished target file sweeps its notes");
+}
+
+#[test]
+fn sweep_never_fires_while_head_is_unchanged() {
+    // The sweep gate requires an actual HEAD move: even if the caller reports the
+    // content resolved, an unchanged HEAD must never delete a note (it protects
+    // against sweeping mid-edit before a commit).
+    let mut c = vec![wt(1, "a.rs", Side::New, 10, Some("x"), HEAD_A)];
+    let diff = FileDiff::Text(vec![line(10, "x")]);
+    let changed = comments::sweep_worktree(&mut c, Some(HEAD_A), |_| FileFacts::Present {
+        diff: diff.clone(),
+        renamed_to: None,
+        resolved_in_head: true,
+    });
+    assert_eq!(c.len(), 1, "HEAD unchanged: the sweep gate holds");
+    assert!(!changed);
+}
+
+#[test]
+fn sweep_rename_repoints_and_reanchors() {
+    let mut c = vec![wt(1, "old.rs", Side::New, 3, Some("moved"), HEAD_A)];
+    // The file was renamed old.rs → new.rs; its net diff (under the new path)
+    // still carries the anchored line.
+    let diff = FileDiff::Text(vec![line(2, "x"), line(3, "moved"), line(4, "y")]);
+    let changed = comments::sweep_worktree(&mut c, Some(HEAD_A), |_| FileFacts::Present {
+        diff: diff.clone(),
+        renamed_to: Some("new.rs".to_string()),
+        resolved_in_head: false,
+    });
+    assert!(changed);
+    assert_eq!(c[0].file, "new.rs", "the note follows the rename");
+    assert_eq!(c[0].line, 3);
+    assert!(!c[0].stale && !c[0].orphaned);
+}
+
+#[test]
+fn sweep_rename_with_lost_content_goes_stale() {
+    let mut c = vec![wt(1, "old.rs", Side::New, 3, Some("moved"), HEAD_A)];
+    // Renamed, and the anchored text is gone from the new file → stale, not swept.
+    let diff = FileDiff::Text(vec![line(2, "x"), line(3, "different"), line(4, "y")]);
+    let changed = comments::sweep_worktree(&mut c, Some(HEAD_A), |_| FileFacts::Present {
+        diff: diff.clone(),
+        renamed_to: Some("new.rs".to_string()),
+        resolved_in_head: false,
+    });
+    assert!(changed);
+    assert_eq!(
+        c[0].file, "new.rs",
+        "the note is re-pointed to the new path"
+    );
+    assert!(
+        c[0].stale,
+        "content lost across the rename → stale, not swept"
+    );
+    assert_eq!(c.len(), 1);
+}
+
+#[test]
+fn sweep_leaves_range_comments_untouched() {
+    // A range comment and a worktree comment on the same (now-vanished) file: only
+    // the worktree one is evaluated — range comments are never passed to
+    // `facts_for` — and only it is swept.
+    let mut c = vec![
+        Comment {
+            scope: Scope::Range {
+                range: "main".to_string(),
+            },
+            base: None,
+            ..comment(1, "gone.rs", Side::New, 3, Some("x"))
+        },
+        wt(2, "gone.rs", Side::New, 3, Some("x"), HEAD_A),
+    ];
+    let range_before = c[0].clone();
+    let changed = comments::sweep_worktree(&mut c, Some(HEAD_A), |cm| {
+        assert!(
+            matches!(cm.scope, Scope::WorkTree),
+            "range comments are never evaluated by the worktree sweep"
+        );
+        FileFacts::Gone
+    });
+    assert!(changed);
+    assert_eq!(c.len(), 1, "only the worktree comment was swept");
+    assert_eq!(
+        c[0], range_before,
+        "the range comment is untouched by worktree drift"
+    );
+}
+
+#[test]
+fn sweep_stale_flag_persists_across_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    comments::mutate(dir.path(), |s| {
+        s.branches.insert(
+            "main".to_string(),
+            Branch {
+                active_range: None,
+                comments: vec![wt(1, "a.rs", Side::New, 10, Some("original"), HEAD_A)],
+            },
+        );
+    })
+    .unwrap();
+
+    // An in-place edit (no commit) marks the note stale; persist via the
+    // write-eliding path, exactly as a refresh would.
+    let diff = FileDiff::Text(vec![line(10, "rewritten")]);
+    comments::mutate_if_changed(dir.path(), |s| {
+        let branch = s.branches.get_mut("main").unwrap();
+        let changed = comments::sweep_worktree(&mut branch.comments, Some(HEAD_A), |_| {
+            present(diff.clone())
+        });
+        ((), changed)
+    })
+    .unwrap();
+
+    let loaded = comments::load(dir.path()).unwrap();
+    let comments = &loaded.branches["main"].comments;
+    assert_eq!(comments.len(), 1, "staled, not swept");
+    assert!(
+        comments[0].stale,
+        "the stale flag survived the write + reload"
+    );
+}
+
+#[test]
+fn sweep_no_op_pass_reports_no_change() {
+    // Mirrors the re-anchor elision contract: a pass that leaves every comment
+    // exactly put reports `false`, so `mutate_if_changed` skips the write.
+    let mut c = vec![wt(1, "a.rs", Side::New, 10, Some("stable"), HEAD_A)];
+    let diff = FileDiff::Text(vec![line(10, "stable")]);
+    let changed = comments::sweep_worktree(&mut c, Some(HEAD_A), |_| present(diff.clone()));
+    assert!(!changed, "nothing changed → the write is elided");
+    assert_eq!(c[0].line, 10);
+    assert!(!c[0].stale && !c[0].orphaned);
 }

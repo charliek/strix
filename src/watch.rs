@@ -20,9 +20,14 @@ const DEBOUNCE: Duration = Duration::from_millis(250);
 /// that yields `()` whenever a relevant change settles. Errors if the primary
 /// watch can't be established, so the caller can fall back to manual refresh.
 ///
-/// `extra` roots are watched best-effort (a failure logs and is skipped): the
-/// comments store dir lives outside the worktree in a *linked* worktree, so
-/// watching it makes agent CLI writes refresh the TUI there too (plan §3.4).
+/// `extra` roots are each created (so notify can bind a not-yet-existent store
+/// dir) then watched best-effort (a failure logs and is skipped): in a *linked*
+/// worktree the shared common dir (refs / HEAD / packed-refs + the comments
+/// store) and the private git dir lie outside `root`, so watching them makes an
+/// in-worktree commit / ref-advance — and an agent's CLI store write — refresh
+/// the TUI there too (plan §2). Recursive dir watches (not watches on the
+/// atomically-renamed ref files themselves) are what catch a ref advance
+/// reliably; `.git/objects` churn is still filtered in [`is_relevant`].
 pub fn spawn(root: PathBuf, extra: Vec<PathBuf>) -> Result<Receiver<()>> {
     // Establish the watch on this thread so a setup failure (e.g. inotify
     // limits) surfaces to the caller rather than dying silently in a thread.
@@ -32,7 +37,14 @@ pub fn spawn(root: PathBuf, extra: Vec<PathBuf>) -> Result<Receiver<()>> {
         .watcher()
         .watch(&root, RecursiveMode::Recursive)
         .with_context(|| format!("watch {}", root.display()))?;
+    // Object-store churn under each extra (git-admin / common) root is noise. The
+    // `.git`-component check in `is_relevant` covers a common dir literally named
+    // `.git`; also filter `<root>/objects` per extra root so a common dir that is
+    // *not* named `.git` (e.g. a bare `repo.git` with linked worktrees) is covered
+    // too. The primary checkout passes no extras, so its behavior is unchanged.
+    let object_dirs: Vec<PathBuf> = extra.iter().map(|root| root.join("objects")).collect();
     for path in extra {
+        let _ = std::fs::create_dir_all(&path);
         if let Err(err) = debouncer.watcher().watch(&path, RecursiveMode::Recursive) {
             tracing::warn!("watching {} failed: {err:#}", path.display());
         }
@@ -44,7 +56,9 @@ pub fn spawn(root: PathBuf, extra: Vec<PathBuf>) -> Result<Receiver<()>> {
         let _debouncer = debouncer;
         for batch in debounce_rx {
             let relevant = match batch {
-                Ok(events) => events.iter().any(|e| is_relevant(&e.path)),
+                Ok(events) => events
+                    .iter()
+                    .any(|e| is_relevant(&e.path) && !under_object_dir(&e.path, &object_dirs)),
                 // A watch error (e.g. a queue overflow) means we may have missed
                 // changes — refresh to be safe.
                 Err(_) => true,
@@ -55,6 +69,13 @@ pub fn spawn(root: PathBuf, extra: Vec<PathBuf>) -> Result<Receiver<()>> {
         }
     });
     Ok(signal_rx)
+}
+
+/// Whether `path` lies inside any watched root's `objects` store — object churn
+/// under a common dir that isn't literally named `.git`, which the path-component
+/// check in [`is_relevant`] would otherwise miss.
+fn under_object_dir(path: &Path, object_dirs: &[PathBuf]) -> bool {
+    object_dirs.iter().any(|dir| path.starts_with(dir))
 }
 
 /// Whether a changed path should trigger a refresh. Git object-store churn
@@ -87,5 +108,14 @@ mod tests {
         assert!(is_relevant(Path::new("/repo/src/main.rs")));
         // The comments store under `.git/strix` must reach the TUI (agent writes).
         assert!(is_relevant(Path::new("/repo/.git/strix/comments.json")));
+        // A linked worktree's ref / reflog updates live under the shared *common*
+        // dir and its private git dir, outside the working tree — kept relevant,
+        // while their object churn stays filtered.
+        assert!(is_relevant(Path::new("/main/.git/refs/heads/side")));
+        assert!(is_relevant(Path::new("/main/.git/packed-refs")));
+        assert!(is_relevant(Path::new("/main/.git/worktrees/wt/logs/HEAD")));
+        assert!(!is_relevant(Path::new(
+            "/main/.git/objects/pack/pack-abc.idx"
+        )));
     }
 }

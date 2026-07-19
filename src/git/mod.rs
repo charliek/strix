@@ -46,7 +46,44 @@ impl Repo {
     /// repository's `.git`, so every checkout — primary or linked — resolves to
     /// the *same* comments store.
     pub fn strix_dir(&self) -> PathBuf {
-        self.gix.common_dir().join("strix")
+        self.common_dir().join("strix")
+    }
+
+    /// This checkout's private git-admin dir: `<workdir>/.git` for a primary
+    /// checkout, or `<common_dir>/worktrees/<name>` for a linked worktree (whose
+    /// per-worktree `HEAD`, `index`, and reflog live here).
+    pub fn git_dir(&self) -> PathBuf {
+        self.gix.git_dir().to_owned()
+    }
+
+    /// The shared common dir (`<main>/.git`): where `refs/*`, `HEAD`,
+    /// `packed-refs`, and the comments store live for every linked checkout.
+    pub fn common_dir(&self) -> PathBuf {
+        self.gix.common_dir().to_owned()
+    }
+
+    /// Directories *outside* the working tree that must also be watched so a
+    /// stage / commit / ref-advance in this checkout still wakes the TUI, with
+    /// any candidate already covered by the recursive workdir watch — or nested
+    /// under a broader root already in the result — dropped as redundant.
+    ///
+    /// In a linked worktree the private git dir and the shared common dir both
+    /// lie outside `workdir` (its `.git` is a file pointing elsewhere), so the
+    /// recursive workdir watch alone never sees them; the result is the common
+    /// dir, which subsumes both the per-worktree git dir and the store. In a
+    /// primary checkout every candidate is under `.git` inside `workdir`, so the
+    /// result is empty.
+    pub fn watch_roots(&self) -> Vec<PathBuf> {
+        // Broadest-first, so a candidate nested under an already-kept root drops.
+        let mut roots: Vec<PathBuf> = Vec::new();
+        for root in [self.common_dir(), self.git_dir(), self.strix_dir()] {
+            let covered =
+                root.starts_with(&self.workdir) || roots.iter().any(|kept| root.starts_with(kept));
+            if !covered {
+                roots.push(root);
+            }
+        }
+        roots
     }
 
     /// The key identifying the current comment inbox: the checked-out branch's
