@@ -22,7 +22,7 @@ Two panes, mouse + keyboard, syntax-highlighted diffs, themeable (cycle at
 runtime with `t`), toggleable line numbers (`n`) — plus a read-only
 **branch review** mode (`strix diff main`) for reviewing a branch against its
 base, GitHub-PR style, with **inline review comments** (`c`) an agent can
-read and clear via `strix comment list --json`. Built in Rust on
+read via `strix comment list --json` and remove via `strix comment rm`. Built in Rust on
 [ratatui](https://github.com/ratatui/ratatui),
 [gitoxide](https://github.com/GitoxideLabs/gitoxide), and
 [syntect](https://github.com/trishume/syntect).

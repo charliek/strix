@@ -68,7 +68,7 @@ failure. A missing `RANGE` on `strix diff` is a clap usage error.
 
 ## `strix comment`
 
-```
+```text
 strix comment [PATH] list [--json]
 strix comment [PATH] add --file <FILE> (--old-line N | --new-line N) --text <TEXT> [--json]
 strix comment [PATH] rm <ID> [--json]
@@ -153,7 +153,7 @@ repository (`common_dir`, not `git_dir`; see
 | `side` | `"old"` \| `"new"` | Which side of the diff `line` refers to. |
 | `line` | integer | 1-based; the last-known line even while `orphaned`. |
 | `text` | string | The comment body, raw (may contain newlines). |
-| `context` | string \| `null` | The anchored line's text at authoring/last-anchor time; `null` means "unavailable" and always orphans on any drift instead of guessing. |
+| `context` | string \| `null` | The anchored line's text captured at authoring time (re-anchoring never rewrites it); `null` means "unavailable" and always orphans on any drift instead of guessing. |
 | `orphaned` | boolean | `true` when the anchor could no longer be matched on the last re-anchor pass. |
 | `created_at` | integer | Unix epoch seconds. |
 

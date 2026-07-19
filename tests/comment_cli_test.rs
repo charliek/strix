@@ -341,6 +341,42 @@ fn gc_on_a_clean_repo_removes_nothing() {
     let result = json_ok(repo.path(), &["gc", "--json"]);
     assert_eq!(result["removed_branches"], Value::Array(vec![]));
     assert_eq!(result["removed_comments"], 0);
+    // A no-op gc must not create the store: a fresh write here would also wake
+    // any watcher on the store dir for nothing.
+    let store_path = repo.path().join(".git").join("strix").join("comments.json");
+    assert!(
+        !store_path.exists(),
+        "a no-op gc must not create comments.json"
+    );
+}
+
+#[test]
+fn noop_gc_leaves_an_existing_store_byte_identical() {
+    let repo = init_repo();
+    json_ok(
+        repo.path(),
+        &[
+            "add",
+            "--file",
+            "README.md",
+            "--new-line",
+            "1",
+            "--text",
+            "keep",
+            "--json",
+        ],
+    );
+    let store_path = repo.path().join(".git").join("strix").join("comments.json");
+    let before = std::fs::read(&store_path).unwrap();
+
+    let result = json_ok(repo.path(), &["gc", "--json"]);
+    assert_eq!(result["removed_branches"], Value::Array(vec![]));
+    assert_eq!(result["removed_comments"], 0);
+    assert_eq!(
+        std::fs::read(&store_path).unwrap(),
+        before,
+        "a gc that removed nothing must not rewrite the store"
+    );
 }
 
 #[test]

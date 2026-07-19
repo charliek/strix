@@ -198,8 +198,10 @@ fn gc(repo: &Repo, dir: &Path, json_out: bool) -> Result<()> {
     // is its own liveness — either way GC must never drop the current session's
     // comments (plan §3.1).
     live.insert(repo.head_branch_key()?);
-    let result = comments::mutate(dir, |store| {
-        comments::gc(store, &live, |key| repo.commit_exists(key))
+    let result = comments::mutate_if_changed(dir, |store| {
+        let result = comments::gc(store, &live, |key| repo.commit_exists(key));
+        let changed = !result.is_empty();
+        (result, changed)
     })?;
     if json_out {
         print_json(&json!({
