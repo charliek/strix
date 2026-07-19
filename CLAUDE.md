@@ -53,6 +53,10 @@ A single binary crate, split into a library (`src/lib.rs`) and a thin binary
   overwrite a file that fails to parse.
 - `keys.rs` — the configurable keymap (`Action`, defaults, `[keys]` overrides);
   key dispatch itself lives in `App::on_key`/`App::on_mouse` (`app.rs`).
+- `comments.rs` — review-comment model, JSON store I/O (`<common_dir>/strix/
+  comments.json`, shared across linked worktrees), and the pure re-anchor
+  engine; `comments_cli.rs` is the agent-facing `strix comment
+  list|add|rm|clear|gc` surface over the same store.
 
 ## Git integration
 
