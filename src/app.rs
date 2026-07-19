@@ -1,6 +1,6 @@
 use std::cell::{Cell, Ref, RefCell};
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use ratatui::crossterm::event::{
@@ -11,6 +11,7 @@ use ratatui::style::Color;
 use ratatui::widgets::ListState;
 use syntect::parsing::SyntaxReference;
 
+use crate::comments::{self, Comment, Side};
 use crate::config::{Config, Setting};
 use crate::git::{
     Change, CommitFile, CommitInfo, DiffLine, FileDiff, FileEntry, LineKind, RefLabel, Repo,
@@ -144,7 +145,9 @@ impl Flash {
 
 /// A side-by-side row, referencing diff lines by index into the file's
 /// `Vec<DiffLine>`. Indices (not borrows) let the row layout be computed once
-/// per file and cached on `App` without a self-referential borrow.
+/// per file and cached on `App` without a self-referential borrow. Comment rows
+/// carry the comment *id* (not a vec index), so a concurrent removal can't shift
+/// a row onto the wrong comment.
 #[derive(Clone, Copy)]
 pub enum SbsRow {
     Hunk(usize),
@@ -152,6 +155,21 @@ pub enum SbsRow {
         left: Option<usize>,
         right: Option<usize>,
     },
+    /// A full-width review comment anchored below its line (spans both columns).
+    Comment(u64),
+    /// A full-width orphaned review comment, shown in the top-of-diff block.
+    Orphan(u64),
+}
+
+/// A unified-diff row: a diff line (by index), or a full-width review comment
+/// anchored below its line, or an orphaned comment in the top-of-diff block.
+/// Making unified row-driven (rather than a strict 1:1 lines→rows map) is what
+/// lets comments inject rows; metrics count rows, so scrolling reaches them.
+#[derive(Clone, Copy)]
+pub enum URow {
+    Line(usize),
+    Comment(u64),
+    Orphan(u64),
 }
 
 /// A blocking overlay that captures input until dismissed.
@@ -187,6 +205,16 @@ struct ReviewState {
     /// Bumped each time the file list is rebuilt by a refresh, so a test (and the
     /// churn guard's contract) can observe that an OID-unchanged reload skips it.
     relist_count: u64,
+    /// This review's comment inbox (the checked-out branch's set), loaded on
+    /// session open and refreshed by the store-dir watcher. Empty when comments
+    /// are inactive (`authoring == false`).
+    comments: Vec<Comment>,
+    /// The branch key this inbox lives under (`Repo::head_branch_key`).
+    branch_key: String,
+    /// Whether comments are active for this session: `true` only when the review
+    /// head OID == the checked-out HEAD OID (plan invariant §3.1.1). A review of a
+    /// range whose head isn't HEAD renders comment-free and can't author.
+    authoring: bool,
     /// The list's scroll offset, persisted between frames for mouse hit-testing.
     list_state: RefCell<ListState>,
     /// The file list's inner rect from the last render, for mouse hit-testing.
@@ -194,7 +222,7 @@ struct ReviewState {
 }
 
 impl ReviewState {
-    fn new(spec: ReviewSpec, files: Vec<CommitFile>) -> Self {
+    fn new(spec: ReviewSpec, files: Vec<CommitFile>, branch_key: String, authoring: bool) -> Self {
         ReviewState {
             spec,
             files,
@@ -203,9 +231,17 @@ impl ReviewState {
             diff: None,
             diff_key: None,
             relist_count: 0,
+            comments: Vec::new(),
+            branch_key,
+            authoring,
             list_state: RefCell::new(ListState::default()),
             list_area: Cell::new(Rect::default()),
         }
+    }
+
+    /// The comment with `id`, if it's in this inbox.
+    fn comment(&self, id: u64) -> Option<&Comment> {
+        self.comments.iter().find(|c| c.id == id)
     }
 }
 
@@ -265,6 +301,10 @@ pub struct App {
     /// fills them, takes `&App`.
     highlight_cache: RefCell<HashMap<String, HighlightedLine>>,
     sbs_rows: RefCell<Option<Vec<SbsRow>>>,
+    /// The unified row layout (diff lines interleaved with comment rows), cached
+    /// beside `sbs_rows` and invalidated at the same points plus on any comment
+    /// mutation. `None` until first built for the current diff.
+    unified_rows: RefCell<Option<Vec<URow>>>,
 
     /// Persisted so the staging list's scroll offset survives between frames
     /// and can be read for mouse hit-testing. The pane rects are recorded
@@ -354,7 +394,13 @@ impl App {
             Some(range) => {
                 let spec = repo.resolve_range(range)?;
                 let files = repo.range_files(&spec)?;
-                Some(ReviewState::new(spec, files))
+                let branch_key = repo.head_branch_key()?;
+                // Comments are active only when the reviewed head is the
+                // checked-out HEAD (plan invariant §3.1.1): that makes the human's
+                // TUI inbox and the agent's CLI inbox provably the same set.
+                let head_oid = repo.gix().head_id().ok().map(|id| id.detach());
+                let authoring = head_oid == Some(spec.head);
+                Some(ReviewState::new(spec, files, branch_key, authoring))
             }
             None => None,
         };
@@ -389,6 +435,7 @@ impl App {
             diff_content_rows: Cell::new(0),
             highlight_cache: RefCell::new(HashMap::new()),
             sbs_rows: RefCell::new(None),
+            unified_rows: RefCell::new(None),
             staging_state: RefCell::new(ListState::default()),
             staging_area: Cell::new(Rect::default()),
             diff_area: Cell::new(Rect::default()),
@@ -417,6 +464,10 @@ impl App {
             config_dir: None,
         };
         app.clamp_selection();
+        // Load the review inbox (records the range + re-anchors, per §3.1.1). A
+        // corrupt store is recoverable: it flashes and opens comment-free rather
+        // than failing construction.
+        app.reanchor_review_comments();
         app.sync_active();
         Ok(app)
     }
@@ -1421,10 +1472,11 @@ impl App {
             // in place must not yank the view back up while the user scrolls.
             self.diff_scroll = 0;
         }
-        // The cached highlights / side-by-side layout describe the previous
-        // diff; drop them so the new one is recomputed lazily on next render.
+        // The cached highlights / row layouts describe the previous diff; drop
+        // them so the new one is recomputed lazily on next render.
         self.highlight_cache.borrow_mut().clear();
         *self.sbs_rows.borrow_mut() = None;
+        *self.unified_rows.borrow_mut() = None;
     }
 
     /// Keep whichever view is active in sync after an input event.
@@ -1473,8 +1525,10 @@ impl App {
             return;
         };
         let (old_base, old_head) = (review.spec.base, review.spec.head);
+        let old_branch_key = review.branch_key.clone();
         // Re-resolve from the stored input by borrow (no clone): the range is only
-        // re-listed if the resolved tips moved.
+        // re-listed if the resolved tips moved. Resolving up front also feeds the
+        // inbox-identity recompute below.
         let spec = match self.repo.resolve_range(&review.spec.input) {
             Ok(spec) => spec,
             Err(err) => {
@@ -1483,6 +1537,37 @@ impl App {
                 return;
             }
         };
+
+        // Recompute the inbox identity from fresh repo state (plan finding 1). An
+        // external `git checkout` while the TUI is open moves HEAD, changing both
+        // which branch's inbox to read (`branch_key`) and whether the reviewed head
+        // is still checked out (`authoring`, invariant §3.1.1). Both were fixed at
+        // construction; refreshing them *before* the store re-read below means we
+        // read the new branch's set and gate authoring on the current head. For
+        // `strix diff main` the reviewed head follows HEAD (authoring stays true,
+        // the inbox just changes branch); for a fixed `A..B` the head is pinned, so
+        // moving HEAD off it turns authoring off.
+        let head_oid = self.repo.gix().head_id().ok().map(|id| id.detach());
+        let branch_key = self
+            .repo
+            .head_branch_key()
+            .unwrap_or_else(|_| old_branch_key.clone());
+        let key_changed = branch_key != old_branch_key;
+        if let Some(review) = self.review.as_mut() {
+            review.authoring = head_oid == Some(spec.head);
+            review.branch_key = branch_key;
+        }
+        if key_changed {
+            // The inbox changed identity; drop cached comment rows so they rebuild
+            // for the new branch's set.
+            self.invalidate_comment_rows();
+        }
+
+        // Re-read the store from disk (plan §3.2b) so an agent's `rm`/`add` — and
+        // any new branch key above — is reflected even when the range OIDs are
+        // unchanged. Cheap and write-free, so it can't drive a reload loop.
+        self.reload_review_comments();
+
         if spec.base == old_base && spec.head == old_head {
             // Range unchanged: keep the list, selection, scroll, and warm caches.
             self.clear_review_error();
@@ -1523,15 +1608,124 @@ impl App {
             // Force the open diff to recompute against the new tips.
             review.diff_key = None;
         }
+        // The range moved, so a full re-anchor pass runs against the new diff
+        // (write elided when nothing moved — plan §3.2b), updating the in-memory
+        // set the row model reads.
+        self.reanchor_review_comments();
         self.sync_review_diff();
+    }
+
+    /// Re-read the comment inbox from disk and replace the in-memory set. Cheap,
+    /// write-free (so it can't loop the store-dir watcher), and a no-op when
+    /// comments are inactive. On a load error the prior set is kept and an error
+    /// flashes at most once (a corrupt store must not spam on every reload).
+    fn reload_review_comments(&mut self) {
+        let dir = self.repo.strix_dir();
+        let (active, branch) = match self.review.as_ref() {
+            Some(review) if review.authoring => (true, review.branch_key.clone()),
+            _ => (false, String::new()),
+        };
+        if !active {
+            // Inactive means no review, or the reviewed head is no longer the
+            // checked-out HEAD (a `git checkout` moved off it — finding 1). Drop
+            // any previously-loaded set so a now-hidden inbox can't keep rendering
+            // stale comments.
+            let cleared = self.review.as_mut().is_some_and(|review| {
+                let had = !review.comments.is_empty();
+                review.comments.clear();
+                had
+            });
+            if cleared {
+                self.invalidate_comment_rows();
+            }
+            return;
+        }
+        match comments::load(&dir) {
+            Ok(store) => {
+                let set = store
+                    .branches
+                    .get(&branch)
+                    .map(|b| b.comments.clone())
+                    .unwrap_or_default();
+                if let Some(review) = self.review.as_mut() {
+                    review.comments = set;
+                }
+                self.invalidate_comment_rows();
+                self.clear_comment_error();
+            }
+            Err(err) => {
+                tracing::warn!("re-reading comments store failed: {err:#}");
+                self.flash_comment_error(err);
+            }
+        }
+    }
+
+    /// Record the range + run the write-elided re-anchor pass against the current
+    /// review diff, replacing the in-memory set with the result. Runs on session
+    /// open (plan §3.1.1 / §3.2) and the OID-changed refresh branch; inactive → a
+    /// no-op. A store error keeps the prior set and flashes once, so a corrupt
+    /// store opens comment-free rather than failing construction.
+    fn reanchor_review_comments(&mut self) {
+        let dir = self.repo.strix_dir();
+        let (branch, spec, files) = match self.review.as_ref() {
+            Some(review) if review.authoring => (
+                review.branch_key.clone(),
+                review.spec.clone(),
+                review.files.clone(),
+            ),
+            _ => return,
+        };
+        match record_range_and_reanchor(&self.repo, &dir, &branch, &spec, &files) {
+            Ok(set) => {
+                if let Some(review) = self.review.as_mut() {
+                    review.comments = set;
+                }
+                self.invalidate_comment_rows();
+                self.clear_comment_error();
+            }
+            Err(err) => {
+                tracing::warn!("loading review comments failed: {err:#}");
+                self.flash_comment_error(err);
+            }
+        }
+    }
+
+    /// Whether the footer currently shows an error flash whose text starts with
+    /// `prefix` — used to de-dup a recurring store error and to clear it once the
+    /// store reads cleanly again.
+    fn has_error_flash(&self, prefix: &str) -> bool {
+        self.flash
+            .as_ref()
+            .is_some_and(|flash| flash.kind == FlashKind::Error && flash.text.starts_with(prefix))
+    }
+
+    /// Flash a comment-store error at most once: if the footer already carries one,
+    /// leave it (a corrupt store recurs on every watcher reload — don't spam).
+    fn flash_comment_error(&mut self, err: anyhow::Error) {
+        if !self.has_error_flash("comments: ") {
+            self.flash = Some(Flash::error(format!("comments: {err}")));
+        }
+    }
+
+    /// Clear a lingering comment-store error flash once the store reads cleanly
+    /// again (mirrors `clear_review_error`).
+    fn clear_comment_error(&mut self) {
+        if self.has_error_flash("comments: ") {
+            self.flash = None;
+        }
+    }
+
+    /// Drop the comment-bearing row caches so the next render rebuilds them (after
+    /// any comment mutation or reload).
+    fn invalidate_comment_rows(&self) {
+        *self.unified_rows.borrow_mut() = None;
+        *self.sbs_rows.borrow_mut() = None;
     }
 
     /// A successful review refresh clears a lingering review failure flash, so a
     /// watcher-driven recovery doesn't keep shouting about a fixed problem.
     fn clear_review_error(&mut self) {
-        if self.flash.as_ref().is_some_and(|flash| {
-            flash.kind == FlashKind::Error && flash.text.starts_with("review: ")
-        }) {
+        if self.has_error_flash("review: ") {
             self.flash = None;
         }
     }
@@ -1615,6 +1809,7 @@ impl App {
         self.diff_scroll = 0;
         self.highlight_cache.borrow_mut().clear();
         *self.sbs_rows.borrow_mut() = None;
+        *self.unified_rows.borrow_mut() = None;
     }
 
     /// Syntax-highlight one already-sanitised line, memoised per file so
@@ -1640,14 +1835,110 @@ impl App {
     }
 
     /// The side-by-side row layout for the current diff, computed once per file
-    /// and cached. Rows reference `lines` by index.
+    /// and cached. Rows reference `lines` by index; review comments inject
+    /// full-width rows below their anchor (and an orphan block at the top).
     pub fn sbs_rows(&self, lines: &[DiffLine]) -> Ref<'_, Vec<SbsRow>> {
         if self.sbs_rows.borrow().is_none() {
-            *self.sbs_rows.borrow_mut() = Some(side_by_side_rows(lines));
+            let (orphans, placements) = self.active_placements(lines);
+            *self.sbs_rows.borrow_mut() = Some(side_by_side_rows_with_comments(
+                lines,
+                &orphans,
+                &placements,
+            ));
         }
         Ref::map(self.sbs_rows.borrow(), |cached| {
             cached.as_ref().expect("filled above")
         })
+    }
+
+    /// The unified row layout for the current diff: diff lines interleaved with
+    /// comment rows (and a top orphan block), computed once per (diff, comments)
+    /// and cached beside `sbs_rows`.
+    pub fn unified_rows(&self, lines: &[DiffLine]) -> Ref<'_, Vec<URow>> {
+        if self.unified_rows.borrow().is_none() {
+            let (orphans, placements) = self.active_placements(lines);
+            *self.unified_rows.borrow_mut() =
+                Some(unified_rows_with_comments(lines, &orphans, &placements));
+        }
+        Ref::map(self.unified_rows.borrow(), |cached| {
+            cached.as_ref().expect("filled above")
+        })
+    }
+
+    /// The comment placements for the diff being rendered: the orphaned ids (for
+    /// the top block) and a map of diff-line index → comment ids anchored just
+    /// below it, both ordered by id. Empty outside a review session (comments are
+    /// a Review-only feature in v1), so status/history rows are unchanged.
+    fn active_placements(&self, lines: &[DiffLine]) -> (Vec<u64>, BTreeMap<usize, Vec<u64>>) {
+        let Some(review) = self.review.as_ref() else {
+            return (Vec::new(), BTreeMap::new());
+        };
+        if self.view != ViewMode::Review {
+            return (Vec::new(), BTreeMap::new());
+        }
+        let Some(path) = review.files.get(review.selected).map(|f| f.path.as_str()) else {
+            return (Vec::new(), BTreeMap::new());
+        };
+        comment_placements(lines, &review.comments, path)
+    }
+
+    /// The comment with `id` in the active review inbox, for rendering a row.
+    pub fn review_comment(&self, id: u64) -> Option<Comment> {
+        self.review.as_ref().and_then(|r| r.comment(id).cloned())
+    }
+
+    /// How many comments (anchored or orphaned) the review inbox holds for `file`.
+    /// Drives the file-list `● n` badge; always 0 outside an active review.
+    pub fn review_comment_count(&self, file: &str) -> usize {
+        self.review
+            .as_ref()
+            .map(|r| r.comments.iter().filter(|c| c.file == file).count())
+            .unwrap_or(0)
+    }
+
+    /// The count of orphaned comments that no diff block can show: those on files
+    /// that dropped out of the range entirely. A *listed* file's orphans — binary
+    /// and empty-text files included — are reachable in that file's top orphan
+    /// block when it's selected (finding 2) and counted in its badge, so they're
+    /// excluded here. Deliberately no binary classification: the footer once used
+    /// `CommitFile.stat.binary` (numstat), which can disagree with the NUL-byte
+    /// classifier that render/re-anchor use (e.g. `.gitattributes`), double-counting
+    /// or dropping an orphan (finding 3). Drives the footer's `⚠ N orphaned` notice.
+    pub fn orphan_footer_count(&self) -> usize {
+        let Some(review) = self.review.as_ref() else {
+            return 0;
+        };
+        review
+            .comments
+            .iter()
+            .filter(|c| c.orphaned)
+            .filter(|c| !review.files.iter().any(|f| f.path == c.file))
+            .count()
+    }
+
+    /// The orphaned comments on the currently-selected review file, ordered by id.
+    /// These render in the diff pane's top orphan block; for a file whose diff is
+    /// empty or binary (no lines to anchor to) it's the *only* place they can
+    /// appear, so the block must render regardless of diff kind (finding 2).
+    /// Always empty outside an active review session in the Review view.
+    pub fn selected_file_orphans(&self) -> Vec<u64> {
+        let Some(review) = self.review.as_ref() else {
+            return Vec::new();
+        };
+        if self.view != ViewMode::Review {
+            return Vec::new();
+        }
+        let Some(path) = review.files.get(review.selected).map(|f| f.path.as_str()) else {
+            return Vec::new();
+        };
+        let mut ids: Vec<u64> = review
+            .comments
+            .iter()
+            .filter(|c| c.orphaned && c.file == path)
+            .map(|c| c.id)
+            .collect();
+        ids.sort_unstable();
+        ids
     }
 
     // --- History view: accessors for rendering + mouse ---
@@ -1935,6 +2226,137 @@ impl App {
             self.flash = Some(Flash::info(format!("couldn't save setting: {err}")));
         }
     }
+}
+
+/// Record `spec.input` as the branch's reviewed range and re-anchor its comments
+/// against the range diff, persisting **only when something changed** (the range
+/// recording or a re-anchor move). Returns the branch's comments after the pass.
+///
+/// The write elision is what prevents a re-anchor → store write → watcher →
+/// reload loop (plan §3.2): a pass that moves nothing and re-records the same
+/// range writes nothing. A corrupt/unsupported store surfaces as an `Err` (the
+/// caller flashes and keeps an empty/prior set — construction never fails).
+fn record_range_and_reanchor(
+    repo: &Repo,
+    dir: &Path,
+    branch: &str,
+    spec: &ReviewSpec,
+    files: &[CommitFile],
+) -> anyhow::Result<Vec<Comment>> {
+    comments::mutate_if_changed(dir, |store| {
+        let entry = store.branches.entry(branch.to_string()).or_default();
+        let range_changed = entry.range.as_deref() != Some(spec.input.as_str());
+        entry.range = Some(spec.input.clone());
+        // The diff for a file is computed at most once, and only for files that
+        // carry a comment (the engine caches per file).
+        let moved = comments::reanchor(&mut entry.comments, files, |file| {
+            repo.range_file_diff(spec, file)
+        });
+        (entry.comments.clone(), range_changed || moved)
+    })
+}
+
+/// The diff-line number on `side`, used to match a comment to its anchor line.
+fn line_no(line: &DiffLine, side: Side) -> Option<usize> {
+    match side {
+        Side::Old => line.old_no,
+        Side::New => line.new_no,
+    }
+}
+
+/// Resolve a file's comments into render placements: the orphaned ids (top block)
+/// and a diff-line-index → comment-ids map (rows anchored just below the matched
+/// line). A non-orphaned comment matches the first diff line whose `side` number
+/// equals its `line`; one that somehow can't be placed falls into the orphan
+/// block rather than being dropped. Both outputs are ordered by id.
+fn comment_placements(
+    lines: &[DiffLine],
+    comments: &[Comment],
+    file: &str,
+) -> (Vec<u64>, BTreeMap<usize, Vec<u64>>) {
+    let mut orphans: Vec<u64> = Vec::new();
+    let mut placements: BTreeMap<usize, Vec<u64>> = BTreeMap::new();
+    for comment in comments.iter().filter(|c| c.file == file) {
+        if comment.orphaned {
+            orphans.push(comment.id);
+            continue;
+        }
+        match lines
+            .iter()
+            .position(|line| line_no(line, comment.side) == Some(comment.line))
+        {
+            Some(index) => placements.entry(index).or_default().push(comment.id),
+            None => orphans.push(comment.id),
+        }
+    }
+    orphans.sort_unstable();
+    for ids in placements.values_mut() {
+        ids.sort_unstable();
+    }
+    (orphans, placements)
+}
+
+/// The comment ids to emit directly after diff-line `index`, ordered by id.
+fn comments_after(placements: &BTreeMap<usize, Vec<u64>>, index: usize) -> &[u64] {
+    placements.get(&index).map(Vec::as_slice).unwrap_or(&[])
+}
+
+/// The unified row layout: an `⚠ orphaned` block at the top, then each diff line
+/// followed by any comment rows anchored to it.
+fn unified_rows_with_comments(
+    lines: &[DiffLine],
+    orphans: &[u64],
+    placements: &BTreeMap<usize, Vec<u64>>,
+) -> Vec<URow> {
+    let mut rows = Vec::with_capacity(lines.len() + orphans.len());
+    rows.extend(orphans.iter().map(|&id| URow::Orphan(id)));
+    for index in 0..lines.len() {
+        rows.push(URow::Line(index));
+        rows.extend(
+            comments_after(placements, index)
+                .iter()
+                .map(|&id| URow::Comment(id)),
+        );
+    }
+    rows
+}
+
+/// The side-by-side row layout with comments: the orphan block, then the paired
+/// rows, each followed by its old-side comments then new-side comments (a Pair
+/// can hold both a deletion and an addition), each side ordered by id.
+fn side_by_side_rows_with_comments(
+    lines: &[DiffLine],
+    orphans: &[u64],
+    placements: &BTreeMap<usize, Vec<u64>>,
+) -> Vec<SbsRow> {
+    let base = side_by_side_rows(lines);
+    let mut rows = Vec::with_capacity(base.len() + orphans.len());
+    rows.extend(orphans.iter().map(|&id| SbsRow::Orphan(id)));
+    for row in base {
+        rows.push(row);
+        if let SbsRow::Pair { left, right } = row {
+            if let Some(l) = left {
+                rows.extend(
+                    comments_after(placements, l)
+                        .iter()
+                        .map(|&id| SbsRow::Comment(id)),
+                );
+            }
+            // A context row is one diff line on both sides (left == right); emit
+            // its comments once. A deletion+addition Pair has distinct indices, so
+            // old-side (left) comments already emitted, then new-side (right).
+            if let Some(r) = right {
+                if Some(r) != left {
+                    rows.extend(
+                        comments_after(placements, r)
+                            .iter()
+                            .map(|&id| SbsRow::Comment(id)),
+                    );
+                }
+            }
+        }
+    }
+    rows
 }
 
 /// Pair the unified diff lines into side-by-side rows (by index): context lines

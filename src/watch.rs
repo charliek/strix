@@ -17,9 +17,13 @@ use notify_debouncer_mini::{new_debouncer, DebounceEventResult};
 const DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// Start watching `root` recursively on a background thread; returns a receiver
-/// that yields `()` whenever a relevant change settles. Errors if the watch
-/// can't be established, so the caller can fall back to manual refresh.
-pub fn spawn(root: PathBuf) -> Result<Receiver<()>> {
+/// that yields `()` whenever a relevant change settles. Errors if the primary
+/// watch can't be established, so the caller can fall back to manual refresh.
+///
+/// `extra` roots are watched best-effort (a failure logs and is skipped): the
+/// comments store dir lives outside the worktree in a *linked* worktree, so
+/// watching it makes agent CLI writes refresh the TUI there too (plan §3.4).
+pub fn spawn(root: PathBuf, extra: Vec<PathBuf>) -> Result<Receiver<()>> {
     // Establish the watch on this thread so a setup failure (e.g. inotify
     // limits) surfaces to the caller rather than dying silently in a thread.
     let (debounce_tx, debounce_rx) = mpsc::channel::<DebounceEventResult>();
@@ -28,6 +32,11 @@ pub fn spawn(root: PathBuf) -> Result<Receiver<()>> {
         .watcher()
         .watch(&root, RecursiveMode::Recursive)
         .with_context(|| format!("watch {}", root.display()))?;
+    for path in extra {
+        if let Err(err) = debouncer.watcher().watch(&path, RecursiveMode::Recursive) {
+            tracing::warn!("watching {} failed: {err:#}", path.display());
+        }
+    }
 
     let (signal_tx, signal_rx) = mpsc::channel::<()>();
     std::thread::spawn(move || {
@@ -76,5 +85,7 @@ mod tests {
         assert!(is_relevant(Path::new("/repo/.git/HEAD")));
         assert!(is_relevant(Path::new("/repo/.git/refs/heads/main")));
         assert!(is_relevant(Path::new("/repo/src/main.rs")));
+        // The comments store under `.git/strix` must reach the TUI (agent writes).
+        assert!(is_relevant(Path::new("/repo/.git/strix/comments.json")));
     }
 }

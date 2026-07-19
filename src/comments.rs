@@ -157,6 +157,25 @@ where
     Ok(out)
 }
 
+/// The write-eliding cousin of [`mutate`]: read the store, apply `f`, and persist
+/// **only when `f`'s returned flag is `true`**. `f` returns `(value, changed)`.
+///
+/// This is what keeps a re-anchor pass that changed nothing from rewriting the
+/// file — and so from waking the store-dir watcher into a reload → re-anchor →
+/// write loop (plan §3.2). The fresh read still enforces the never-clobber and
+/// version guards before any write, exactly like [`mutate`].
+pub fn mutate_if_changed<F, T>(dir: &Path, f: F) -> Result<T>
+where
+    F: FnOnce(&mut Store) -> (T, bool),
+{
+    let mut store = load(dir)?;
+    let (out, changed) = f(&mut store);
+    if changed {
+        save(dir, &store)?;
+    }
+    Ok(out)
+}
+
 /// Write `store` to `dir/comments.json` as pretty-printed JSON (agent-readable),
 /// atomically via [`crate::config::write_atomic`]. Creates `dir` if missing.
 ///

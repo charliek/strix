@@ -33,6 +33,10 @@ pub struct Theme {
     pub del_bg: Color,
     pub hunk: Color,
     pub line_no: Color,
+    /// Accent for review comments (the `● you`/`● agent` rows and the file-list
+    /// `● n` badge). A purple/magenta family in every preset, distinct from the
+    /// add/del/hunk diff colours.
+    pub comment: Color,
     /// Cycling colours for the history graph's branch lanes.
     pub lanes: Vec<Color>,
 }
@@ -192,6 +196,7 @@ impl Theme {
             del_bg: rgb(49, 32, 39),
             hunk: rgb(125, 207, 255),
             line_no: rgb(60, 67, 99),
+            comment: rgb(187, 154, 247),
             lanes: vec![
                 rgb(122, 162, 247),
                 rgb(158, 206, 106),
@@ -228,6 +233,7 @@ impl Theme {
             del_bg: rgb(42, 31, 31),
             hunk: rgb(95, 175, 215),
             line_no: rgb(88, 88, 88),
+            comment: rgb(175, 135, 215),
             lanes: vec![
                 rgb(95, 135, 215),
                 rgb(135, 175, 95),
@@ -264,6 +270,7 @@ impl Theme {
             del_bg: rgb(255, 238, 240),
             hunk: rgb(1, 132, 188),
             line_no: rgb(192, 192, 192),
+            comment: rgb(166, 38, 164),
             lanes: vec![
                 rgb(64, 120, 242),
                 rgb(80, 161, 79),
@@ -300,6 +307,7 @@ impl Theme {
             del_bg: rgb(48, 35, 43),
             hunk: rgb(137, 220, 235),
             line_no: rgb(69, 71, 90),
+            comment: rgb(203, 166, 247),
             lanes: vec![
                 rgb(137, 180, 250),
                 rgb(166, 227, 161),
@@ -336,6 +344,7 @@ impl Theme {
             del_bg: rgb(58, 36, 32),
             hunk: rgb(131, 165, 152),
             line_no: rgb(80, 73, 69),
+            comment: rgb(211, 134, 155),
             lanes: vec![
                 rgb(131, 165, 152),
                 rgb(184, 187, 38),
@@ -425,6 +434,7 @@ struct ColorsFile {
     del_bg: Option<String>,
     hunk: Option<String>,
     line_no: Option<String>,
+    comment: Option<String>,
 }
 
 impl ColorsFile {
@@ -459,5 +469,6 @@ impl ColorsFile {
         set(&self.del_bg, &mut theme.del_bg);
         set(&self.hunk, &mut theme.hunk);
         set(&self.line_no, &mut theme.line_no);
+        set(&self.comment, &mut theme.comment);
     }
 }

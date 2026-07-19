@@ -66,7 +66,19 @@ pub fn run() -> Result<()> {
     // Watch the true working-tree root (not a possibly-subdir CLI path) so every
     // change is caught. A watcher that fails to start degrades to manual refresh.
     let watch_rx = if config.auto_refresh() {
-        match watch::spawn(app.repo.workdir().to_path_buf()) {
+        let workdir = app.repo.workdir().to_path_buf();
+        // Also watch the comments store dir so an agent's CLI writes refresh the
+        // TUI. Create it first so notify can bind it. In a primary checkout it's
+        // under `.git` (already covered by the recursive workdir watch), so add it
+        // only when it lies outside the worktree — the linked-worktree case.
+        let strix_dir = app.repo.strix_dir();
+        let _ = std::fs::create_dir_all(&strix_dir);
+        let extra = if strix_dir.starts_with(&workdir) {
+            Vec::new()
+        } else {
+            vec![strix_dir]
+        };
+        match watch::spawn(workdir, extra) {
             Ok(rx) => Some(rx),
             Err(err) => {
                 tracing::warn!("file watcher failed to start: {err:#}");

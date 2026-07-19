@@ -206,6 +206,18 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         ],
     };
     let mut spans = Vec::new();
+    // Review-only: orphaned comments that no diff block can show (files gone from
+    // the range, or binary files) are surfaced here — `strix comment list` is the
+    // only way to see/clear them (plan §3.4).
+    if app.view == ViewMode::Review {
+        let orphans = app.orphan_footer_count();
+        if orphans > 0 {
+            spans.push(Span::styled(
+                format!(" ⚠ {orphans} orphaned — strix comment list  "),
+                Style::new().fg(theme.del).add_modifier(Modifier::BOLD),
+            ));
+        }
+    }
     for (key, label) in hints {
         spans.push(Span::styled(key, key_style));
         spans.push(Span::styled(label, label_style));
