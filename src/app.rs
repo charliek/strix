@@ -172,6 +172,70 @@ pub enum URow {
     Orphan(u64),
 }
 
+/// The *logical* selectable unit the diff cursor addresses, decoupled from the
+/// physical row it renders on. `Code` carries the diff-line index (unique to the
+/// row within the current mode: unified uses the line index, side-by-side uses
+/// a pair's present side or the hunk index); `Comment`/`Orphan` carry the
+/// comment id. Addressing a `RowTarget` rather than a physical row index is what
+/// lets a later commit expand one comment into a multi-row box (or an in-place
+/// editor) without touching cursor/scroll logic: the cursor still names a target,
+/// the width-keyed layout still maps physical rows → targets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowTarget {
+    Code(usize),
+    Comment(u64),
+    Orphan(u64),
+}
+
+/// The in-place comment editor's state. A placeholder for now — the editor is
+/// still the centered `Modal::CommentInput`; a later commit moves editing into
+/// [`DiffPaneState::editing`] and fills this in. Never constructed in C1.
+#[derive(Debug)]
+#[allow(dead_code)]
+struct CommentEdit;
+
+/// A diff pane's cursor + editor state, owned by each view that has a cursor.
+/// The cursor names a [`RowTarget`] (logical), not a physical row: `None` is the
+/// reset state (top of the layout), resolved to physical row 0 once the layout
+/// exists — a file change or mode toggle resets before the new layout is built,
+/// so the concrete target isn't yet known. Scroll/metrics/row caches stay
+/// App-global (History shares them and has no cursor).
+#[derive(Debug, Default)]
+struct DiffPaneState {
+    cursor: Option<RowTarget>,
+    /// The in-place editor slot, filled in when it lands; always `None` in C1
+    /// (the editor is still `Modal::CommentInput`). Kept here so the later
+    /// commit doesn't reshape this struct.
+    #[allow(dead_code)]
+    editing: Option<CommentEdit>,
+}
+
+/// The logical target a unified row renders. The physical↔logical bridge for
+/// unified mode (see [`RowTarget`]).
+fn urow_target(row: &URow) -> RowTarget {
+    match *row {
+        URow::Line(li) => RowTarget::Code(li),
+        URow::Comment(id) => RowTarget::Comment(id),
+        URow::Orphan(id) => RowTarget::Orphan(id),
+    }
+}
+
+/// The logical target a side-by-side row renders. A `Pair` always has at least
+/// one side (`flush_pairs` never emits an empty pair), so its present side's
+/// line index is a stable per-row identity.
+fn sbs_target(row: &SbsRow) -> RowTarget {
+    match *row {
+        SbsRow::Hunk(i) => RowTarget::Code(i),
+        SbsRow::Pair { left, right } => RowTarget::Code(
+            right
+                .or(left)
+                .expect("a side-by-side pair always has a side"),
+        ),
+        SbsRow::Comment(id) => RowTarget::Comment(id),
+        SbsRow::Orphan(id) => RowTarget::Orphan(id),
+    }
+}
+
 /// A comment's anchor, captured *by value* when the input modal opens so a
 /// watcher reload that rebuilds the diff mid-typing can't dangle it. Submit
 /// persists exactly these fields; if the diff moved underneath, the comment
@@ -218,11 +282,10 @@ struct ReviewState {
     files: Vec<CommitFile>,
     /// Row selected in `files` (0-based; meaningless when `files` is empty).
     selected: usize,
-    /// The diff cursor: an index into the active mode's row list (unified or
-    /// side-by-side), able to rest on an injected comment/orphan row. Moved by
-    /// j/k/g/G/ctrl-d/u while the diff pane has focus, reset to 0 on file change
-    /// and mode toggle, clamped to the row count after a relist (plan §3.4).
-    cursor: usize,
+    /// The diff pane's cursor + editor state. The cursor names a [`RowTarget`]
+    /// (logical), moved by j/k/g/G/ctrl-d/u while the diff pane has focus, reset
+    /// on file change and mode toggle, clamped after a relist (plan §3.4).
+    pane: DiffPaneState,
     focus: ReviewFocus,
     /// The cached diff for the selected file and the `(base, head, path)` OID key
     /// it was computed for, so a moved range tip recomputes it.
@@ -253,7 +316,7 @@ impl ReviewState {
             spec,
             files,
             selected: 0,
-            cursor: 0,
+            pane: DiffPaneState::default(),
             focus: ReviewFocus::List,
             diff: None,
             diff_key: None,
@@ -881,10 +944,10 @@ impl App {
                 self.select_review_file(target);
             }
             ReviewFocus::Diff => {
-                let last = self.review_row_count().saturating_sub(1);
-                if let Some(review) = self.review.as_mut() {
-                    review.cursor = if bottom { last } else { 0 };
-                }
+                let count = self.review_row_count();
+                let idx = if bottom { count.saturating_sub(1) } else { 0 };
+                let target = self.review_target_at(idx);
+                self.set_review_cursor(target);
                 self.review_reveal_cursor();
             }
         }
@@ -900,22 +963,26 @@ impl App {
         if let Some(review) = self.review.as_mut() {
             if review.selected != idx {
                 review.selected = idx;
-                review.cursor = 0;
+                // `None` is the top-of-layout reset; the new file's layout doesn't
+                // exist yet (it's built by the trailing `sync_active`).
+                review.pane.cursor = None;
             }
         }
     }
 
-    /// Move the diff cursor by `step` rows (clamped), then scroll the viewport so
-    /// it stays visible ("act-and-reveal", plan §3.4).
+    /// Move the diff cursor by `step` physical rows (clamped), then scroll the
+    /// viewport so it stays visible ("act-and-reveal", plan §3.4). The cursor is
+    /// re-pinned to the [`RowTarget`] at the new physical row.
     fn review_move_cursor(&mut self, down: bool, step: usize) {
-        let last = self.review_row_count().saturating_sub(1);
-        if let Some(review) = self.review.as_mut() {
-            review.cursor = if down {
-                (review.cursor + step).min(last)
-            } else {
-                review.cursor.saturating_sub(step)
-            };
-        }
+        let count = self.review_row_count();
+        let current = self.review_cursor();
+        let next = if down {
+            (current + step).min(count.saturating_sub(1))
+        } else {
+            current.saturating_sub(step)
+        };
+        let target = self.review_target_at(next);
+        self.set_review_cursor(target);
         self.review_reveal_cursor();
     }
 
@@ -932,9 +999,10 @@ impl App {
     /// Scroll the diff viewport so the cursor row is visible: no-op when it
     /// already is, otherwise snap the top edge to bring it just into view.
     fn review_reveal_cursor(&mut self) {
-        let Some(cursor) = self.review.as_ref().map(|r| r.cursor) else {
+        if self.review.is_none() {
             return;
-        };
+        }
+        let cursor = self.review_cursor();
         let viewport = self.diff_viewport.get() as usize;
         if viewport == 0 {
             return;
@@ -957,9 +1025,10 @@ impl App {
     /// tested against the same clamped offset the renderer paints with (so a
     /// wheel scroll that pushed it offscreen reads as not-visible).
     fn review_cursor_visible(&self) -> bool {
-        let Some(cursor) = self.review.as_ref().map(|r| r.cursor) else {
+        if self.review.is_none() {
             return false;
-        };
+        }
+        let cursor = self.review_cursor();
         let viewport = self.diff_viewport.get() as usize;
         if viewport == 0 {
             return false;
@@ -998,54 +1067,95 @@ impl App {
         }
     }
 
-    /// Clamp the diff cursor to the current row count (after a relist or a
-    /// comment deletion shrinks the row list). Keeps the index otherwise.
-    fn clamp_review_cursor(&mut self) {
-        let last = self.review_row_count().saturating_sub(1);
-        if let Some(review) = self.review.as_mut() {
-            review.cursor = review.cursor.min(last);
+    /// The logical [`RowTarget`] at physical row `index` in the active diff
+    /// mode's layout, or `None` when the row list is shorter. This is the
+    /// physical→logical half of the cursor seam; every cursor op reads through
+    /// it, so a later commit can map one target across several physical rows
+    /// (comment boxes) without changing cursor logic.
+    fn review_target_at(&self, index: usize) -> Option<RowTarget> {
+        let review = self.review.as_ref()?;
+        match review.diff.as_ref() {
+            Some(FileDiff::Text(lines)) if !lines.is_empty() => match self.diff_mode {
+                DiffMode::Unified => self.unified_rows(lines).get(index).map(urow_target),
+                DiffMode::SideBySide => self.sbs_rows(lines).get(index).map(sbs_target),
+            },
+            // Empty/binary diff: every rendered row is an orphan comment.
+            _ => self
+                .selected_file_orphans()
+                .get(index)
+                .map(|&id| RowTarget::Orphan(id)),
         }
+    }
+
+    /// The first physical row `target` occupies, or `None` when it isn't in the
+    /// current layout (e.g. its comment was removed). The logical→physical half
+    /// of the cursor seam.
+    fn review_index_of(&self, target: RowTarget) -> Option<usize> {
+        let review = self.review.as_ref()?;
+        match review.diff.as_ref() {
+            Some(FileDiff::Text(lines)) if !lines.is_empty() => match self.diff_mode {
+                DiffMode::Unified => self
+                    .unified_rows(lines)
+                    .iter()
+                    .position(|row| urow_target(row) == target),
+                DiffMode::SideBySide => self
+                    .sbs_rows(lines)
+                    .iter()
+                    .position(|row| sbs_target(row) == target),
+            },
+            _ => self
+                .selected_file_orphans()
+                .iter()
+                .position(|&id| RowTarget::Orphan(id) == target),
+        }
+    }
+
+    /// The target the cursor rests on: the pinned one, or (when unset after a
+    /// reset) the target at the top of the current layout.
+    fn review_cursor_target(&self) -> Option<RowTarget> {
+        let pinned = self.review.as_ref()?.pane.cursor;
+        pinned.or_else(|| self.review_target_at(0))
+    }
+
+    /// Pin the diff cursor to `target` (the write-side mirror of the read seam);
+    /// `None` resets it to the top of the layout. A no-op outside a review.
+    fn set_review_cursor(&mut self, target: Option<RowTarget>) {
+        if let Some(review) = self.review.as_mut() {
+            review.pane.cursor = target;
+        }
+    }
+
+    /// Clamp the diff cursor after a relist or a comment deletion shrinks the row
+    /// list: keep the pinned target when it still resolves, else snap to the last
+    /// physical row's target (top when the list is empty).
+    fn clamp_review_cursor(&mut self) {
+        let Some(pinned) = self.review.as_ref().and_then(|r| r.pane.cursor) else {
+            return; // unset already means "top"; nothing to clamp
+        };
+        if self.review_index_of(pinned).is_some() {
+            return; // still resolves
+        }
+        // Snap to the last physical row's target (`None`/top when the list is
+        // empty: `review_target_at` of an empty layout is `None`).
+        let count = self.review_row_count();
+        let target = self.review_target_at(count.saturating_sub(1));
+        self.set_review_cursor(target);
     }
 
     /// The comment id under the cursor in the selected file, or `None` when the
     /// cursor rests on a code/hunk row (so `x` there is a silent no-op).
     fn cursor_comment_id(&self) -> Option<u64> {
-        let review = self.review.as_ref()?;
-        let cursor = review.cursor;
-        match review.diff.as_ref() {
-            Some(FileDiff::Text(lines)) if !lines.is_empty() => match self.diff_mode {
-                DiffMode::Unified => match self.unified_rows(lines).get(cursor)? {
-                    URow::Comment(id) | URow::Orphan(id) => Some(*id),
-                    URow::Line(_) => None,
-                },
-                DiffMode::SideBySide => match self.sbs_rows(lines).get(cursor)? {
-                    SbsRow::Comment(id) | SbsRow::Orphan(id) => Some(*id),
-                    SbsRow::Hunk(_) | SbsRow::Pair { .. } => None,
-                },
-            },
-            // Empty/binary diff: every rendered row is an orphan comment.
-            _ => self.selected_file_orphans().get(cursor).copied(),
+        match self.review_cursor_target()? {
+            RowTarget::Comment(id) | RowTarget::Orphan(id) => Some(id),
+            RowTarget::Code(_) => None,
         }
     }
 
     /// The row index of comment `id` in the selected file's active row list, for
     /// placing the cursor after a jump. `None` when it isn't placed in this file.
     fn comment_row_index(&self, id: u64) -> Option<usize> {
-        let review = self.review.as_ref()?;
-        match review.diff.as_ref() {
-            Some(FileDiff::Text(lines)) if !lines.is_empty() => match self.diff_mode {
-                DiffMode::Unified => self.unified_rows(lines).iter().position(
-                    |row| matches!(row, URow::Comment(cid) | URow::Orphan(cid) if *cid == id),
-                ),
-                DiffMode::SideBySide => self.sbs_rows(lines).iter().position(
-                    |row| matches!(row, SbsRow::Comment(cid) | SbsRow::Orphan(cid) if *cid == id),
-                ),
-            },
-            _ => self
-                .selected_file_orphans()
-                .iter()
-                .position(|&cid| cid == id),
-        }
+        self.review_index_of(RowTarget::Comment(id))
+            .or_else(|| self.review_index_of(RowTarget::Orphan(id)))
     }
 
     /// Every comment on a *listed* file, in file-list order then by anchor line
@@ -1115,9 +1225,8 @@ impl App {
         // late for this in-handler placement).
         self.sync_review_diff();
         if let Some(row) = self.comment_row_index(target) {
-            if let Some(review) = self.review.as_mut() {
-                review.cursor = row;
-            }
+            let cursor = self.review_target_at(row);
+            self.set_review_cursor(cursor);
         }
         self.review_reveal_cursor();
     }
@@ -1234,26 +1343,20 @@ impl App {
     /// `context` is the line's text. In side-by-side a replaced-line pair anchors
     /// to its new side when present, else its old side.
     fn cursor_code_anchor(&self) -> Option<CommentAnchor> {
+        // Resolve the cursor's target first (dropping its borrows) before
+        // borrowing the file path / diff lines, so the nested cache reads inside
+        // `review_cursor_target` don't overlap the borrows below.
+        let RowTarget::Code(li) = self.review_cursor_target()? else {
+            return None;
+        };
         let review = self.review.as_ref()?;
         let file = review.files.get(review.selected)?.path.clone();
-        let cursor = review.cursor;
         let FileDiff::Text(lines) = review.diff.as_ref()? else {
             return None;
         };
-        if lines.is_empty() {
-            return None;
-        }
-        let li = match self.diff_mode {
-            DiffMode::Unified => match self.unified_rows(lines).get(cursor)? {
-                URow::Line(li) => *li,
-                URow::Comment(_) | URow::Orphan(_) => return None,
-            },
-            DiffMode::SideBySide => match self.sbs_rows(lines).get(cursor)? {
-                SbsRow::Pair { left, right } => right.or(*left)?,
-                SbsRow::Hunk(_) | SbsRow::Comment(_) | SbsRow::Orphan(_) => return None,
-            },
-        };
-        anchor_for_line(&lines[li], file)
+        // A hunk row maps to `Code(index)` too; `anchor_for_line` returns `None`
+        // for it, so no explicit hunk guard is needed here.
+        lines.get(li).and_then(|line| anchor_for_line(line, file))
     }
 
     /// Route a key to the comment input modal. Handles the editing branch of
@@ -1399,6 +1502,10 @@ impl App {
                     review.comments = set;
                 }
                 self.invalidate_comment_rows();
+                // A `Vanished` submit (the edited comment was removed underneath)
+                // shrinks the row list; re-pin the cursor so it can't linger on
+                // the deleted target (matches the delete path above).
+                self.clamp_review_cursor();
                 self.modal = None;
                 self.flash = Some(flash);
             }
@@ -1411,18 +1518,23 @@ impl App {
         }
     }
 
-    /// The diff cursor's row index (into the active mode's row list); `0` outside
-    /// a review session. Exposed for tests and comment navigation.
+    /// The diff cursor's physical row index (into the active mode's row list);
+    /// `0` outside a review session or when the cursor is at the top. The cursor
+    /// itself names a [`RowTarget`]; this projects it onto the current layout.
+    /// Exposed for tests and comment navigation.
     pub fn review_cursor(&self) -> usize {
-        self.review.as_ref().map(|r| r.cursor).unwrap_or(0)
+        self.review_cursor_target()
+            .and_then(|target| self.review_index_of(target))
+            .unwrap_or(0)
     }
 
     /// The cursor row to highlight while rendering — `Some(idx)` only in the
     /// review view with the diff pane focused (plan §3.4); `None` otherwise, so
-    /// the highlight never shows while the file list is focused.
+    /// the highlight never shows while the file list is focused. In C1 a target
+    /// spans one physical row, so a single index suffices.
     pub fn review_cursor_highlight(&self) -> Option<usize> {
         if self.view == ViewMode::Review && self.diff_focused() {
-            self.review.as_ref().map(|r| r.cursor)
+            self.review.is_some().then(|| self.review_cursor())
         } else {
             None
         }
@@ -1773,7 +1885,7 @@ impl App {
                 review.focus = ReviewFocus::List;
                 if row < review.files.len() {
                     review.selected = row;
-                    review.cursor = 0; // a new file starts at its first row
+                    review.pane.cursor = None; // a new file starts at its first row
                 }
             }
         } else if self.diff_area.get().contains(pos) {
@@ -1789,9 +1901,8 @@ impl App {
             let row = offset + (pos.y - diff.y) as usize;
             let count = self.review_row_count();
             if row < count {
-                if let Some(review) = self.review.as_mut() {
-                    review.cursor = row;
-                }
+                let target = self.review_target_at(row);
+                self.set_review_cursor(target);
             }
         }
     }
@@ -2800,11 +2911,10 @@ impl App {
             DiffMode::SideBySide => DiffMode::Unified,
         };
         self.diff_scroll = 0;
-        // The two modes have different row lists, so the cursor index doesn't
-        // carry over — reset to the top (plan §3.4).
-        if let Some(review) = self.review.as_mut() {
-            review.cursor = 0;
-        }
+        // The two modes have different row lists (a `Code` index means a
+        // different physical row), so the cursor doesn't carry over — reset to
+        // the top (plan §3.4).
+        self.set_review_cursor(None);
     }
 
     /// Flip the line-number gutter on/off. The gutter width is computed fresh
