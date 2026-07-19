@@ -46,9 +46,10 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let focused = app.diff_focused();
     let path = app.active_diff_path();
 
+    let label = app.active_diff_title();
     let title = match &path {
-        Some(path) => format!(" Diff · {path} "),
-        None => " Diff ".to_string(),
+        Some(path) => format!(" {label} · {path} "),
+        None => format!(" {label} "),
     };
     let block = panel_block(&title, focused, theme);
     let inner = block.inner(area);

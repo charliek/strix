@@ -368,7 +368,11 @@ pub struct App {
     /// Cached diff for the selected file; recomputed only when the selection
     /// changes (see `sync_diff`).
     pub current_diff: Option<FileDiff>,
-    diff_key: Option<(Section, String)>,
+    /// Keyed by file *path* only, not `(Section, path)`: the Status pane shows
+    /// one net HEAD→worktree diff per file (plan §0/§3.1), so a path that appears
+    /// in both the staged and unstaged sections selects the same computed diff
+    /// from either row — no recompute, no divergence.
+    diff_key: Option<String>,
     /// Set when an external refresh should recompute the open file's diff even
     /// though its `(section, path)` is unchanged (its content may have changed).
     /// Unlike navigating to a new file, this preserves the scroll position.
@@ -2173,9 +2177,8 @@ impl App {
     /// external refresh marked it dirty. Navigating to a different file resets
     /// the scroll; a same-file content refresh keeps it.
     fn sync_diff(&mut self) {
-        let key = self
-            .selected_file()
-            .map(|(section, entry)| (section, entry.path.clone()));
+        // Path only, not (section, path) — see the `diff_key` field doc.
+        let key = self.selected_file().map(|(_, entry)| entry.path.clone());
         let file_changed = key != self.diff_key;
         if !file_changed && !self.diff_dirty {
             return;
@@ -2185,7 +2188,7 @@ impl App {
         // (and repo) is released before assigning the cached fields.
         let diff = self
             .selected_file()
-            .map(|(section, entry)| self.repo.diff(section, entry));
+            .map(|(_, entry)| self.repo.file_diff_head_vs_worktree(entry));
         // A same-file refresh that produced an identical diff is a no-op: keep
         // the warm highlight / SBS caches and the scroll untouched, so a watcher
         // firing on unrelated activity doesn't churn or disturb the view.
@@ -2683,6 +2686,16 @@ impl App {
             ViewMode::Status => self.current_diff.as_ref(),
             ViewMode::History => self.history_diff.as_ref(),
             ViewMode::Review => self.review.as_ref().and_then(|review| review.diff.as_ref()),
+        }
+    }
+
+    /// The label shown before the path in the diff pane's title. The Status pane
+    /// shows the file's net pending change, so it reads `pending · HEAD→worktree`
+    /// (plan §0); History and Review keep the plain `Diff` label.
+    pub fn active_diff_title(&self) -> &'static str {
+        match self.view {
+            ViewMode::Status => "pending · HEAD→worktree",
+            ViewMode::History | ViewMode::Review => "Diff",
         }
     }
 
