@@ -9,7 +9,7 @@
 //! [`Repo::strix_dir`]: crate::git::Repo::strix_dir
 
 use std::collections::{BTreeMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -17,10 +17,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::git::{CommitFile, DiffLine, FileDiff};
 
-// The store schema version this build reads and writes. A store found with a
-// higher version is refused for both read and write (no silent downgrade).
-const STORE_VERSION: u32 = 1;
+// The store schema version this build reads and writes. A higher version is
+// refused for read and write (no silent downgrade); a version-1 (milestone-6)
+// store is backed up once and reset to empty on load (see [`load`]).
+const STORE_VERSION: u32 = 2;
 const STORE_FILE: &str = "comments.json";
+// Where [`load`] copies a version-1 store aside before resetting it to empty v2.
+const STORE_BACKUP_V1: &str = "comments.json.v1.bak";
 // Content-match re-anchoring only relocates a comment within this many lines of
 // its stored position; a farther match orphans instead of faking an "addressed"
 // signal by silently teleporting the note (plan §3.2).
@@ -45,10 +48,36 @@ pub enum Side {
     New,
 }
 
+/// Which review surface a comment belongs to. Serialized *flat* and additively
+/// into [`Comment`] via `#[serde(flatten)]` (plan §3.3): the internally-tagged
+/// `scope` key carries the discriminant, and a range comment additionally carries
+/// its `range` spec as a sibling key.
+///
+/// - [`Scope::WorkTree`] → `"scope":"worktree"` (no `range` key)
+/// - [`Scope::Range`]    → `"scope":"range","range":"<spec>"`
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "scope", rename_all = "snake_case")]
+pub enum Scope {
+    /// A comment on the uncommitted working tree (net HEAD-vs-worktree diff).
+    #[serde(rename = "worktree")]
+    WorkTree,
+    /// A comment on a committed range review; `range` is the `strix diff` spec.
+    Range { range: String },
+}
+
 /// A single review comment anchored to a line of a file's diff.
+///
+/// `scope` is flattened into the object as the pinned, additive JSON contract
+/// (plan §3.3): a worktree comment serializes `{"scope":"worktree", …}` (no
+/// `range` key), a range comment `{"scope":"range","range":"main", …}`. Every
+/// pre-existing field keeps its name and shape, so milestone-6 skill parsers
+/// keep working.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct Comment {
+    /// Which review surface this comment lives on (flattened; see [`Scope`]).
+    #[serde(flatten)]
+    pub scope: Scope,
     pub id: u64,
     pub source: Source,
     /// The file's new-side path (`CommitFile::path`); a later rename orphans it.
@@ -63,14 +92,26 @@ pub struct Comment {
     pub orphaned: bool,
     /// Unix epoch seconds.
     pub created_at: u64,
+    /// The HEAD commit OID (40-char lowercase hex) captured when a *worktree*
+    /// comment was authored — its stable baseline. Range comments don't carry it
+    /// (`None`, omitted from JSON). C2c compares it against the current HEAD to
+    /// drive sweep/stale; C2a only lands the field so the schema is stable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    /// Set when the anchored line's content drifted under a still-current HEAD:
+    /// surfaced with a dim marker, never auto-deleted. C2c drives it; here it
+    /// defaults false and is read by serde's derive, so it is not dead code.
+    #[serde(default)]
+    pub stale: bool,
 }
 
-/// One branch's inbox: the last reviewed range and its comments.
+/// One branch's inbox: the active reviewed range and its comments.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Branch {
-    /// The last `strix diff` argument recorded on this branch, or `None` until
-    /// a review session has run.
-    pub range: Option<String>,
+    /// The last `strix diff` range recorded on this branch — the *active range*,
+    /// the source for range-scoped operations — or `None` until a review session
+    /// has run.
+    pub active_range: Option<String>,
     pub comments: Vec<Comment>,
 }
 
@@ -115,9 +156,17 @@ impl Store {
 /// Load the store from `dir/comments.json`.
 ///
 /// A missing *or zero-byte* file is a valid empty store. A file that fails to
-/// parse returns an error and is left untouched. A store whose `version` is
-/// newer than this build understands is refused (read *and*, by extension,
-/// write — every mutation reads first) with a clear message.
+/// parse returns an error and is left untouched (never-clobber). Version handling
+/// (plan §3.0):
+///
+/// - version 2 (current) → parse normally.
+/// - version 1 (milestone-6) → back the file up once to `comments.json.v1.bak`,
+///   then return an empty v2 store. The old comments are intentionally dropped
+///   (backwards compatibility is not required); this is *not* an error. If the
+///   backup can't be written the error surfaces and the v1 file is left intact —
+///   we never reset without a backup.
+/// - version > 2 → refused for read (and, since every mutation reads first,
+///   write) with a clear message.
 pub fn load(dir: &Path) -> Result<Store> {
     let path = dir.join(STORE_FILE);
     let bytes = match std::fs::read(&path) {
@@ -128,18 +177,100 @@ pub fn load(dir: &Path) -> Result<Store> {
     if bytes.is_empty() {
         return Ok(Store::default());
     }
-    let store: Store =
+    // Decode only the version envelope first. A full `Store` parse requires the v2
+    // `Comment` shape (the flattened `scope` tag), so a *real* v1 file with
+    // comments would fail that parse and hit the never-clobber path — the upgrade
+    // has to route on `version` alone, never on a successful v2 decode.
+    let envelope: StoreEnvelope =
         serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
-    if store.version > STORE_VERSION {
-        anyhow::bail!(
+    match envelope.version {
+        v if v == STORE_VERSION => {
+            serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))
+        }
+        1 => {
+            backup_legacy_store(dir, &path, &bytes)?;
+            // Carry the old id counter into the empty v2 store so an id minted
+            // after the reset can't collide with one still referenced from the
+            // backup (a stale `rm <id>` would otherwise delete an unrelated new
+            // comment).
+            Ok(Store {
+                next_id: envelope.next_id.max(1),
+                ..Store::default()
+            })
+        }
+        v if v > STORE_VERSION => anyhow::bail!(
             "{} is comments store version {}, but this strix understands only \
              version {}; refusing to read or write it",
             path.display(),
-            store.version,
+            v,
             STORE_VERSION
-        );
+        ),
+        other => anyhow::bail!(
+            "{} is comments store version {}, which this strix does not recognize; \
+             refusing to read or write it",
+            path.display(),
+            other
+        ),
     }
-    Ok(store)
+}
+
+/// The minimal shape [`load`] decodes first, to route on `version` without
+/// committing to the current `Comment` schema (so a v1 file with comments still
+/// migrates instead of tripping the never-clobber guard).
+#[derive(Deserialize)]
+struct StoreEnvelope {
+    version: u32,
+    #[serde(default)]
+    next_id: u64,
+}
+
+/// Copy a version-1 store aside before the v2 upgrade resets it. The original
+/// bytes are written verbatim (they parsed as JSON, so they are valid UTF-8). An
+/// existing backup is **never destroyed**: an identical one makes this an
+/// idempotent no-op, and a *differing* one is kept while these bytes go to the
+/// first free numbered sibling (`comments.json.v1.bak.1`, `.2`, …). Uses the same
+/// atomic write as every other store write.
+fn backup_legacy_store(dir: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
+    let contents = std::str::from_utf8(bytes)
+        .with_context(|| format!("{} is not valid UTF-8", path.display()))?;
+    let Some(backup) = free_backup_path(dir, bytes)? else {
+        return Ok(()); // an identical backup already exists — nothing to do
+    };
+    crate::config::write_atomic(dir, &backup, contents)
+        .with_context(|| format!("backing up {} to {}", path.display(), backup.display()))?;
+    tracing::info!(
+        backup = %backup.display(),
+        "comments store upgraded v1 → v2; previous comments backed up and reset"
+    );
+    Ok(())
+}
+
+/// Where to back a v1 store up to: the base `comments.json.v1.bak` if free, else
+/// the first numbered sibling that is free — or `None` when an existing backup
+/// already holds these exact bytes (so a backup is never duplicated nor a
+/// differing one clobbered).
+fn free_backup_path(dir: &Path, bytes: &[u8]) -> Result<Option<PathBuf>> {
+    const MAX_BACKUPS: u32 = 100;
+    for n in 0..MAX_BACKUPS {
+        let candidate = if n == 0 {
+            dir.join(STORE_BACKUP_V1)
+        } else {
+            dir.join(format!("{STORE_BACKUP_V1}.{n}"))
+        };
+        match std::fs::read(&candidate) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Some(candidate)),
+            Err(err) => {
+                return Err(err).with_context(|| format!("reading {}", candidate.display()))
+            }
+            Ok(existing) if existing == bytes => return Ok(None), // already backed up
+            Ok(_) => continue,                                    // differs — keep it, try next
+        }
+    }
+    anyhow::bail!(
+        "refusing to reset the v1 comments store: {} already holds {} differing backups",
+        dir.display(),
+        MAX_BACKUPS
+    )
 }
 
 /// Apply `f` to a freshly-read store and persist the result atomically.
@@ -261,13 +392,39 @@ pub fn now_secs() -> u64 {
 /// `files` is the review's changed-file list; `diff_for` computes a file's
 /// `FileDiff` and is invoked at most once per file that carries a comment
 /// (results are cached). The algorithm is exactly plan §3.2.
-pub fn reanchor<F>(comments: &mut [Comment], files: &[CommitFile], mut diff_for: F) -> bool
+pub fn reanchor<F>(comments: &mut [Comment], files: &[CommitFile], diff_for: F) -> bool
 where
+    F: FnMut(&CommitFile) -> FileDiff,
+{
+    reanchor_scoped(comments, |_| true, files, diff_for)
+}
+
+/// Like [`reanchor`], but re-anchors only the comments for which `selected`
+/// returns `true`, leaving every other comment untouched.
+///
+/// This lets a caller re-anchor a single scope's comments — the worktree's, or
+/// one exact range's — against that scope's own diff without disturbing the other
+/// scope (plan §3.2/§3.3). Since a store's comments interleave scopes in one
+/// `Vec`, selection is by predicate rather than a contiguous sub-slice. The
+/// ±`REANCHOR_WINDOW` content-match and the per-file diff caching are identical
+/// to [`reanchor`]; there is deliberately **no** sweep/stale logic here (that
+/// lands in C2c).
+pub fn reanchor_scoped<S, F>(
+    comments: &mut [Comment],
+    selected: S,
+    files: &[CommitFile],
+    mut diff_for: F,
+) -> bool
+where
+    S: Fn(&Comment) -> bool,
     F: FnMut(&CommitFile) -> FileDiff,
 {
     let mut cache: BTreeMap<String, FileDiff> = BTreeMap::new();
     let mut changed = false;
     for comment in comments.iter_mut() {
+        if !selected(comment) {
+            continue;
+        }
         let before = (comment.line, comment.orphaned);
         match files.iter().find(|f| f.path == comment.file) {
             None => comment.orphaned = true,

@@ -11,7 +11,7 @@ use ratatui::style::Color;
 use ratatui::widgets::ListState;
 use syntect::parsing::SyntaxReference;
 
-use crate::comments::{self, Comment, Side, Source};
+use crate::comments::{self, Comment, Scope, Side, Source};
 use crate::config::{Config, Setting};
 use crate::git::{
     Change, CommitFile, CommitInfo, DiffLine, FileDiff, FileEntry, LineKind, RefLabel, Repo,
@@ -1466,6 +1466,11 @@ impl App {
                     // here too in case a comment is authored before that ran.
                     record_range(entry, &range_input);
                     entry.comments.push(Comment {
+                        // Comments authored in a `strix diff` session are
+                        // range-scoped; the review's range is the scope source.
+                        scope: Scope::Range {
+                            range: range_input.clone(),
+                        },
                         id,
                         source: Source::Human,
                         file: anchor.file.clone(),
@@ -1475,6 +1480,8 @@ impl App {
                         context: anchor.context.clone(),
                         orphaned: false,
                         created_at,
+                        base: None,
+                        stale: false,
                     });
                     SubmitOutcome::Added(entry.comments.clone())
                 }
@@ -2975,8 +2982,8 @@ fn record_range_and_reanchor(
 ) -> anyhow::Result<Vec<Comment>> {
     comments::mutate_if_changed(dir, |store| {
         let entry = store.branches.entry(branch.to_string()).or_default();
-        let range_changed = entry.range.as_deref() != Some(spec.input.as_str());
-        entry.range = Some(spec.input.clone());
+        let range_changed = entry.active_range.as_deref() != Some(spec.input.as_str());
+        entry.active_range = Some(spec.input.clone());
         // The diff for a file is computed at most once, and only for files that
         // carry a comment (the engine caches per file).
         let moved = comments::reanchor(&mut entry.comments, files, |file| {
@@ -3021,8 +3028,8 @@ fn char_byte_index(s: &str, idx: usize) -> usize {
 /// defensive mirror of the session-open pass (`record_range_and_reanchor`), so a
 /// comment authored before that ran still stamps the range.
 fn record_range(entry: &mut comments::Branch, range: &str) {
-    if entry.range.is_none() {
-        entry.range = Some(range.to_string());
+    if entry.active_range.is_none() {
+        entry.active_range = Some(range.to_string());
     }
 }
 

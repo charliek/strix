@@ -14,7 +14,7 @@ use anyhow::{bail, Result};
 use serde_json::json;
 
 use crate::cli::CommentAction;
-use crate::comments::{self, Comment, Side, Source};
+use crate::comments::{self, Comment, Scope, Side, Source};
 use crate::git::{DiffLine, FileDiff, Repo};
 
 /// Dispatch a `strix comment` action against the repository at `repo_path`.
@@ -43,7 +43,7 @@ fn list(repo: &Repo, dir: &Path, branch: &str, json_out: bool) -> Result<()> {
     // A corrupt/unsupported store fails here (non-zero) before any write.
     let store = comments::load(dir)?;
     let entry = store.branches.get(branch);
-    let range = entry.and_then(|b| b.range.clone());
+    let range = entry.and_then(|b| b.active_range.clone());
     let mut comments = entry.map(|b| b.comments.clone()).unwrap_or_default();
 
     // Re-anchor first, best-effort (plan §3.2c).
@@ -88,7 +88,10 @@ fn add(
 
     // Fresh read for the stored range (also fails fast on a corrupt store).
     let store = comments::load(dir)?;
-    let range = store.branches.get(branch).and_then(|b| b.range.clone());
+    let range = store
+        .branches
+        .get(branch)
+        .and_then(|b| b.active_range.clone());
 
     // Re-anchor the branch's existing comments too — the pass runs on `add` as
     // well as `list` (plan §3.2c), so an agent annotating also refreshes the set.
@@ -117,6 +120,11 @@ fn add(
     let comment = comments::mutate(dir, |store| {
         let id = store.take_id();
         let comment = Comment {
+            // The milestone-6 CLI is range-oriented; the branch's active range is
+            // the scope source. `--scope`/`--range` selection lands in C4.
+            scope: Scope::Range {
+                range: range.clone().unwrap_or_default(),
+            },
             id,
             source: Source::Agent,
             file: file.to_string(),
@@ -126,6 +134,8 @@ fn add(
             context,
             orphaned,
             created_at,
+            base: None,
+            stale: false,
         };
         store
             .branches

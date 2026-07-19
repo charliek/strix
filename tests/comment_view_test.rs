@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use common::{git, init_repo, init_repo_with_diverged_branches, write};
 use strix::app::App;
-use strix::comments::{Branch, Comment, Side, Source, Store};
+use strix::comments::{Branch, Comment, Scope, Side, Source, Store};
 use strix::config::Config;
 use strix::crossterm::event::{KeyCode, KeyEvent};
 use tempfile::TempDir;
@@ -36,6 +36,11 @@ fn strix_dir(repo: &Path) -> PathBuf {
 /// A comment builder with sensible defaults; override fields at the call site.
 fn comment(id: u64, source: Source, file: &str, side: Side, line: usize, text: &str) -> Comment {
     Comment {
+        // A `strix diff` range review; the range value is a C2a placeholder
+        // (scope is not asserted here — C3 makes it exact).
+        scope: Scope::Range {
+            range: String::new(),
+        },
         id,
         source,
         file: file.to_string(),
@@ -45,6 +50,8 @@ fn comment(id: u64, source: Source, file: &str, side: Side, line: usize, text: &
         context: None,
         orphaned: false,
         created_at: 1_700_000_000,
+        base: None,
+        stale: false,
     }
 }
 
@@ -65,12 +72,12 @@ fn seed_store(repo: &Path, branch: &str, range: Option<&str>, comments: Vec<Comm
     branches.insert(
         branch.to_string(),
         Branch {
-            range: range.map(str::to_string),
+            active_range: range.map(str::to_string),
             comments,
         },
     );
     let store = Store {
-        version: 1,
+        version: 2,
         next_id: 1000,
         branches,
     };
@@ -641,19 +648,19 @@ fn seed_two_branches(repo: &Path, a: (&str, Vec<Comment>), b: (&str, Vec<Comment
     branches.insert(
         a.0.to_string(),
         Branch {
-            range: Some("main".to_string()),
+            active_range: Some("main".to_string()),
             comments: a.1,
         },
     );
     branches.insert(
         b.0.to_string(),
         Branch {
-            range: Some("main".to_string()),
+            active_range: Some("main".to_string()),
             comments: b.1,
         },
     );
     let store = Store {
-        version: 1,
+        version: 2,
         next_id: 1000,
         branches,
     };

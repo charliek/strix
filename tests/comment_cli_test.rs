@@ -527,7 +527,7 @@ fn add_orphans_when_line_absent_on_a_resolvable_range() {
     // anchor against; `README.md` is edited in it, `nope.rs` is absent.
     std::fs::write(
         store_dir.join("comments.json"),
-        r#"{ "version": 1, "next_id": 1, "branches": { "main": { "range": "HEAD~2", "comments": [] } } }"#,
+        r#"{ "version": 2, "next_id": 1, "branches": { "main": { "active_range": "HEAD~2", "comments": [] } } }"#,
     )
     .unwrap();
 
