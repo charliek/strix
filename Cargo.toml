@@ -3,7 +3,7 @@ name = "strix"
 # 0.0.0 is a pre-release sentinel: strix has never published a release, and the
 # release-workflows flow needs the version-bump commit to be a real change. The
 # first `/release-workflows:release v0.0.1` moves this to 0.0.1.
-version = "0.0.3"
+version = "0.0.4"
 edition = "2021"
 rust-version = "1.96"
 description = "A focused, polished TUI for staging changes and viewing diffs"
