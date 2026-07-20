@@ -259,8 +259,10 @@ fn add_range(
 
     let (context, orphaned) = match capture_context(repo, &target, file, side, line) {
         Ok(Some(text)) => (Some(text), false),
-        Ok(None) => (None, true),
-        Err(_) => (None, false),
+        // Line/file not found, or the range failed to resolve: nothing to anchor
+        // to, so mark the note orphaned rather than storing it as cleanly anchored
+        // at a line that may not exist.
+        Ok(None) | Err(_) => (None, true),
     };
     let created_at = comments::now_secs();
 

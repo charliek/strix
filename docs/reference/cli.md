@@ -197,7 +197,7 @@ scope, while `stale` is still present (always `false` for a range comment):
 | `scope` | `"worktree"` \| `"range"` | Which surface the comment anchors to — see [Scopes](#scopes). |
 | `range` | string | Present only when `scope` is `"range"`: the reviewed range spec (e.g. `"main"`). |
 | `source` | `"human"` \| `"agent"` | Notes left in the TUI are `human`; everything `strix comment add` creates is `agent`. |
-| `file` | string | The file's new-side path; a rename orphans the comment (no rename-following). |
+| `file` | string | The file's new-side path. A range comment orphans if the file is renamed; a worktree comment follows a *staged* rename via `orig_path`, and a committed rename marks it `stale`. |
 | `side` | `"old"` \| `"new"` | Which side of the diff `line` refers to. |
 | `line` | integer | 1-based; the last-known line even while `orphaned`. |
 | `text` | string | The comment body, raw (may contain newlines). |

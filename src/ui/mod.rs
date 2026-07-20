@@ -183,6 +183,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             ];
             if app.diff_focused() {
                 hints.push((" c ", "comment  "));
+                hints.push((" X ", "delete  "));
             }
             hints.extend([
                 (" d ", "split  "),
