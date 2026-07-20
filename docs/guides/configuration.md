@@ -52,15 +52,17 @@ discard          = ["x"]
 comment          = ["c"]
 next_comment     = ["]"]
 prev_comment     = ["["]
+delete_comment   = ["X"]
 ```
 
 `down`/`up` and `top`/`bottom` are context-aware: they move the file cursor in
-the **Changes** pane and scroll the **Diff** pane, depending on which is focused.
-Staging actions (`stage`, `discard`, …) act on the selected file from either
-pane. `discard` is also what deletes a comment under the cursor in a review
-session — the two views share one action, so remapping `discard` changes both;
-you can't bind Changes-pane discard and review-comment delete to different
-chords.
+the **Changes** pane and scroll the **Diff** pane, depending on which is
+focused. Staging actions (`stage`, `discard`, …) act on the selected file from
+either pane. `comment`/`next_comment`/`prev_comment`/`delete_comment` act on
+the diff-pane cursor in both the Status (working-tree) and Review diff panes —
+`discard` and `delete_comment` are independent actions, so remapping one never
+touches the other (unlike milestone 6, where deleting a comment was an
+overload of `discard`/`x`).
 
 Chord syntax: a key name (`a`, `enter`, `space`, `tab`, `esc`, `up`, `left`,
 `pageup`, …) optionally prefixed with `ctrl-`, `alt-`, or `shift-`
@@ -101,11 +103,11 @@ Running multiple strix instances against the same config directory is
 save around the same time, one save can be silently lost. There's no
 cross-instance locking.
 
-**Review comments are not part of this.** Adding, editing, or deleting a
-comment in a review session (`c`, `x` — see
-[Leaving review comments](../getting-started/usage.md#leaving-review-comments))
-writes to `.git/strix/comments.json` immediately, the moment you act — there's
-no "persists on next launch" delay like `t`/`d`/`n`, and nothing about it
+**Comments are not part of this.** Adding, editing, or deleting a comment —
+on uncommitted work in bare `strix`, or in a review session (`c`, `X` — see
+[Comments](../getting-started/usage.md#comments)) — writes to
+`.git/strix/comments.json` immediately, the moment you act — there's no
+"persists on next launch" delay like `t`/`d`/`n`, and nothing about it
 touches `config.toml`.
 
 See [Keybindings](../getting-started/keybindings.md) for the defaults and

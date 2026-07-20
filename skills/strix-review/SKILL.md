@@ -74,8 +74,8 @@ Each **Comment**:
 | `text` | string | The comment body (may contain newlines). |
 | `context` | string \| `null` | The anchored line's text captured when the note was written. `null` means it was unavailable. |
 | `orphaned` | boolean | `true` if strix could no longer match the anchor on its last pass — see below. |
-| `base` | string \| `null` | Worktree comments only: the `HEAD` commit recorded when the note was written. |
-| `stale` | boolean | Worktree comments only: `true` if the anchored line drifted while `HEAD` stayed the same — see below. |
+| `base` | string | Worktree comments only: the `HEAD` commit recorded when the note was written. **Omitted entirely** (not `null`) for a range comment. |
+| `stale` | boolean | Always present; meaningful for worktree comments only — `true` if the anchored line drifted while `HEAD` stayed the same (see below). Always `false` for a range comment. |
 | `created_at` | integer | Unix epoch seconds. |
 
 Work the `source: "human"` comments. Ignore your own `agent` notes unless asked.

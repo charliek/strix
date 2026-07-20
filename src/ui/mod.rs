@@ -208,12 +208,12 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         ],
         ViewMode::Review => {
             // Comment-navigation hints join the review footer; `c` adds/edits and
-            // `x` deletes the comment under the cursor, so both only show when the
+            // `X` deletes the comment under the cursor, so both only show when the
             // diff pane (where the cursor lives) is focused.
             let mut hints = vec![(" j/k ", "move  "), (" ]/[ ", "notes  ")];
             if app.diff_focused() {
                 hints.push((" c ", "comment  "));
-                hints.push((" x ", "delete  "));
+                hints.push((" X ", "delete  "));
             }
             hints.extend([
                 (" tab ", "pane  "),

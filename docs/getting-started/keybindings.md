@@ -40,12 +40,27 @@ modal closes.
 
 | Key             | Action                                            |
 |-----------------|---------------------------------------------------|
-| `j`, `↓`        | Scroll down one line                              |
-| `k`, `↑`        | Scroll up one line                                |
-| `Ctrl-d`, `Ctrl-u` | Scroll half a page down / up                   |
+| `j`, `↓`        | Move the cursor down (scrolls to follow it)       |
+| `k`, `↑`        | Move the cursor up                                |
+| `Ctrl-d`, `Ctrl-u` | Move the cursor a half page down / up          |
 | `g`, `G`        | Jump to top / bottom of the diff                  |
 | `d`             | Toggle unified / side-by-side mode                |
+| `c`             | Add a comment on the cursor's line, or edit the comment under it |
+| `X`             | Delete the comment under the cursor (no confirmation) |
+| `]`, `[`        | Jump to the next / previous comment               |
 | `h`, `←`        | Focus the Changes pane                            |
+
+### Comments (working tree)
+
+The diff pane's cursor above also addresses comments — worktree notes on the
+selected file's net `HEAD`-vs-worktree change (the `pending · HEAD→worktree`
+pane; see [Usage](usage.md#on-uncommitted-work)). `c` and `X` follow
+**act-and-reveal**: an offscreen cursor's first press only scrolls it into
+view, the second acts. `c` on the file list, a hunk-header row, or a
+conflicted/binary/submodule file does nothing but flash a hint;
+double-clicking a code line or an existing comment box works the same as
+pressing `c`. See [Comments](usage.md#comments) for the box, the multi-line
+editor, and the lifecycle (stale, swept on commit).
 
 ## History view
 
@@ -84,32 +99,37 @@ flat file list (no Staged/Changes sections) beside the shared diff pane.
 | `g`, `G`        | Jump to the first / last item in the focused pane                 |
 | `Ctrl-d`, `Ctrl-u` | Move the diff cursor a half page                               |
 | `d`             | Toggle unified / side-by-side                                     |
-| `c`             | Add a comment on the code row under the cursor, or edit your comment on a comment row (single-line input, `Enter` saves, `Esc` cancels) |
-| `x`             | Delete the comment under the cursor (no confirmation)              |
+| `c`             | Add a comment on the code row under the cursor, or edit the comment on a comment row (multi-line editor, `Enter` saves, `Esc` cancels — see below) |
+| `X`             | Delete the comment under the cursor (no confirmation)              |
 | `]`, `[`        | Jump to the next / previous comment (listed files only, wraps)     |
 | `b`             | Show / hide the file list                                         |
 | `i`             | Open the History view                                             |
 | `1`             | Return to the review session (from History)                       |
 | `2`             | Open the History view                                             |
 
-The view is read-only for staging: `space`, `Enter`, `s`, `u`, and clicking a
-file's status marker do nothing — no modal, no index change. `x` is
-repurposed for comment deletion here (see below) rather than discarding
-changes. `Esc` does not exit the session (unlike History); quit with `q`.
+The view is read-only for staging: `space`, `Enter`, `s`, `u`, `x`, and
+clicking a file's status marker do nothing — no modal, no index change. `x`
+does **not** delete a comment here either — that's `X` (`Action::DeleteComment`,
+its own action) — `x` is a silent no-op on a comment/orphan row and inert
+everywhere else in this read-only view. `Esc` does not exit the session
+(unlike History); quit with `q`.
 
 ### Review comments
 
 The diff pane's cursor (`j`/`k`/`g`/`G`/`Ctrl-d`/`Ctrl-u` above) can rest on a
 comment row, not just a code line; it only renders (with the selection
-colour) while the diff pane has focus. `c` and `x` act on whatever row the
+colour) while the diff pane has focus. `c` and `X` act on whatever row the
 cursor is on, and both follow **act-and-reveal**: if the cursor is currently
 scrolled offscreen, the key only scrolls it into view — a second press is
 needed to actually act, so nothing is ever added to or deleted from a row
 you can't see. `c` on the file list, a hunk-header row, or an
 agent-authored comment does nothing but flash a hint instead of opening the
-editor. `]`/`[` only cycle comments on files still in the review's file list;
-comments on files that dropped out of the range are orphaned and only
-reachable via `strix comment list` (see [CLI](../reference/cli.md)).
+editor; double-clicking a code line or an existing comment box opens the
+editor the same way `c` does, and clicking a box's `[x]` deletes it directly
+(see [Mouse](#mouse)). `]`/`[` only cycle comments on files still in the
+review's file list; comments on files that dropped out of the range are
+orphaned and only reachable via `strix comment list` (see
+[CLI](../reference/cli.md)).
 
 Adding or editing a comment additionally requires that the range you're
 reviewing has your checked-out branch as its head (the common
@@ -117,12 +137,11 @@ reviewing has your checked-out branch as its head (the common
 editor. See [Usage](usage.md#leaving-review-comments) for the full comment
 model (orphans, persistence, the agent-facing CLI).
 
-`c`, `]`, and `[` share their default chords with no other action, but they
-*are* remappable like everything else — see
-[Configuration](../guides/configuration.md#keybindings). If you remap `x`
-away from `discard`, remember it also drives comment deletion in the review
-view; the two share one action (`Action::Discard`) and can't be split apart
-per-view.
+`c`, `X`, `]`, and `[` share their default chords with no other action, and
+each is independently remappable — see
+[Configuration](../guides/configuration.md#keybindings). Unlike milestone 6,
+`x`/`discard` and comment deletion are fully separate actions now, so
+remapping one never affects the other.
 
 ## Mouse
 
@@ -132,7 +151,38 @@ per-view.
 | Click a file's status marker  | Toggle stage / unstage (staging view only; a no-op in the read-only Review view) |
 | Click a pane                  | Focus that pane                                 |
 | Click a commit in the graph   | Select it (and show its details)                |
-| Click a row in the review diff | Focus the diff and move the cursor there (a comment row is selected, not opened — press `c` to edit it) |
+| Click a row in the diff pane (Status or Review) | Focus the diff and move the cursor there (a comment box is selected, not opened — double-click or press `c` to edit it) |
+| Double-click a code line in the diff pane | Open the in-place editor there (add a comment); excludes the marker zone and the file list |
+| Double-click a comment box    | Edit it (an agent note flashes read-only instead) |
+| Click a comment box's `[x]`   | Delete that comment, no confirmation             |
 | Drag the vertical split bar   | Resize the left column vs the diff              |
 | Drag the horizontal split bar | Resize Committed Changes vs Graph (History view)|
-| Scroll wheel                  | Scroll the pane under the cursor; in the review diff this moves the viewport only — the cursor stays put |
+| Scroll wheel                  | Scroll the pane under the cursor; in the diff pane this moves the viewport only — the cursor stays put |
+
+Double-click detection is semantic, not pixel-based: two clicks resolving to
+the same target (same file, same code line or comment box) within 500 ms
+count as a double-click. A drag, a scroll, or a layout change (resize, mode
+toggle, a comment added/edited/deleted) resets the tracker, so a stray click
+afterward is never mistaken for the second half of a double-click.
+
+## In-place comment editor
+
+While the editor is open (after `c` or a double-click — see
+[Usage](usage.md#comments)), keys go to the editor first — these are
+**fixed**, not part of the remappable `[keys]` keymap, so they apply
+regardless of any keybinding overrides:
+
+| Key                              | Action                                    |
+|-----------------------------------|--------------------------------------------|
+| `Enter`                           | Save                                      |
+| `Esc`                             | Discard (revert an edit, or cancel a new comment) |
+| `Shift+Enter`, `Ctrl-J`, `Alt+Enter` | Insert a newline (three equivalent chords — see below) |
+| `←` `→` `↑` `↓`, `Home`, `End`, `Backspace`, `Delete` | Move / edit within the buffer |
+| any other character               | Inserted literally, including `c`, `x`, `]`, `[`, and any other action's normal key |
+
+`Shift+Enter` alone is unreliable on terminals without a keyboard-enhancement
+protocol, so `Ctrl-J` and `Alt+Enter` are equally-supported fallbacks — use
+whichever your terminal delivers. A bracketed paste containing newlines
+inserts them as real line breaks rather than one `Enter` per line. Ctrl/Alt
+combinations other than the newline chords above are ignored; `Ctrl-C` still
+quits immediately, even while editing.
