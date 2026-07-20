@@ -56,6 +56,47 @@ fn unknown_theme_falls_back_to_default() {
     assert_eq!(theme.syntax_theme, Theme::default().syntax_theme);
 }
 
+// --- word-diff emphasis colours (plan §3.7, C9) ---
+
+#[test]
+fn every_preset_sets_a_distinct_emphasis_colour() {
+    for name in Theme::PRESETS {
+        let theme = Theme::preset(name).unwrap();
+        assert_ne!(
+            theme.add_emph, theme.add_bg,
+            "{name}: add_emph should read distinctly from the flat add_bg wash"
+        );
+        assert_ne!(
+            theme.del_emph, theme.del_bg,
+            "{name}: del_emph should read distinctly from the flat del_bg wash"
+        );
+    }
+}
+
+#[test]
+fn a_custom_theme_without_emphasis_colours_falls_back_to_the_base_preset() {
+    // `mine` overrides an unrelated colour but not add_emph/del_emph, so an
+    // existing user theme file predating this field is unaffected (plan §3.7).
+    let dir = config_with_themes(&[("mine", "base = \"gruvbox\"\n[colors]\nadd = \"#00ff00\"\n")]);
+
+    let theme = Theme::resolve("mine", Some(dir.path())).1;
+    let gruvbox = Theme::preset("gruvbox").unwrap();
+    assert_eq!(theme.add_emph, gruvbox.add_emph);
+    assert_eq!(theme.del_emph, gruvbox.del_emph);
+}
+
+#[test]
+fn a_custom_theme_can_override_the_emphasis_colours() {
+    let dir = config_with_themes(&[(
+        "mine",
+        "base = \"gruvbox\"\n[colors]\nadd_emph = \"#00ff00\"\ndel_emph = \"#ff0000\"\n",
+    )]);
+
+    let theme = Theme::resolve("mine", Some(dir.path())).1;
+    assert_eq!(theme.add_emph, Color::Rgb(0, 255, 0));
+    assert_eq!(theme.del_emph, Color::Rgb(255, 0, 0));
+}
+
 // --- resolve: canonical name reporting (§3.5) ---
 
 #[test]

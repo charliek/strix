@@ -30,7 +30,9 @@ fn app_with_changes() -> (tempfile::TempDir, App) {
 #[test]
 fn renders_status_against_repo() {
     let (_repo, app) = app_with_changes();
-    let out = dump_frame(&app, 100, 30).expect("dump_frame");
+    // Wide enough for the full status footer (the comment-nav hints grew it past
+    // 100 cols, like the review footer); a narrower terminal truncates the tail.
+    let out = dump_frame(&app, 120, 30).expect("dump_frame");
     assert!(out.contains("strix"), "header shows the app name");
     assert!(out.contains("main"), "header shows the branch");
     assert!(out.contains("Staged"), "staged section header");
@@ -124,11 +126,12 @@ fn focusing_staging_reveals_a_hidden_changes_panel() {
 fn b_hides_changes_so_diff_fills_the_width() {
     let (_repo, mut app) = app_with_changes();
 
-    // Shown by default: the Diff title sits to the right of the Changes panel.
+    // Shown by default: the diff title (`pending · HEAD→worktree`) sits to the
+    // right of the Changes panel.
     let shown = dump_frame(&app, 100, 30).expect("dump_frame");
     assert!(shown.contains("Changes"), "Changes panel shown by default");
     let shown_top = shown.lines().nth(1).expect("body top border");
-    let shown_diff_col = shown_top.find("Diff").expect("Diff title shown");
+    let shown_diff_col = shown_top.find("pending").expect("diff title shown");
     assert!(
         shown_diff_col > 20,
         "Diff title starts past the Changes panel when shown (col {shown_diff_col})"
@@ -144,7 +147,7 @@ fn b_hides_changes_so_diff_fills_the_width() {
         hidden_top.starts_with('╭') && hidden_top.ends_with('╮'),
         "Diff border spans the full width: {hidden_top:?}"
     );
-    let hidden_diff_col = hidden_top.find("Diff").expect("Diff title hidden");
+    let hidden_diff_col = hidden_top.find("pending").expect("diff title hidden");
     assert!(
         hidden_diff_col < 8,
         "Diff title now sits at the left edge (col {hidden_diff_col})"

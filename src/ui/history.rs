@@ -173,8 +173,13 @@ fn render_details(frame: &mut Frame, area: Rect, app: &App) {
     lines.push(Line::from(""));
     lines.extend(stat_summary(app.history_files(), theme));
 
-    app.set_diff_metrics(inner.height, lines.len().min(u16::MAX as usize) as u16);
-    let offset = app.diff_scroll.min(app.diff_max_scroll());
+    app.set_diff_metrics(inner.height, lines.len());
+    // `Paragraph::scroll` takes a `u16`; the commit-details pane is short, so
+    // clamping the (now `usize`) offset can't lose anything real.
+    let offset = app
+        .diff_scroll
+        .min(app.diff_max_scroll())
+        .min(u16::MAX as usize) as u16;
     frame.render_widget(Paragraph::new(lines).scroll((offset, 0)), inner);
 }
 

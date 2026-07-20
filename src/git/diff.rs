@@ -40,23 +40,15 @@ impl Repo {
     /// an untracked file) against the working tree.
     pub fn diff(&self, section: Section, entry: &FileEntry) -> FileDiff {
         let (old, new) = self.diff_sides(section, entry);
-        if is_binary(&old) || is_binary(&new) {
-            return FileDiff::Binary;
-        }
-        let old = String::from_utf8_lossy(&old);
-        let new = String::from_utf8_lossy(&new);
-        FileDiff::Text(diff_lines(&old, &new))
+        bytes_diff(&old, &new)
     }
 
     fn diff_sides(&self, section: Section, entry: &FileEntry) -> (Vec<u8>, Vec<u8>) {
         match section {
-            Section::Staged => {
-                let head_path = entry.orig_path.as_deref().unwrap_or(&entry.path);
-                (
-                    self.object_bytes(&format!("HEAD:{head_path}")),
-                    self.object_bytes(&format!(":{}", entry.path)),
-                )
-            }
+            Section::Staged => (
+                self.object_bytes(&format!("HEAD:{}", head_path(entry))),
+                self.object_bytes(&format!(":{}", entry.path)),
+            ),
             Section::Unstaged => match entry.change {
                 Change::Untracked => (Vec::new(), self.worktree_bytes(&entry.path)),
                 Change::Deleted => (self.object_bytes(&format!(":{}", entry.path)), Vec::new()),
@@ -66,6 +58,26 @@ impl Repo {
                 ),
             },
         }
+    }
+
+    /// The net HEAD→worktree diff for a single file, addressed by a full
+    /// [`FileEntry`] descriptor so an uncommitted rename resolves its old side
+    /// correctly (old = `HEAD:orig_path` when the entry carries a rename source,
+    /// else `HEAD:path`; new = the worktree bytes of `path`, empty when the file
+    /// was deleted → deletions only). An unborn HEAD or a newly added file has no
+    /// HEAD blob (`object_bytes` returns empty) → an additions-only diff.
+    ///
+    /// This is the file's *net worktree state relative to HEAD*, not the sum of
+    /// its pending changes: a file staged and then reverted in the worktree
+    /// yields an empty diff even though it still shows in both the staged and
+    /// unstaged lists. The old (HEAD) side is stable while HEAD is unchanged; a
+    /// commit moves it. Conflicted files diff HEAD against the worktree copy
+    /// carrying conflict markers (acceptable display; commenting on them is
+    /// gated in C3).
+    pub fn file_diff_head_vs_worktree(&self, entry: &FileEntry) -> FileDiff {
+        let old = self.object_bytes(&format!("HEAD:{}", head_path(entry)));
+        let new = self.worktree_bytes(&entry.path);
+        bytes_diff(&old, &new)
     }
 
     /// Bytes of an object addressed by a revspec (`HEAD:path`, `:path`,
@@ -91,14 +103,26 @@ impl Repo {
     pub(crate) fn file_diff_from_specs(&self, old_spec: &str, new_spec: &str) -> FileDiff {
         let old = self.object_bytes(old_spec);
         let new = self.object_bytes(new_spec);
-        if is_binary(&old) || is_binary(&new) {
-            return FileDiff::Binary;
-        }
-        FileDiff::Text(diff_lines(
-            &String::from_utf8_lossy(&old),
-            &String::from_utf8_lossy(&new),
-        ))
+        bytes_diff(&old, &new)
     }
+}
+
+/// The rename-aware HEAD-side path for `entry`: its rename source when the
+/// entry carries one, else its current path.
+fn head_path(entry: &FileEntry) -> &str {
+    entry.orig_path.as_deref().unwrap_or(&entry.path)
+}
+
+/// Binary check + line diff for an already-read blob pair, shared by the three
+/// whole-file diff entry points above.
+fn bytes_diff(old: &[u8], new: &[u8]) -> FileDiff {
+    if is_binary(old) || is_binary(new) {
+        return FileDiff::Binary;
+    }
+    FileDiff::Text(diff_lines(
+        &String::from_utf8_lossy(old),
+        &String::from_utf8_lossy(new),
+    ))
 }
 
 /// The +/- line counts for an already-computed diff (so a file list and the

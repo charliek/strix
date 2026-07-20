@@ -56,15 +56,26 @@ untracked = "#7dcfff"
 selection_bg = "#283457"
 add = "#9ece6a"
 add_bg = "#202c26"
+add_emph = "#2e5c3a"
 del = "#f7768e"
 del_bg = "#312027"
+del_emph = "#642a3c"
 hunk = "#7dcfff"
 comment = "#bb9af7"
 ```
 
-`comment` colours the review-comment rows (`● you`/`● agent`) and the
-file-list `● n` badge in a `strix diff` session — see
-[Leaving review comments](../getting-started/usage.md#leaving-review-comments).
+`comment` colours the comment boxes (`● you`/`● agent`) and the file-list
+`● n` badge — see [Comments](../getting-started/usage.md#comments).
+
+`add_emph`/`del_emph` are the side-by-side **word-diff emphasis** colours: on
+a genuinely modified pair (both sides present, similar enough to be an edit
+of one another), the changed span within the line is painted in `add_emph`
+(new side) / `del_emph` (old side) instead of the flat `add_bg`/`del_bg` wash
+— brighter and more saturated, so the edited substring reads distinctly. A
+pure addition/deletion, an unchanged context pair, or a pair too dissimilar
+to be a real edit gets no emphasis (just the base background). Both are
+optional in a custom theme file; an omitted one falls back to the `base`
+preset's value like every other colour.
 
 Any colour you omit falls back to the `base` preset's value, so a partial theme
 is fine.

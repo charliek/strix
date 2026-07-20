@@ -8,7 +8,7 @@ or mouse-unfriendly.
 
 ```
  strix  my-repo                                       main
-╭ Changes ───────────────────╮╭ Diff · unified ──────────────────────╮
+╭ Changes ───────────────────╮╭ pending · HEAD→worktree ─────────────╮
 │ Staged                     ││  src/app.rs                          │
 │   M src/app.rs             ││ @@ -12,6 +12,7 @@                     │
 │ Changes                    ││  12  pub struct App {                │
@@ -21,8 +21,11 @@ or mouse-unfriendly.
 Two panes, mouse + keyboard, syntax-highlighted diffs, themeable (cycle at
 runtime with `t`), toggleable line numbers (`n`) — plus a read-only
 **branch review** mode (`strix diff main`) for reviewing a branch against its
-base, GitHub-PR style, with **inline review comments** (`c`) an agent can
-read via `strix comment list --json` and remove via `strix comment rm`. Built in Rust on
+base, GitHub-PR style. **Inline comments** — on uncommitted work in bare
+`strix` or in a review session — render as multi-line boxes you add or edit
+with `c` or a double-click, delete with `X` or a click on `[x]`; an agent
+reads them via `strix comment list --json` and clears each one via
+`strix comment rm`. Built in Rust on
 [ratatui](https://github.com/ratatui/ratatui),
 [gitoxide](https://github.com/GitoxideLabs/gitoxide), and
 [syntect](https://github.com/trishume/syntect).
@@ -77,13 +80,16 @@ full key set.
 
 ## Agent review loop
 
-The review comments close a loop: you review a branch with `strix diff main`,
-press `c` to leave inline notes on the diff, then tell your agent to "address
-my strix comments". The agent reads the inbox with `strix comment list --json`,
-fixes each note, commits, and removes it — resolved comments vanish from your
-open review as it works. The bundled `strix-review` skill teaches an agent
-that contract. Install it via [skills.sh](https://skills.sh), which targets
-Claude Code, GitHub Copilot, OpenCode, and many other agents:
+Comments close a loop, on either changeset strix reviews. Review a branch
+with `strix diff main`, press `c` to leave inline notes, then tell your agent
+to "address my strix comments": it reads the inbox with
+`strix comment list --json`, fixes each note, commits, then removes it —
+resolved comments vanish from your open review as it works. Or skip the
+branch entirely and comment straight on **uncommitted work** in bare `strix`
+— the agent's fix just needs to land in a commit (or an explicit `rm`), no
+separate removal step required. The bundled `strix-review` skill teaches an
+agent both loops. Install it via [skills.sh](https://skills.sh), which
+targets Claude Code, GitHub Copilot, OpenCode, and many other agents:
 
 ```bash
 npx skills add charliek/strix

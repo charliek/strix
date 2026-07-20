@@ -1,12 +1,13 @@
 use std::io::{self, Stdout, Write};
 use std::sync::mpsc::Receiver;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ratatui::backend::{CrosstermBackend, TestBackend};
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -48,8 +49,27 @@ pub fn run(mut app: App, watch_rx: Option<Receiver<()>>) -> Result<()> {
 
 fn setup() -> Result<Tui> {
     enable_raw_mode()?;
+    // Once any mode is enabled, a later failure must undo it: `restore()` is only
+    // reached on normal exit and the panic hook, so a `?` bail-out mid-setup would
+    // otherwise leave the real terminal in raw / alt-screen / bracketed-paste mode
+    // (codex fix #5). Best-effort restore, then propagate the original error.
+    setup_modes().inspect_err(|_| {
+        let _ = restore();
+    })
+}
+
+/// Enable the alternate screen, mouse capture + motion, and bracketed paste, and
+/// build the terminal. Split out so [`setup`] can clean up on any failure here.
+fn setup_modes() -> Result<Tui> {
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // Bracketed paste so a multi-line paste arrives as one `Event::Paste` (its
+    // newlines insert into the comment editor) rather than a burst of Enter keys.
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     write!(stdout, "{ENABLE_MOUSE_MOTION}")?;
     stdout.flush()?;
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
@@ -60,7 +80,12 @@ fn restore() -> Result<()> {
     // Undo the motion request and any custom pointer shape before leaving, so
     // the terminal isn't left reporting movement or showing a grab cursor.
     write!(stdout, "{POINTER_DEFAULT}{DISABLE_MOUSE_MOTION}")?;
-    execute!(stdout, LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        stdout,
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        DisableBracketedPaste
+    )?;
     disable_raw_mode()?;
     Ok(())
 }
@@ -120,8 +145,20 @@ fn handle_event(app: &mut App, event: Event) -> bool {
             app.on_key(key);
             true
         }
-        Event::Mouse(mouse) => app.on_mouse(mouse),
-        Event::Resize(_, _) => true,
+        // The event loop stamps the double-click clock as it dispatches (plan §3.6).
+        Event::Mouse(mouse) => app.on_mouse_at(mouse, Instant::now()),
+        // A bracketed paste: its newlines insert into the open comment editor
+        // instead of each Enter saving the note (plan §3.5).
+        Event::Paste(text) => {
+            app.on_paste(&text);
+            true
+        }
+        // A resize breaks a pending double-click chain before the redraw rebuilds
+        // the layout (plan §3.6).
+        Event::Resize(_, _) => {
+            app.on_resize();
+            true
+        }
         _ => false,
     }
 }

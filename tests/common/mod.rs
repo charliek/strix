@@ -5,6 +5,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use ratatui::buffer::Buffer;
+use ratatui::style::Color;
 use strix::app::App;
 use strix::crossterm::event::{KeyCode, KeyEvent};
 use tempfile::TempDir;
@@ -12,6 +14,47 @@ use tempfile::TempDir;
 /// Press a plain character key on `app`, as if typed at the keyboard.
 pub fn press(app: &mut App, ch: char) {
     app.on_key(KeyEvent::from(KeyCode::Char(ch)));
+}
+
+// --- Styled-cell assertions -------------------------------------------------
+//
+// `dump_frame` serialises only the glyphs, dropping every colour, so a test that
+// needs to check a border colour, a selection highlight, or the stale-dim accent
+// has to reach into the rendered `Buffer` and read per-cell styles. These shared
+// helpers do that against the same `TestBackend` render path `dump_frame` uses.
+
+/// Render one frame to a `Buffer` for per-cell style assertions.
+pub fn render_buffer(app: &App, width: u16, height: u16) -> Buffer {
+    strix::terminal::render_to_buffer(app, width, height).unwrap()
+}
+
+/// The glyph at cell `(x, y)`, or `""` when out of bounds.
+pub fn cell_symbol(buf: &Buffer, x: u16, y: u16) -> String {
+    buf.cell((x, y))
+        .map(|c| c.symbol().to_string())
+        .unwrap_or_default()
+}
+
+/// The foreground colour at cell `(x, y)`, if any.
+pub fn cell_fg(buf: &Buffer, x: u16, y: u16) -> Option<Color> {
+    buf.cell((x, y)).map(|c| c.fg)
+}
+
+/// The background colour at cell `(x, y)`, if any.
+pub fn cell_bg(buf: &Buffer, x: u16, y: u16) -> Option<Color> {
+    buf.cell((x, y)).map(|c| c.bg)
+}
+
+/// Whether any cell in buffer row `y` carries foreground colour `fg`.
+pub fn row_has_fg(buf: &Buffer, y: u16, fg: Color) -> bool {
+    let area = buf.area;
+    (area.x..area.x + area.width).any(|x| buf.cell((x, y)).map(|c| c.fg) == Some(fg))
+}
+
+/// Whether any cell in buffer row `y` carries background colour `bg`.
+pub fn row_has_bg(buf: &Buffer, y: u16, bg: Color) -> bool {
+    let area = buf.area;
+    (area.x..area.x + area.width).any(|x| buf.cell((x, y)).map(|c| c.bg) == Some(bg))
 }
 
 /// Run a git command in `dir`, asserting success.

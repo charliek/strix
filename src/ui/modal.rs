@@ -1,4 +1,4 @@
-use ratatui::layout::{Alignment, Constraint, Layout};
+use ratatui::layout::Alignment;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
@@ -6,8 +6,7 @@ use ratatui::Frame;
 
 use crate::app::{App, Modal};
 use crate::git::Change;
-use crate::ui::theme::Theme;
-use crate::ui::{centered_rect, char_width};
+use crate::ui::centered_rect;
 
 /// Draw the active modal as a centred popup over the rest of the UI. A no-op
 /// when no modal is open.
@@ -20,103 +19,7 @@ pub fn render(frame: &mut Frame, app: &App) {
             render_confirm_discard(frame, app, *change, label)
         }
         Modal::Help => render_help(frame, app),
-        Modal::CommentInput {
-            buffer,
-            cursor,
-            editing,
-            ..
-        } => render_comment_input(frame, app, buffer, *cursor, editing.is_some()),
     }
-}
-
-/// The single-line comment editor: a centred popup with the input line (a block
-/// cursor via reversed video), then a hint row. The buffer scrolls horizontally
-/// so the cursor stays visible, unicode-width aware.
-fn render_comment_input(frame: &mut Frame, app: &App, buffer: &str, cursor: usize, editing: bool) {
-    let theme = &app.theme;
-    let title = if editing {
-        " Edit comment "
-    } else {
-        " Comment "
-    };
-
-    let area = centered_rect(frame.area(), 60, 5);
-    frame.render_widget(Clear, area);
-    let block = popup_block(title, theme.border_focused, theme.bg);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let [input_area, _gap, footer_area] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .areas(inner);
-
-    let input = input_line(buffer, cursor, input_area.width as usize, theme);
-    frame.render_widget(Paragraph::new(input), input_area);
-
-    let footer = Line::from(vec![
-        Span::styled(" enter ", key_style(theme.footer_key)),
-        Span::styled("save  ", Style::new().fg(theme.dim)),
-        Span::styled(" esc ", key_style(theme.footer_key)),
-        Span::styled("cancel", Style::new().fg(theme.dim)),
-    ]);
-    frame.render_widget(Paragraph::new(footer), footer_area);
-}
-
-/// Lay out the input buffer within `width` columns, scrolled so the cursor cell
-/// (char index `cursor`, or a trailing blank when at the end) is visible, and
-/// painting that cell with reversed video as the block cursor.
-fn input_line(buffer: &str, cursor: usize, width: usize, theme: &Theme) -> Line<'static> {
-    if width == 0 {
-        return Line::from(String::new());
-    }
-    let chars: Vec<char> = buffer.chars().collect();
-    let char_w = |i: usize| chars.get(i).map(|&c| char_width(c)).unwrap_or(1);
-
-    // Scroll: walk left from the cursor, keeping its cell plus the run before it
-    // within `width`, so the visible window always ends at (or after) the cursor.
-    let cursor_w = if cursor < chars.len() {
-        char_w(cursor)
-    } else {
-        1
-    };
-    let mut start = cursor;
-    let mut used = cursor_w;
-    while start > 0 {
-        let w = char_w(start - 1);
-        if used + w > width {
-            break;
-        }
-        used += w;
-        start -= 1;
-    }
-
-    let base = Style::new().fg(theme.fg).bg(theme.bg);
-    let cursor_style = base.add_modifier(Modifier::REVERSED);
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut col = 0;
-    let mut i = start;
-    while i < chars.len() {
-        let w = char_w(i);
-        if col + w > width {
-            break;
-        }
-        let style = if i == cursor { cursor_style } else { base };
-        spans.push(Span::styled(chars[i].to_string(), style));
-        col += w;
-        i += 1;
-    }
-    // Cursor at the end has no char under it: draw a reversed blank.
-    if cursor >= chars.len() && col < width {
-        spans.push(Span::styled(" ".to_string(), cursor_style));
-        col += 1;
-    }
-    if col < width {
-        spans.push(Span::styled(" ".repeat(width - col), base));
-    }
-    Line::from(spans)
 }
 
 fn render_help(frame: &mut Frame, app: &App) {
@@ -158,10 +61,12 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
         binding("x", "discard changes (confirm)"),
         binding("r", "refresh"),
         Line::raw(""),
-        section("Review comments"),
+        section("Comments"),
+        binding("c", "add / edit comment (or dbl-click)"),
+        binding("X", "delete comment (or click [x])"),
         binding("] / [", "next / prev comment"),
-        binding("c", "add / edit comment"),
-        binding("x", "delete comment under cursor"),
+        binding("enter / esc", "save / cancel (while editing)"),
+        binding("shift+enter", "newline (also ctrl-j, alt+enter)"),
         Line::raw(""),
         section("View"),
         binding("d", "toggle side-by-side"),

@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use common::{git, init_repo, init_repo_with_diverged_branches, write};
 use ratatui::style::Color;
 use strix::app::{App, FlashKind};
-use strix::comments::{Branch, Comment, Side, Source, Store};
+use strix::comments::{Branch, Comment, Scope, Side, Source, Store};
 use strix::config::Config;
 use strix::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -45,6 +45,11 @@ fn strix_dir(repo: &Path) -> PathBuf {
 
 fn comment(id: u64, file: &str, side: Side, line: usize, text: &str, ctx: &str) -> Comment {
     Comment {
+        // A `strix diff` range review; the range value is a C2a placeholder
+        // (scope is not asserted here — C3 makes it exact).
+        scope: Scope::Range {
+            range: String::new(),
+        },
         id,
         source: Source::Human,
         file: file.to_string(),
@@ -54,6 +59,8 @@ fn comment(id: u64, file: &str, side: Side, line: usize, text: &str, ctx: &str) 
         context: Some(ctx.to_string()),
         orphaned: false,
         created_at: 1_700_000_000,
+        base: None,
+        stale: false,
     }
 }
 
@@ -62,12 +69,12 @@ fn seed_store(repo: &Path, branch: &str, range: Option<&str>, comments: Vec<Comm
     branches.insert(
         branch.to_string(),
         Branch {
-            range: range.map(str::to_string),
+            active_range: range.map(str::to_string),
             comments,
         },
     );
     let store = Store {
-        version: 1,
+        version: 2,
         next_id: 1000,
         branches,
     };
@@ -172,7 +179,7 @@ fn cursor_reaches_an_injected_comment_row_in_both_modes() {
         }
         app.on_key(key('l')); // focus diff
         app.on_key(key('G')); // cursor to the last (comment) row
-        app.on_key(key('x')); // delete it
+        app.on_key(key('X')); // delete it
         assert!(
             app.review_comment(1).is_none(),
             "the cursor sat on the comment row (sbs={sbs})"
@@ -200,8 +207,8 @@ fn far_cursor_move_reveals_the_row_act_and_reveal() {
     }
     assert!(app.diff_scroll > 0, "the viewport followed the cursor down");
     assert!(
-        dump(&app).contains("● you final note"),
-        "the cursor's row was revealed"
+        dump(&app).contains("final note"),
+        "the cursor's box body was revealed"
     );
 }
 
@@ -256,19 +263,19 @@ fn cursor_row_shows_selection_bg_only_when_the_diff_is_focused() {
     select_file(&mut app, "feature.txt");
     app.on_key(key('l')); // focus the diff
 
-    // Park the cursor on the comment row and find its screen row.
+    // Park the cursor on the comment box and find its body row's screen row.
     app.on_key(key(']'));
     let frame = dump(&app);
-    let row = row_of(&frame, "● you cursor mark");
+    let row = row_of(&frame, "cursor mark");
     assert!(
         row_has_bg(&app, row, sel_bg),
-        "the cursor row is painted with the selection background while focused:\n{frame}"
+        "the selected box's body row carries the selection background while focused:\n{frame}"
     );
 
     // Focus the file list: the cursor highlight must disappear from the diff.
     app.on_key(key('h'));
     let frame = dump(&app);
-    let row = row_of(&frame, "● you cursor mark");
+    let row = row_of(&frame, "cursor mark");
     assert!(
         !row_has_bg(&app, row, sel_bg),
         "no cursor highlight while the list is focused:\n{frame}"
@@ -340,10 +347,14 @@ fn comment_nav_with_no_comments_flashes() {
     assert_eq!(flash.text, "no comments");
 }
 
-// --- Delete (x) ---
+// --- Delete (X) ---
+//
+// C5 replaces the milestone-6 overload: `x`/`Action::Discard` no longer
+// deletes a comment in Review (it's a no-op there regardless of row);
+// deletion is `X`/`Action::DeleteComment` only.
 
 #[test]
-fn x_deletes_exactly_the_cursor_comment() {
+fn capital_x_deletes_exactly_the_cursor_comment() {
     let repo = init_repo_with_diverged_branches();
     seed_store(
         repo.path(),
@@ -357,7 +368,7 @@ fn x_deletes_exactly_the_cursor_comment() {
     let mut app = review(repo.path(), "main");
     let _ = dump(&app);
     app.on_key(key(']')); // cursor onto the first comment (lowest id)
-    app.on_key(key('x'));
+    app.on_key(key('X'));
 
     assert!(
         app.review_comment(1).is_none(),
@@ -382,6 +393,38 @@ fn x_deletes_exactly_the_cursor_comment() {
     let frame = dump(&app);
     assert!(!frame.contains("firstnote"), "the row is gone:\n{frame}");
     assert!(frame.contains("secondnote"));
+}
+
+#[test]
+fn lowercase_x_on_a_comment_row_is_inert_in_review() {
+    // The milestone-6 overload is gone: `x` never deletes a comment in Review,
+    // even with the cursor parked directly on the comment row.
+    let repo = init_repo_with_diverged_branches();
+    seed_store(
+        repo.path(),
+        "feature",
+        Some("main"),
+        vec![comment(
+            1,
+            "feature.txt",
+            Side::New,
+            1,
+            "keep me",
+            "feature",
+        )],
+    );
+    let mut app = review(repo.path(), "main");
+    let _ = dump(&app);
+    app.on_key(key(']')); // cursor onto the comment row
+    let before = store_text(repo.path());
+
+    app.on_key(key('x'));
+    assert!(
+        app.review_comment(1).is_some(),
+        "x never deletes a comment in review"
+    );
+    assert_eq!(store_text(repo.path()), before, "the store is byte-stable");
+    assert!(app.flash.is_none(), "no flash on a comment-row x");
 }
 
 #[test]
@@ -413,6 +456,37 @@ fn x_on_a_code_row_is_a_silent_no_op() {
 }
 
 #[test]
+fn capital_x_on_a_code_row_is_inert() {
+    let repo = init_repo_with_diverged_branches();
+    seed_store(
+        repo.path(),
+        "feature",
+        Some("main"),
+        vec![comment(
+            1,
+            "feature.txt",
+            Side::New,
+            1,
+            "keep me",
+            "feature",
+        )],
+    );
+    let mut app = review(repo.path(), "main");
+    select_file(&mut app, "feature.txt");
+    app.on_key(key('l')); // focus diff, cursor on a code (hunk) row
+    app.on_key(key('j')); // still a code row (the `+ feature` line)
+    let before = store_text(repo.path());
+
+    app.on_key(key('X'));
+    assert!(
+        app.review_comment(1).is_some(),
+        "X on a code row deletes nothing"
+    );
+    assert_eq!(store_text(repo.path()), before, "the store is byte-stable");
+    assert!(app.flash.is_none(), "no flash on a code-row X");
+}
+
+#[test]
 fn a_failed_delete_keeps_the_comment_and_flashes() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -435,7 +509,7 @@ fn a_failed_delete_keeps_the_comment_and_flashes() {
     perms.set_mode(0o555);
     std::fs::set_permissions(&dir, perms).unwrap();
 
-    app.on_key(key('x'));
+    app.on_key(key('X'));
 
     // Restore perms first so the assertions (and TempDir cleanup) can proceed.
     let mut restore = std::fs::metadata(&dir).unwrap().permissions();
@@ -480,7 +554,9 @@ fn clicking_a_diff_row_focuses_the_pane_and_moves_the_cursor() {
     app.on_key(key('l'));
     let frame = dump(&app);
 
-    let screen_row = row_of(&frame, "● you click target") as u16;
+    // Click a code row (the `+ feature` addition), where one physical row maps to
+    // one cursor position — a box body row would pin the cursor to the box's top.
+    let screen_row = row_of(&frame, "+ feature") as u16;
     let diff = app.diff_area();
     app.on_mouse(mouse(
         diff.x + 3,
@@ -492,9 +568,9 @@ fn clicking_a_diff_row_focuses_the_pane_and_moves_the_cursor() {
         !app.review_list_focused(),
         "the click focuses the diff pane"
     );
-    let expected = app.diff_scroll + (screen_row - diff.y);
+    let expected = app.diff_scroll + (screen_row - diff.y) as usize;
     assert_eq!(
-        app.review_cursor() as u16,
+        app.review_cursor(),
         expected,
         "the cursor jumps to the clicked row"
     );
@@ -534,7 +610,7 @@ fn a_click_after_content_shrinks_hits_the_visually_clicked_row() {
     app.on_key(key('G')); // cursor onto the trailing comment row; diff_scroll == max
     assert!(app.diff_scroll > 0);
 
-    app.on_key(key('x')); // delete it: the row list shrinks by one
+    app.on_key(key('X')); // delete it: the row list shrinks by one
     let frame = dump(&app);
     assert!(
         app.diff_scroll > app.diff_max_scroll(),
@@ -550,7 +626,7 @@ fn a_click_after_content_shrinks_hits_the_visually_clicked_row() {
     ));
     let clamped = app.diff_scroll.min(app.diff_max_scroll());
     assert_eq!(
-        app.review_cursor() as u16,
+        app.review_cursor(),
         clamped,
         "the click hit the visually top row, not a phantom one row past it:\n{frame}"
     );
@@ -559,9 +635,9 @@ fn a_click_after_content_shrinks_hits_the_visually_clicked_row() {
 // --- Act-and-reveal gate (findings 1-3) ---
 
 #[test]
-fn x_reveals_an_offscreen_cursor_before_deleting() {
-    // A wheel scroll can push the cursor row offscreen. The first `x` must only
-    // reveal it (no delete); a second `x`, now that it's visible, deletes.
+fn capital_x_reveals_an_offscreen_cursor_before_deleting() {
+    // A wheel scroll can push the cursor row offscreen. The first `X` must only
+    // reveal it (no delete); a second `X`, now that it's visible, deletes.
     let repo = tall_repo();
     seed_store(
         repo.path(),
@@ -579,16 +655,13 @@ fn x_reveals_an_offscreen_cursor_before_deleting() {
     for _ in 0..12 {
         app.on_mouse(mouse(diff.x + 2, diff.y + 1, MouseEventKind::ScrollDown));
     }
-    assert!(
-        app.diff_scroll as usize > cursor,
-        "the cursor scrolled offscreen"
-    );
+    assert!(app.diff_scroll > cursor, "the cursor scrolled offscreen");
     let before = store_text(repo.path());
 
-    app.on_key(key('x'));
+    app.on_key(key('X'));
     assert!(
         app.review_comment(1).is_some(),
-        "the first x reveals but must not delete an invisible row"
+        "the first X reveals but must not delete an invisible row"
     );
     assert_eq!(
         store_text(repo.path()),
@@ -596,14 +669,14 @@ fn x_reveals_an_offscreen_cursor_before_deleting() {
         "the store is untouched by the reveal"
     );
     assert!(
-        dump(&app).contains("● you topnote"),
-        "the cursor's row was scrolled into view"
+        dump(&app).contains("topnote"),
+        "the cursor's box body was scrolled into view"
     );
 
-    app.on_key(key('x'));
+    app.on_key(key('X'));
     assert!(
         app.review_comment(1).is_none(),
-        "the second x, on the now-visible row, deletes"
+        "the second X, on the now-visible row, deletes"
     );
 }
 
@@ -704,7 +777,8 @@ fn cycle_visits_a_replaced_line_in_old_then_new_visual_order() {
     for expected in ["aaa", "bbb", "ccc", "aaa"] {
         app.on_key(key(']'));
         let frame = dump(&app);
-        let row = row_of(&frame, &format!("● you {expected}"));
+        // The cursor lands on the box; its body row (the note text) is highlighted.
+        let row = row_of(&frame, expected);
         assert!(
             row_has_bg(&app, row, sel_bg),
             "] placed the cursor on {expected} in visual order:\n{frame}"

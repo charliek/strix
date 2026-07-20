@@ -41,6 +41,10 @@ pub enum Action {
     /// Jump to the next / previous review comment on a listed file (review view).
     NextComment,
     PrevComment,
+    /// Delete the comment/orphan under the diff-pane cursor (Status and Review
+    /// alike). Replaces the milestone-6 overload of `x`/`Discard`, which no
+    /// longer deletes comments in either view.
+    DeleteComment,
 }
 
 /// A key plus modifiers, normalised so Shift is folded into the character.
@@ -160,6 +164,7 @@ const DEFAULTS: &[(&str, Action)] = &[
     ("c", Action::Comment),
     ("]", Action::NextComment),
     ("[", Action::PrevComment),
+    ("X", Action::DeleteComment),
 ];
 
 fn parse_action(name: &str) -> Option<Action> {
@@ -190,6 +195,7 @@ fn parse_action(name: &str) -> Option<Action> {
         "comment" => Action::Comment,
         "next-comment" => Action::NextComment,
         "prev-comment" => Action::PrevComment,
+        "delete-comment" => Action::DeleteComment,
         _ => return None,
     })
 }

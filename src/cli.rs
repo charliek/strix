@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 /// A focused, polished TUI for staging changes and viewing diffs.
 #[derive(Debug, Parser)]
@@ -89,11 +89,32 @@ pub enum SkillAction {
     },
 }
 
+/// Which review surface a `strix comment` action targets (plan §3.3).
+///
+/// `All` is accepted by `list`/`clear` only — `add` always creates exactly one
+/// comment, in exactly one scope, so `--scope all` there is a usage error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ScopeArg {
+    /// The uncommitted working tree (the net HEAD-vs-worktree diff).
+    Worktree,
+    /// The branch's active reviewed range (the last `strix diff <range>`).
+    Range,
+    /// Both scopes together.
+    All,
+}
+
 /// A `strix comment` action. All act on the current HEAD branch key.
 #[derive(Debug, Subcommand)]
 pub enum CommentAction {
-    /// List this branch's comments (re-anchoring against the stored range first).
+    /// List this branch's comments, re-anchoring/sweeping the requested scope
+    /// first so the result is never stale (plan §3.3).
+    ///
+    /// Defaults to `worktree` when the repository has uncommitted changes (the
+    /// common agent case), else to the branch's active reviewed range.
     List {
+        /// Which scope to list: `worktree`, `range`, or `all`.
+        #[arg(long, value_enum)]
+        scope: Option<ScopeArg>,
         /// Emit the machine-readable JSON contract instead of a plain table.
         #[arg(long)]
         json: bool,
@@ -102,7 +123,8 @@ pub enum CommentAction {
     ///
     /// Exactly one of `--old-line` / `--new-line` selects the side; both must be
     /// ≥ 1. `--text` must be non-empty after trimming (its raw bytes, newlines
-    /// included, are stored verbatim).
+    /// included, are stored verbatim). Defaults to `--scope worktree`, stamping
+    /// the current HEAD as the comment's baseline.
     Add {
         /// The file's new-side path, as listed in the review.
         #[arg(long)]
@@ -116,11 +138,20 @@ pub enum CommentAction {
         /// The comment body (stored raw; may contain newlines).
         #[arg(long)]
         text: String,
+        /// Which scope to add to: `worktree` (default) or `range`.
+        #[arg(long, value_enum)]
+        scope: Option<ScopeArg>,
+        /// The range a `--scope range` comment anchors to; defaults to the
+        /// branch's active reviewed range. One of the two is required for range
+        /// scope — it is an error to give neither.
+        #[arg(long)]
+        range: Option<String>,
         /// Emit the machine-readable JSON contract instead of the new id.
         #[arg(long)]
         json: bool,
     },
-    /// Remove one comment by id from this branch.
+    /// Remove one comment by id from this branch. Crosses scopes: ids are
+    /// store-global, so this works regardless of the comment's scope.
     Rm {
         /// The id to remove (from `list`).
         id: u64,
@@ -128,8 +159,15 @@ pub enum CommentAction {
         #[arg(long)]
         json: bool,
     },
-    /// Remove every comment on this branch.
+    /// Remove comments from this branch. A scope is required — `clear` never
+    /// implicitly wipes everything.
     Clear {
+        /// Which scope to clear: `worktree`, `range`, or `all`.
+        #[arg(long, value_enum)]
+        scope: Option<ScopeArg>,
+        /// Shorthand for `--scope all`.
+        #[arg(long)]
+        all: bool,
         /// Emit the machine-readable JSON contract.
         #[arg(long)]
         json: bool,

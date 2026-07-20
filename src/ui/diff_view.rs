@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::ops::Range;
+
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -5,8 +8,10 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use syntect::parsing::SyntaxReference;
 
-use crate::app::{App, DiffMode, SbsRow, URow};
-use crate::comments::Source;
+use crate::app::{
+    sbs_columns, App, BoxPart, BoxRow, EditorPart, LayoutRow, PairEmphasis, RowContent,
+};
+use crate::comments::Side;
 use crate::git::{DiffLine, FileDiff, LineKind};
 use crate::ui::syntax::syntax_for;
 use crate::ui::theme::Theme;
@@ -46,43 +51,124 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let focused = app.diff_focused();
     let path = app.active_diff_path();
 
+    let label = app.active_diff_title();
     let title = match &path {
-        Some(path) => format!(" Diff · {path} "),
-        None => " Diff ".to_string(),
+        Some(path) => format!(" {label} · {path} "),
+        None => format!(" {label} "),
     };
     let block = panel_block(&title, focused, theme);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     app.set_diff_area(inner);
 
-    // The review diff cursor row to paint with the selection background — `None`
-    // outside the review view or while its file list is focused (plan §3.4).
+    // The `[start, end)` physical rows of the cursor target to paint with the
+    // selection background — `None` outside a cursor-bearing view or while its
+    // file list is focused (plan §3.4). A comment box spans several rows.
     let cursor = app.review_cursor_highlight();
 
-    let lines = match app.active_diff() {
-        Some(FileDiff::Text(lines)) if !lines.is_empty() => lines,
-        other => {
-            let message = match other {
-                Some(FileDiff::Binary) => "Binary file — no preview",
-                Some(_) => "No changes to show",
-                None => "Select a file to view its diff",
-            };
-            render_orphans_only(frame, inner, app, message, theme, cursor);
-            return;
-        }
+    // The physical layout drives both the row count (metrics) and rendering; a
+    // code line is one row, a comment box several. Built for this pane width, so a
+    // resize rewraps its boxes.
+    let layout = app.diff_layout(inner.width);
+    app.set_diff_metrics(inner.height, layout.len());
+
+    // The diff lines backing the code rows; empty for a no-text diff (the layout
+    // then holds only orphan boxes).
+    let lines: &[DiffLine] = match app.active_diff() {
+        Some(FileDiff::Text(lines)) => lines,
+        _ => &[],
     };
+    let is_text = !lines.is_empty();
+
+    // No diff and no orphan boxes: the plain centered hint, as before. Clear any
+    // `[x]` rects a previous frame recorded so a stale click can't hit them.
+    if !is_text && layout.is_empty() {
+        app.set_x_rects(HashMap::new());
+        centered_hint(
+            frame,
+            inner,
+            no_diff_message(app),
+            Style::new().fg(theme.dim),
+        );
+        return;
+    }
 
     let syntax = syntax_for(path.as_deref().unwrap_or(""));
-    match app.diff_mode {
-        DiffMode::Unified => render_unified(frame, inner, app, lines, syntax, cursor),
-        DiffMode::SideBySide => render_side_by_side(frame, inner, app, lines, syntax, cursor),
+    let (left_w, right_w) = sbs_columns(inner.width);
+    let body_width =
+        (inner.width as usize).saturating_sub(unified_gutter_width(app.show_line_numbers));
+    let offset = app.diff_scroll.min(app.diff_max_scroll());
+
+    let mut out: Vec<Line> = Vec::new();
+    let mut x_rects: HashMap<u64, Rect> = HashMap::new();
+    for (i, row) in layout
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(inner.height as usize)
+    {
+        let screen_y = inner.y + (i - offset) as u16;
+        let line = match &row.content {
+            RowContent::Line(li) => unified_line(app, &lines[*li], theme, syntax, body_width),
+            RowContent::Hunk(h) => hunk_line(&lines[*h], theme),
+            RowContent::Pair {
+                left,
+                right,
+                emphasis,
+            } => sbs_pair_line(
+                app,
+                *left,
+                *right,
+                lines,
+                theme,
+                syntax,
+                left_w,
+                right_w,
+                emphasis.as_ref(),
+            ),
+            RowContent::Box(boxed) => box_row_line(
+                row,
+                boxed,
+                theme,
+                inner,
+                left_w,
+                right_w,
+                screen_y,
+                &mut x_rects,
+            ),
+            RowContent::Editor(part) => editor_row_line(row, part, theme, inner, left_w, right_w),
+        };
+        let in_cursor = cursor.as_ref().is_some_and(|span| span.contains(&i));
+        out.push(mark_cursor_row(line, in_cursor, theme));
+    }
+    app.set_x_rects(x_rects);
+
+    // A no-text diff (binary / empty) still surfaces its orphan boxes; the hint
+    // follows them when there's vertical room (finding 2), exactly as the old
+    // orphan block did.
+    if !is_text && out.len() < inner.height as usize {
+        out.push(Line::from(Span::styled(
+            no_diff_message(app).to_string(),
+            Style::new().fg(theme.dim),
+        )));
+    }
+    frame.render_widget(Paragraph::new(out), inner);
+}
+
+/// The empty-state hint for a diff with no text lines to show.
+fn no_diff_message(app: &App) -> &'static str {
+    match app.active_diff() {
+        Some(FileDiff::Binary) => "Binary file — no preview",
+        Some(_) => "No changes to show",
+        None => "Select a file to view its diff",
     }
 }
 
 /// When `is_cursor`, repaint every span's background with the selection colour
-/// to mark the diff cursor row, keeping each span's foreground (syntax colours)
-/// and modifiers; otherwise return the line untouched. Plan §3.4 pins
-/// selection_bg as the whole-row cursor treatment.
+/// to mark a diff cursor row, keeping each span's foreground (syntax / box
+/// colours) and modifiers; otherwise return the line untouched. Every physical
+/// row of the selected target (a whole comment box) is marked, so the box
+/// highlights as one unit (plan §3.4).
 fn mark_cursor_row(line: Line<'static>, is_cursor: bool, theme: &Theme) -> Line<'static> {
     if !is_cursor {
         return line;
@@ -93,83 +179,6 @@ fn mark_cursor_row(line: Line<'static>, is_cursor: bool, theme: &Theme) -> Line<
         .map(|span| Span::styled(span.content, span.style.bg(theme.selection_bg)))
         .collect();
     Line::from(spans)
-}
-
-/// Render the diff pane when there are no diff lines to show (empty text diff,
-/// binary file, or no file selected). The selected file's orphaned comments
-/// still render as a top block — for such a file it's the only place they can
-/// appear (finding 2) — with the `message` hint beneath. With no orphans this is
-/// the plain centered hint, exactly as before.
-fn render_orphans_only(
-    frame: &mut Frame,
-    inner: Rect,
-    app: &App,
-    message: &str,
-    theme: &Theme,
-    cursor: Option<usize>,
-) {
-    let orphans = app.selected_file_orphans();
-    if orphans.is_empty() {
-        app.set_diff_metrics(inner.height, 0);
-        centered_hint(frame, inner, message, Style::new().fg(theme.dim));
-        return;
-    }
-    // Metrics count only the selectable orphan rows so the cursor rests on a
-    // comment, not the trailing hint.
-    app.set_diff_metrics(inner.height, clamp_u16(orphans.len()));
-    let offset = app.diff_scroll.min(app.diff_max_scroll()) as usize;
-    let mut rows: Vec<Line> = orphans
-        .iter()
-        .enumerate()
-        .skip(offset)
-        .take(inner.height as usize)
-        .map(|(i, &id)| {
-            let row = comment_row(app, id, theme, inner.width as usize, true);
-            mark_cursor_row(row, cursor == Some(i), theme)
-        })
-        .collect();
-    // The no-diff hint follows the orphan rows when there's vertical room left.
-    if rows.len() < inner.height as usize {
-        rows.push(Line::from(Span::styled(
-            message.to_string(),
-            Style::new().fg(theme.dim),
-        )));
-    }
-    frame.render_widget(Paragraph::new(rows), inner);
-}
-
-fn render_unified(
-    frame: &mut Frame,
-    inner: Rect,
-    app: &App,
-    lines: &[DiffLine],
-    syntax: &SyntaxReference,
-    cursor: Option<usize>,
-) {
-    // Unified is row-driven: diff lines plus injected comment/orphan rows. Metrics
-    // count rows (not lines), so scrolling reaches an injected last row.
-    let rows = app.unified_rows(lines);
-    app.set_diff_metrics(inner.height, clamp_u16(rows.len()));
-    let theme = &app.theme;
-    let offset = app.diff_scroll.min(app.diff_max_scroll()) as usize;
-    let body_width =
-        (inner.width as usize).saturating_sub(unified_gutter_width(app.show_line_numbers));
-
-    let out: Vec<Line> = rows
-        .iter()
-        .enumerate()
-        .skip(offset)
-        .take(inner.height as usize)
-        .map(|(i, row)| {
-            let line = match row {
-                URow::Line(li) => unified_line(app, &lines[*li], theme, syntax, body_width),
-                URow::Comment(id) => comment_row(app, *id, theme, inner.width as usize, false),
-                URow::Orphan(id) => comment_row(app, *id, theme, inner.width as usize, true),
-            };
-            mark_cursor_row(line, cursor == Some(i), theme)
-        })
-        .collect();
-    frame.render_widget(Paragraph::new(out), inner);
 }
 
 fn unified_line(
@@ -202,112 +211,91 @@ fn unified_line(
         &line.text,
         body_width.saturating_sub(SIGN_WIDTH),
         bg,
+        // Word-diff emphasis is a side-by-side feature only (plan §3.7).
+        None,
     ));
     Line::from(spans)
 }
 
-fn render_side_by_side(
-    frame: &mut Frame,
-    inner: Rect,
-    app: &App,
-    lines: &[DiffLine],
-    syntax: &SyntaxReference,
-    cursor: Option<usize>,
-) {
-    let rows = app.sbs_rows(lines);
-    app.set_diff_metrics(inner.height, clamp_u16(rows.len()));
-    let theme = &app.theme;
-    let offset = app.diff_scroll.min(app.diff_max_scroll()) as usize;
-    // left column │ right column, the divider taking one cell.
-    let left_w = inner.width.saturating_sub(1) / 2;
-    let right_w = inner.width.saturating_sub(left_w + 1);
-
-    let out: Vec<Line> = rows
-        .iter()
-        .enumerate()
-        .skip(offset)
-        .take(inner.height as usize)
-        .map(|(i, row)| {
-            let line = side_by_side_line(
-                app,
-                row,
-                lines,
-                theme,
-                syntax,
-                left_w as usize,
-                right_w as usize,
-                inner.width as usize,
-            );
-            mark_cursor_row(line, cursor == Some(i), theme)
-        })
-        .collect();
-    frame.render_widget(Paragraph::new(out), inner);
-}
-
-#[derive(Clone, Copy)]
-enum Side {
-    Old,
-    New,
-}
-
+/// One side-by-side code row: the old cell, the centre divider, the new cell.
+/// `emphasis` carries the pair's word-diff changed-char ranges (plan §3.7),
+/// `None` unless this is a genuinely modified pair.
 #[allow(clippy::too_many_arguments)]
-fn side_by_side_line(
+fn sbs_pair_line(
     app: &App,
-    row: &SbsRow,
+    left: Option<usize>,
+    right: Option<usize>,
     lines: &[DiffLine],
     theme: &Theme,
     syntax: &SyntaxReference,
     left_w: usize,
     right_w: usize,
-    full_w: usize,
+    emphasis: Option<&PairEmphasis>,
 ) -> Line<'static> {
-    match row {
-        SbsRow::Comment(id) => comment_row(app, *id, theme, full_w, false),
-        SbsRow::Orphan(id) => comment_row(app, *id, theme, full_w, true),
-        SbsRow::Hunk(i) => hunk_line(&lines[*i], theme),
-        SbsRow::Pair { left, right } => {
-            let mut spans = cell(
-                app,
-                left.map(|i| &lines[i]),
-                Side::Old,
-                theme,
-                syntax,
-                left_w,
-            );
-            spans.push(Span::styled("│", Style::new().fg(theme.border)));
-            spans.extend(cell(
-                app,
-                right.map(|i| &lines[i]),
-                Side::New,
-                theme,
-                syntax,
-                right_w,
-            ));
-            Line::from(spans)
-        }
-    }
+    let mut spans = cell(
+        app,
+        left.map(|i| &lines[i]),
+        Col::Old,
+        theme,
+        syntax,
+        left_w,
+        emphasis.map(|e| e.old_ranges.as_slice()),
+    );
+    spans.push(Span::styled("│", Style::new().fg(theme.border)));
+    spans.extend(cell(
+        app,
+        right.map(|i| &lines[i]),
+        Col::New,
+        theme,
+        syntax,
+        right_w,
+        emphasis.map(|e| e.new_ranges.as_slice()),
+    ));
+    Line::from(spans)
+}
+
+/// Which column a side-by-side cell renders (old / new).
+#[derive(Clone, Copy)]
+enum Col {
+    Old,
+    New,
 }
 
 fn cell(
     app: &App,
     line: Option<&DiffLine>,
-    side: Side,
+    side: Col,
     theme: &Theme,
     syntax: &SyntaxReference,
     width: usize,
+    emph_ranges: Option<&[Range<usize>]>,
 ) -> Vec<Span<'static>> {
     let Some(line) = line else {
         return vec![Span::styled(" ".repeat(width), Style::new().bg(theme.bg))];
     };
-    let (number, active_kind, active_bg) = match side {
-        Side::Old => (line.old_no, LineKind::Deletion, theme.del_bg),
-        Side::New => (line.new_no, LineKind::Addition, theme.add_bg),
+    let (number, active_kind, active_bg, emph_bg) = match side {
+        Col::Old => (
+            line.old_no,
+            LineKind::Deletion,
+            theme.del_bg,
+            theme.del_emph,
+        ),
+        Col::New => (
+            line.new_no,
+            LineKind::Addition,
+            theme.add_bg,
+            theme.add_emph,
+        ),
     };
-    let bg = if line.kind == active_kind {
-        active_bg
-    } else {
-        theme.bg
-    };
+    let active = line.kind == active_kind;
+    let bg = if active { active_bg } else { theme.bg };
+    // Emphasis only ever applies to this side's changed line (the other side of
+    // a modified pair never carries this side's ranges); guard on `active`
+    // defensively even though `App::pair_emphasis` only ever sets ranges for a
+    // real deletion/addition pairing.
+    let emphasis = emph_ranges
+        .filter(|_| active)
+        .map(|ranges| (ranges, emph_bg));
     let gutter_w = sbs_gutter_width(app.show_line_numbers);
     let mut spans = Vec::new();
     if app.show_line_numbers {
@@ -321,6 +309,7 @@ fn cell(
         &line.text,
         width.saturating_sub(gutter_w),
         bg,
+        emphasis,
     ));
     spans
 }
@@ -332,52 +321,297 @@ fn hunk_line(line: &DiffLine, theme: &Theme) -> Line<'static> {
     ))
 }
 
-/// A full-width review-comment row (spans both columns in side-by-side): `● you
-/// <text>` / `● agent <text>`, or `⚠ …` for an orphan. The comment accent colour,
-/// text sanitized with embedded newlines shown as `⏎`, truncated to `width` with
-/// an ellipsis. A missing id (a concurrent removal between row build and render)
-/// renders a blank line rather than panicking.
-fn comment_row(app: &App, id: u64, theme: &Theme, width: usize, orphaned: bool) -> Line<'static> {
-    let Some(comment) = app.review_comment(id) else {
-        return Line::from(Span::raw(String::new()));
+/// Render one physical row of a comment box (plan §3.4). Unified boxes span the
+/// full pane; side-by-side boxes occupy their comment's anchor-side column while
+/// the other column renders equal-height blanks. The title row's `[x]` cell rect
+/// is recorded into `x_rects` for C8's click handling. A drifted (`stale`) note
+/// renders dim.
+#[allow(clippy::too_many_arguments)]
+fn box_row_line(
+    row: &LayoutRow,
+    boxed: &BoxRow,
+    theme: &Theme,
+    inner: Rect,
+    left_w: usize,
+    right_w: usize,
+    screen_y: u16,
+    x_rects: &mut HashMap<u64, Rect>,
+) -> Line<'static> {
+    let (box_x_offset, box_w) = match row.side {
+        None => (0usize, inner.width as usize),
+        Some(Side::Old) => (0usize, left_w),
+        Some(Side::New) => (left_w + 1, right_w),
     };
-    let marker = if orphaned { '⚠' } else { '●' };
-    let who = match comment.source {
-        Source::Human => "you",
-        Source::Agent => "agent",
+    let accent = if boxed.stale {
+        theme.dim
+    } else {
+        theme.comment
     };
-    let text = comment_display_text(&comment.text);
-    let full = format!("{marker} {who} {text}");
-    let shown = fit_with_ellipsis(&full, width);
-    Line::from(Span::styled(
-        shown,
-        Style::new()
-            .fg(theme.comment)
-            .add_modifier(Modifier::BOLD)
-            .bg(theme.bg),
-    ))
-}
+    let border = Style::new().fg(accent);
+    let title_style = Style::new().fg(accent).add_modifier(Modifier::BOLD);
+    let body_style = Style::new().fg(if boxed.stale { theme.dim } else { theme.fg });
 
-/// Sanitize comment text for a single display row: render embedded newlines as
-/// `⏎` (CLI-authored notes may be multi-line; the store keeps the raw bytes),
-/// then run the shared `sanitize` pass (tabs expanded, other control chars
-/// dropped so content can't inject escapes).
-fn comment_display_text(text: &str) -> String {
-    sanitize(&text.replace(['\n', '\r'], "⏎"))
-}
-
-/// Truncate `s` to `width` display columns (unicode-width aware), appending `…`
-/// when it doesn't fit. Returns `s` unchanged when it already fits.
-fn fit_with_ellipsis(s: &str, width: usize) -> String {
-    if width == 0 {
-        return String::new();
+    let (box_spans, close_col) = match &boxed.part {
+        BoxPart::Title(text) => box_title_spans(text, box_w, border, title_style),
+        BoxPart::Body(text) => (box_body_spans(text, box_w, border, body_style), None),
+        BoxPart::Bottom => (box_bottom_spans(box_w, border), None),
+    };
+    if let Some(col) = close_col {
+        x_rects.insert(
+            boxed.id,
+            Rect {
+                x: inner.x + (box_x_offset + col) as u16,
+                y: screen_y,
+                width: 3,
+                height: 1,
+            },
+        );
     }
+
+    frame_side_columns(box_spans, row.side, left_w, right_w, theme)
+}
+
+/// Wrap a box's own spans into its side-by-side column, padding the other column
+/// with a divider + equal-height blank; a full-width (`None`) box passes through.
+/// Shared by the comment-box and editor renderers.
+fn frame_side_columns(
+    box_spans: Vec<Span<'static>>,
+    side: Option<Side>,
+    left_w: usize,
+    right_w: usize,
+    theme: &Theme,
+) -> Line<'static> {
+    let divider = || Span::styled("│", Style::new().fg(theme.border));
+    let blank = |w: usize| Span::styled(" ".repeat(w), Style::new().bg(theme.bg));
+    let spans = match side {
+        None => box_spans,
+        Some(Side::Old) => {
+            let mut spans = box_spans;
+            spans.push(divider());
+            spans.push(blank(right_w));
+            spans
+        }
+        Some(Side::New) => {
+            let mut spans = vec![blank(left_w), divider()];
+            spans.extend(box_spans);
+            spans
+        }
+    };
+    Line::from(spans)
+}
+
+/// The box top border with the title and a right-aligned `[x]`:
+/// `╭─ ● you — <file> R<line> ────[x]╮`. The title is truncated to fit, but the
+/// `[x]` close affordance always stays visible (plan §3.4). Returns the spans and
+/// the column of `[` within the box, so the caller can record its click rect.
+fn box_title_spans(
+    title: &str,
+    box_w: usize,
+    border: Style,
+    accent: Style,
+) -> (Vec<Span<'static>>, Option<usize>) {
+    if box_w == 0 {
+        return (Vec::new(), None);
+    }
+    // Too narrow for corners + `[x]`: fill with border, no close cell.
+    if box_w < 5 {
+        return (vec![Span::styled("─".repeat(box_w), border)], None);
+    }
+    let close_col = box_w - 4;
+    // Narrow: no room for a title, but keep the framed `[x]`.
+    if box_w < 8 {
+        let spans = vec![
+            Span::styled("╭", border),
+            Span::styled("─".repeat(box_w - 5), border),
+            Span::styled("[x]", accent),
+            Span::styled("╮", border),
+        ];
+        return (spans, Some(close_col));
+    }
+    // Normal: `╭─ ` + title + ` ` + fill + `[x]` + `╮` totals `box_w`.
+    let (title_fit, title_w) = fit_display(title, box_w - 8);
+    let fill = box_w - 8 - title_w;
+    let mut spans = vec![Span::styled("╭─ ", border)];
+    if !title_fit.is_empty() {
+        spans.push(Span::styled(title_fit, accent));
+    }
+    spans.push(Span::styled(format!(" {}", "─".repeat(fill)), border));
+    spans.push(Span::styled("[x]", accent));
+    spans.push(Span::styled("╮", border));
+    (spans, Some(close_col))
+}
+
+/// A box body row: `│ <text padded> │`. The text was word-wrapped to the box's
+/// inner width at layout time; it's fitted again here defensively.
+fn box_body_spans(text: &str, box_w: usize, border: Style, body: Style) -> Vec<Span<'static>> {
+    if box_w == 0 {
+        return Vec::new();
+    }
+    // Below `│ x │` (2 borders + 2 padding) there is no room for content; degrade
+    // to a bare border column rather than underflow `box_w - 4`.
+    if box_w < 4 {
+        return vec![Span::styled("│".repeat(box_w), border)];
+    }
+    let content_w = box_w - 4;
+    let (fit, fit_w) = fit_display(text, content_w);
+    let mid = format!(" {fit}{} ", " ".repeat(content_w - fit_w));
+    vec![
+        Span::styled("│", border),
+        Span::styled(mid, body),
+        Span::styled("│", border),
+    ]
+}
+
+/// The box bottom border: `╰────╯`.
+fn box_bottom_spans(box_w: usize, border: Style) -> Vec<Span<'static>> {
+    if box_w == 0 {
+        return Vec::new();
+    }
+    if box_w < 2 {
+        return vec![Span::styled("─".repeat(box_w), border)];
+    }
+    vec![
+        Span::styled("╰", border),
+        Span::styled("─".repeat(box_w - 2), border),
+        Span::styled("╯", border),
+    ]
+}
+
+/// Render one physical row of the in-place editor box (plan §3.5). Mirrors
+/// `box_row_line`'s side-column placement, but the accent is the focus colour (an
+/// active input) and the body draws a reversed caret cell — no `[x]`, since the
+/// editor is dismissed with Esc/Enter, not a click.
+fn editor_row_line(
+    row: &LayoutRow,
+    part: &EditorPart,
+    theme: &Theme,
+    inner: Rect,
+    left_w: usize,
+    right_w: usize,
+) -> Line<'static> {
+    let box_w = match row.side {
+        None => inner.width as usize,
+        Some(Side::Old) => left_w,
+        Some(Side::New) => right_w,
+    };
+    let accent = theme.border_focused;
+    let border = Style::new().fg(accent);
+    let title_style = Style::new().fg(accent).add_modifier(Modifier::BOLD);
+    let body_style = Style::new().fg(theme.fg);
+    let caret_style = body_style.add_modifier(Modifier::REVERSED);
+
+    let box_spans = match part {
+        EditorPart::Title(text) => editor_title_spans(text, box_w, border, title_style),
+        EditorPart::Body { text, caret } => {
+            editor_body_spans(text, *caret, box_w, border, body_style, caret_style)
+        }
+        EditorPart::Bottom => box_bottom_spans(box_w, border),
+    };
+
+    frame_side_columns(box_spans, row.side, left_w, right_w, theme)
+}
+
+/// The editor box top border with its title: `╭─ ✎ you — <file> R<line> ────╮`,
+/// truncated to fit. Like `box_title_spans` but without the `[x]` close cell.
+fn editor_title_spans(
+    title: &str,
+    box_w: usize,
+    border: Style,
+    accent: Style,
+) -> Vec<Span<'static>> {
+    if box_w == 0 {
+        return Vec::new();
+    }
+    if box_w < 2 {
+        return vec![Span::styled("─".repeat(box_w), border)];
+    }
+    if box_w < 5 {
+        // Corners + fill; too narrow for a title.
+        return vec![
+            Span::styled("╭", border),
+            Span::styled("─".repeat(box_w - 2), border),
+            Span::styled("╮", border),
+        ];
+    }
+    // `╭─ ` (3) + title + ` ` (1) + fill + `╮` (1) totals box_w.
+    let (fit, w) = fit_display(title, box_w - 5);
+    let fill = box_w - 5 - w;
+    let mut spans = vec![Span::styled("╭─ ", border)];
+    if !fit.is_empty() {
+        spans.push(Span::styled(fit, accent));
+    }
+    spans.push(Span::styled(format!(" {}", "─".repeat(fill)), border));
+    spans.push(Span::styled("╮", border));
+    spans
+}
+
+/// An editor body row: `│ <text with caret> │`. `text` is already wrapped to the
+/// content width; the caret cell (at display column `caret`) is drawn reversed, and
+/// a caret past the text end reverses a trailing blank.
+fn editor_body_spans(
+    text: &str,
+    caret: Option<usize>,
+    box_w: usize,
+    border: Style,
+    body: Style,
+    caret_style: Style,
+) -> Vec<Span<'static>> {
+    if box_w == 0 {
+        return Vec::new();
+    }
+    // Below `│ x │` there is no room for content; degrade to a bare border column.
+    if box_w < 4 {
+        return vec![Span::styled("│".repeat(box_w), border)];
+    }
+    let content_w = box_w - 4;
+    let mut content: Vec<Span<'static>> = Vec::new();
+    let mut col = 0;
+    for ch in text.chars() {
+        let w = char_width(ch);
+        if col + w > content_w {
+            break;
+        }
+        let style = if caret == Some(col) {
+            caret_style
+        } else {
+            body
+        };
+        content.push(Span::styled(ch.to_string(), style));
+        col += w;
+    }
+    // The caret sits past the drawn text (empty line, or end of a short line): pad
+    // up to it, then a reversed blank so it's visible.
+    if let Some(cc) = caret {
+        if cc >= col && cc < content_w {
+            if cc > col {
+                content.push(Span::styled(" ".repeat(cc - col), body));
+                col = cc;
+            }
+            content.push(Span::styled(" ".to_string(), caret_style));
+            col += 1;
+        }
+    }
+    if col < content_w {
+        content.push(Span::styled(" ".repeat(content_w - col), body));
+    }
+    let mut spans = vec![Span::styled("│", border), Span::styled(" ", body)];
+    spans.extend(content);
+    spans.push(Span::styled(" ", body));
+    spans.push(Span::styled("│", border));
+    spans
+}
+
+/// Fit `s` into `max` display columns (unicode-width aware), returning the
+/// fitted string and its exact width, appending `…` when it doesn't fit.
+fn fit_display(s: &str, max: usize) -> (String, usize) {
     let total: usize = s.chars().map(char_width).sum();
-    if total <= width {
-        return s.to_string();
+    if total <= max {
+        return (s.to_string(), total);
     }
-    // Reserve one column for the ellipsis.
-    let budget = width - 1;
+    if max == 0 {
+        return (String::new(), 0);
+    }
+    let budget = max - 1; // one column for the ellipsis
     let mut out = String::new();
     let mut used = 0;
     for ch in s.chars() {
@@ -389,12 +623,35 @@ fn fit_with_ellipsis(s: &str, width: usize) -> String {
         used += w;
     }
     out.push('…');
-    out
+    used += 1;
+    (out, used)
 }
 
 /// Syntax-highlight `text` into spans (each token's colour over the line's
 /// background), expanding tabs, dropping control chars, and padding to `width`
-/// so the background fills the row.
+/// so the background fills the row. `emphasis`, when given, is a side-by-side
+/// modified pair's changed-char ranges over this same sanitized text plus the
+/// emphasis background to use for them (plan §3.7): each char's background is
+/// decided against the ranges (`char_bg`), intersecting the word-diff with the
+/// syntax-token spans below without touching foreground colour.
+///
+/// Two non-obvious invariants:
+/// - **Truncation stops the whole line, not just the current token.** The first
+///   char that doesn't fit exits the outer token loop too (a labeled break), so
+///   a later, differently-highlighted token can't render past the cut — which
+///   would otherwise also desync `char_idx` from `emphasis`'s ranges (nothing
+///   advances it over the skipped remainder), corrupting every emphasis lookup
+///   for the rest of the line.
+/// - **A zero-width char (a combining mark/ZWJ) never forces a span break.** A
+///   terminal only combines it with the preceding base character when both are
+///   written in the same span/string; splitting it into its own span stranded
+///   it in a zero-width cell that got overwritten by the trailing padding,
+///   silently dropping the change it renders (e.g. an accent in a modified
+///   pair). It's glued onto the current chunk regardless of its own `char_bg`
+///   — the chunk keeps the base character's background rather than switching
+///   for just the mark — so a word-diff range landing only on the mark itself
+///   is not visually distinguished; this is the documented fallback over
+///   splitting the cluster.
 fn highlighted_content(
     app: &App,
     syntax: &SyntaxReference,
@@ -402,25 +659,45 @@ fn highlighted_content(
     text: &str,
     width: usize,
     bg: Color,
+    emphasis: Option<(&[Range<usize>], Color)>,
 ) -> Vec<Span<'static>> {
     let clean = sanitize(text);
     let mut spans = Vec::new();
-    let mut used = 0;
-    for (color, piece) in app.highlight(syntax, theme_name, &clean).iter() {
+    let mut used = 0; // display columns consumed, for width truncation/padding
+    let mut char_idx = 0; // char offset into `clean`, aligned with `emphasis`'s ranges
+    'tokens: for (color, piece) in app.highlight(syntax, theme_name, &clean).iter() {
         if used >= width {
             break;
         }
         let mut chunk = String::new();
+        let mut chunk_bg = bg;
         for ch in piece.chars() {
             let ch_width = char_width(ch);
             if used + ch_width > width {
-                break;
+                if !chunk.is_empty() {
+                    spans.push(Span::styled(chunk, Style::new().fg(*color).bg(chunk_bg)));
+                }
+                break 'tokens;
             }
+            if ch_width == 0 && !chunk.is_empty() {
+                chunk.push(ch);
+                char_idx += 1;
+                continue;
+            }
+            let ch_bg = char_bg(char_idx, emphasis, bg);
+            if !chunk.is_empty() && ch_bg != chunk_bg {
+                spans.push(Span::styled(
+                    std::mem::take(&mut chunk),
+                    Style::new().fg(*color).bg(chunk_bg),
+                ));
+            }
+            chunk_bg = ch_bg;
             chunk.push(ch);
             used += ch_width;
+            char_idx += 1;
         }
         if !chunk.is_empty() {
-            spans.push(Span::styled(chunk, Style::new().fg(*color).bg(bg)));
+            spans.push(Span::styled(chunk, Style::new().fg(*color).bg(chunk_bg)));
         }
     }
     if used < width {
@@ -429,9 +706,23 @@ fn highlighted_content(
     spans
 }
 
+/// The background for sanitized-text char `idx`: `emph_bg` when `idx` falls in
+/// one of `emphasis`'s changed-char ranges, else the line's base `bg` (plan
+/// §3.7). The per-char decision is what lets a changed span's emphasis
+/// intersect with the syntax-highlighted token spans above (each token can
+/// straddle an emphasis-range boundary and split into an emphasized/base run).
+fn char_bg(idx: usize, emphasis: Option<(&[Range<usize>], Color)>, bg: Color) -> Color {
+    match emphasis {
+        Some((ranges, emph_bg)) if ranges.iter().any(|r| r.contains(&idx)) => emph_bg,
+        _ => bg,
+    }
+}
+
 /// Normalise a line for display in one pass: expand tabs and drop control
-/// characters so file content can't inject terminal escape sequences.
-fn sanitize(text: &str) -> String {
+/// characters so file content can't inject terminal escape sequences. `pub(crate)`
+/// so `App::pair_emphasis` (plan §3.7) can diff the exact same text the renderer
+/// shows, keeping its changed-char-range offsets aligned with these tokens.
+pub(crate) fn sanitize(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
         match ch {
@@ -448,8 +739,4 @@ fn gutter_num(no: Option<usize>) -> String {
         Some(n) => format!("{n:>4}"),
         None => "    ".to_string(),
     }
-}
-
-fn clamp_u16(value: usize) -> u16 {
-    value.min(u16::MAX as usize) as u16
 }

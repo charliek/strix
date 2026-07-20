@@ -33,8 +33,8 @@ assertions.
 | `graph`       | Pure rail-graph lane layout for the history view.                 |
 | `config`      | Config read (`toml`) and write-back (`toml_edit`). |
 | `keys`        | The configurable keymap: `Action`, default chords, `[keys]` overrides; dispatch itself lives in `App::on_key`/`App::on_mouse`. |
-| `comments`    | Review-comment model, JSON store I/O, and the re-anchor engine (pure; see [comments store](#comments-store)). |
-| `comments_cli`| `strix comment list\|add\|rm\|clear\|gc` — the agent-facing CLI over the same store. |
+| `comments`    | Comment model (worktree + range scopes), JSON store I/O, and the pure re-anchor/sweep engines (see [comments store](#comments-store)). |
+| `comments_cli`| `strix comment list\|add\|rm\|clear\|gc --scope …` — the agent-facing CLI over the same store, sharing the worktree sweep engine with the TUI. |
 | `skill`       | `strix skill path` — materializes the bundled `strix-review` skill (see [skill distribution](#skill-distribution)). |
 
 ## Git layer
@@ -60,7 +60,7 @@ porcelain. Those shell-outs are confined to `git/ops.rs` (mutations),
 
 ### Comments store
 
-Review comments (`src/comments.rs`) live in a single JSON file at
+Comments (`src/comments.rs`) live in a single JSON file at
 `<common_dir>/strix/comments.json` — `Repo::strix_dir()` resolves
 `gix.common_dir()`, not `git_dir()`, so a linked worktree (whose `git_dir` is
 private to that checkout) and the primary checkout share exactly one file,
@@ -74,30 +74,82 @@ never written to — every mutation reads first, so the never-clobber guarantee
 holds for both reads and writes. A missing or zero-byte file is a valid empty
 store.
 
+**Scope.** Every `Comment` carries a `Scope`: `WorkTree` (anchored to the net
+`HEAD`-vs-worktree diff — see [Status view](#status-view-net-worktree-diff-and-comments)
+below) or `Range { range }` (anchored to a committed `strix diff <range>`
+review). `Scope` is serialized flat and additively — `"scope":"worktree"`, or
+`"scope":"range","range":"main"` — so no pre-existing field was renamed for
+it (see [CLI](cli.md#strix-comment)). A worktree comment additionally carries
+`base` (the `HEAD` commit hex at authoring time; omitted, not `null`, for a
+range comment) and always carries `stale` (`bool`, meaningful — set when the
+line drifts under an unchanged `HEAD` — for worktree comments only, always
+`false` otherwise); see the lifecycle below.
+
+**Store versioning.** `STORE_VERSION` is 2 (bumped from milestone 6's 1 to add
+`Scope`). `load` decodes a minimal `{version, next_id}` envelope first — a
+full v2 decode requires the v2 `Comment` shape, so a real v1 file with
+comments would otherwise fail that parse and wrongly hit the never-clobber
+path — then routes on `version` alone: `2` parses normally; `1` copies the
+raw bytes aside to `comments.json.v1.bak` (an identical existing backup is a
+no-op; a different one is kept, and these bytes go to
+`comments.json.v1.bak.1`, `.2`, …) and returns an **empty** v2 store,
+carrying the old `next_id` forward so a freshly minted id can't collide with
+one still referenced from the backup; this is a deliberate, one-time reset —
+backwards compatibility with v1 was explicitly out of scope for the milestone
+that introduced `Scope` (see the [review loop guide](../guides/review-loop.md)
+for the user-facing note). Unparseable JSON still errors and preserves the
+file (never-clobber kept); `version > 2` still refuses read and write.
+
 **GC** runs at TUI startup (`App::build`, right after `Repo::open` and before
 comments load — best-effort, never fatal) and via `strix comment gc`: it
 drops inboxes keyed to a branch whose ref is gone, and detached (commit-hex)
-inboxes whose commit no longer resolves, logging each drop.
+inboxes whose commit no longer resolves, logging each drop — both scopes on a
+dropped branch key go together, not just one.
 
-**Re-anchoring** (`comments::reanchor`, a pure function over a comment slice
-and the range's per-file diffs) runs on review-session open, on every
-`refresh_review` (a store re-read is the *first* statement, ahead of the OID
-churn guard, so an agent's `rm` shows up even when nothing else changed), and
-in the CLI's `list`/`add` paths. For each comment: an exact line-number +
-line-text match wins outright; failing that, a same-side line whose text
-matches the stored `context` **within ±10 lines** of the stored line
-re-anchors to it (closest wins, ties toward the smaller line); anything
-farther, or with no match at all, is marked `orphaned` rather than silently
-relocated — a `context` of `None` ("unavailable" at authoring time) always
-orphans on any drift instead of content-matching. A re-anchor pass that
-changes nothing skips its write, which is what keeps a live TUI's watcher
-from looping (reload → re-anchor → write → reload → …).
+**Re-anchoring** (`comments::reanchor`/`reanchor_scoped`, pure functions over
+a comment slice and per-file diffs) runs on review-session open, on every
+`refresh_review`/Status `refresh()` (a store re-read is the *first*
+statement, ahead of the OID churn guard, so an agent's `rm` shows up even
+when nothing else changed), and in the CLI's `list`/`add` paths. Re-anchoring
+is **scope-filtered**: Status re-anchors only `Scope::WorkTree` comments
+against the net worktree diff; Review re-anchors only `Scope::Range`
+comments whose `range` matches the resolved review's *exact* range — a
+comment is never re-anchored against, or orphaned by, the wrong view's diff.
+For each comment: an exact line-number + line-text match wins outright;
+failing that, a same-side line whose text matches the stored `context`
+**within ±10 lines** of the stored line re-anchors to it (closest wins, ties
+toward the smaller line); anything farther, or with no match at all, is
+marked `orphaned` rather than silently relocated — a `context` of `None`
+("unavailable" at authoring time) always orphans on any drift instead of
+content-matching. A re-anchor pass that changes nothing skips its write,
+which is what keeps a live TUI's watcher from looping (reload → re-anchor →
+write → reload → …).
 
-The watcher (`watch.rs`) recursively watches the workdir as usual, plus
-`Repo::strix_dir()` as an extra root — necessary because in a linked
-worktree the shared store lives *outside* the watched workdir entirely, so
-without that extra root an agent's CLI writes there would never trigger a
-live refresh.
+**Worktree comment lifecycle.** A worktree comment's `base` OID plus the
+current `Status` drive a small state machine (`comments::sweep_worktree`,
+fed per-comment `FileFacts` from `App::worktree_facts` — the same function
+`comments_cli`'s headless sweep calls, so the TUI and CLI run one lifecycle
+engine, not two): committing the exact change a comment anchors to (`HEAD`
+moves past `base` and the comment is orphaned-after-re-anchor against the net
+diff) sweeps it from the inbox; editing the anchored line in place while
+`HEAD` is unchanged marks it `stale` (surfaced with a dimmed accent, never
+auto-deleted); staging/unstaging with no content change, an unrelated edit,
+an unrelated commit, or the line merely scrolling out of the rendered diff
+never touch it; a comment's file vanishing from the worktree with `HEAD`
+unchanged sweeps unconditionally. The sweep runs through `mutate_if_changed`,
+so a pass that finds nothing to do never writes (and never re-triggers the
+watcher).
+
+The watcher (`watch.rs`) recursively watches the workdir plus
+`Repo::watch_roots()` — the common dir, this checkout's private git dir, and
+`strix_dir()`, each dropped if it's already covered by the recursive workdir
+watch or nested under another root already kept. In a primary checkout every
+candidate lives under `workdir/.git`, so the result is empty (the workdir
+watch already covers it); in a linked worktree the private git dir and the
+shared common dir both live outside `workdir` (its `.git` is a file pointing
+elsewhere), so the result is the common dir alone — which subsumes both the
+per-worktree git dir and the store — letting a commit or a `strix comment`
+write from another linked worktree wake this session.
 
 ### Skill distribution
 
@@ -126,6 +178,83 @@ commit blob and its first-parent blob, looked up by revspec — so the diff pane
 serves both views unchanged. The right pane swaps between that diff and a
 `git show`-style commit-details paragraph based on the selection.
 
+**Side-by-side word emphasis.** A zipped SBS `Pair` with both sides present is
+a candidate for word-level emphasis: a char/word-level `similar` diff over the
+two sides' *sanitized* text (the same sanitize `highlighted_content` already
+applies, so offsets align) locates the changed spans, computed once when the
+row layout is built and cached with it, not per frame. Below a similarity
+threshold the pair is treated as a plain add+del instead — dissimilar lines
+never get emphasis painted over them, and a pure addition/deletion (no
+opposite-side partner) never does either. The renderer intersects the changed
+spans with `highlighted_content`'s syntax-token spans and paints the
+intersection in `theme.add_emph`/`del_emph` — a brighter, more saturated pair
+than the flat `add_bg`/`del_bg` wash — instead of the line's base background;
+selecting the row still repaints every span with `selection_bg`, so the
+cursor highlight intentionally overrides emphasis.
+
+## Diff pane: rows, cursor, and comments
+
+The diff pane is shared by Status, Review, and History, but only Status and
+Review have a cursor (History reuses the rendering, not the input model). The
+cursor addresses a **logical** `RowTarget` — `Code(diff_index)`,
+`Comment(id)`, or `Orphan(id)` — never a raw row index. A separate, **physical**
+layout (`Vec<LayoutRow>`, each row carrying its `RowTarget`, a `subrow` index,
+an optional side-by-side column, a click `HitRegion`, and its render content)
+is rebuilt from that target list for the current pane width and diff/comments
+generation; a code line is exactly one `LayoutRow`, a comment box or the
+in-place editor is several (border / title / body) sharing one target.
+Consequences of the split: `j`/`k` move between *targets*, crossing a
+multi-row box in a single step; scroll offset and content-height metrics
+count physical rows; the cursor highlight spans every physical row of the
+selected target; and a resize rebuilds the layout while preserving the
+logical target the cursor was on. `DiffPaneState` (the cursor, the open
+in-place editor if any, and the comment boxes' `[x]` click rects recorded
+during render) is owned per view that *has* a cursor — Status and Review each
+get their own; the scroll offset, the height metrics, and the row-layout
+cache itself stay App-global, shared with History.
+
+**Comment boxes.** A comment renders as a bordered, multi-row box directly
+below its anchored line: a title row (`● you — <file> R<line>` or
+`● agent — …`, `⚠` in place of `●` for an orphan, a right-aligned `[x]`), the
+word-wrapped body, and a bottom border — placed after the line in unified
+mode, and in the anchor's own column (the other column rendering blank) in
+side-by-side. A `stale` worktree comment (see
+[Comments store](#comments-store)) renders its accent and body dimmed rather
+than in the theme's `comment` colour.
+
+**The in-place editor** (`CommentEdit`, replacing milestone 6's centered
+`Modal::CommentInput`) lives in `DiffPaneState.editing`: an editable box
+rendered at the anchor, its position recomputed from that anchor *every
+frame* rather than a captured row index, so a watcher reload that rebuilds
+the diff mid-typing can't dangle it. It expands the diff around it, and the
+view scrolls after every keystroke to keep the caret visible as the box
+grows. While editing, keys route to the editor *before* the keymap, so any
+plain character — including `c`, `x`, `]` — inserts literally instead of
+firing its usual action; `Enter` saves, `Esc` discards, and a newline is
+`Shift+Enter`, with `Ctrl-J`/`Alt+Enter` as equal fallbacks for terminals that
+don't report Shift+Enter reliably (see
+[Keybindings](../getting-started/keybindings.md#in-place-comment-editor)).
+Bracketed paste is enabled in the terminal setup so a multi-line paste
+inserts real newlines rather than one `Enter` per line. Submitting re-reads
+the store fresh and, for an edit, updates only the comment's `text` on that
+freshly-read record (so a concurrent re-anchor's location is never
+overwritten by the stale captured anchor); an unchanged-text save is elided
+as a no-op, matching the store's general write-elision discipline.
+
+**Mouse.** A render pass resolves a click position to a semantic `HitTarget`
+(the view, the file, and a region — a code line, a comment box, or its
+`[x]`); two `Down(Left)` events whose `HitTarget`s are *equal* within 500 ms
+are a double-click (`is_double_click`, driven through an injectable clock,
+`on_mouse_at`, so tests assert the timing boundary with explicit instants
+instead of sleeping). A double-click on a code line opens the editor there,
+same as `c`; on an existing comment box, it edits that comment (an
+agent-authored box flashes read-only instead); a single click on a box's
+`[x]` deletes it immediately, ahead of the double-click check. The tracker
+resets on any drag, scroll, resize, view/mode change, or comment
+mutation — including a `[x]` click consuming its own click — so a
+triple-click or a click just after a delete can't false-fire a second
+double-click.
+
 ## History view
 
 The history view is a toggleable second view (`i` / `1` / `2`) alongside the
@@ -152,24 +281,42 @@ is read-only for staging — those actions are a no-op — and the file watcher
 refreshes it like the other views, guarded so a worktree-only change (no new
 commit on either side of the range) skips re-listing.
 
-**Cursor and row model.** `ReviewState.cursor` is an index into the active
-diff mode's *row list*, not a raw line index — a row can be a diff line or an
-injected review-comment/orphan row. Unified rendering, previously a strict
-1:1 map from `DiffLine`s to screen rows, became row-list-driven for this:
-`URow::{Line(usize), Comment(u64), Orphan(u64)}`, cached in `unified_rows`
-next to the pre-existing `SbsRow` cache side-by-side rendering already used
-(extended with its own `Comment`/`Orphan` variants). Rows carry comment
-*ids*, not vector indexes, so a mid-session deletion can't leave a row
-pointing at the wrong comment. The cursor renders with the selection colour
-only while the diff pane has focus, is clamped to the (possibly-shrunk) row
-count after every relist, and resets to row 0 on a file or mode change — with
-one deliberate exception: `]`/`[` (comment navigation) switch the file first,
-then place the cursor on the target comment's row rather than row 0. Every
-cursor-acting key (`c`, `x`) first scrolls an offscreen cursor into view and
-stops there ("act-and-reveal") rather than acting on a row the user can't
-see; a mouse click in the diff resolves the clicked screen row to a row index
-the same way and moves the cursor there, while the scroll wheel only moves
-the viewport.
+**Cursor and comments.** Review's diff-pane cursor and its comments (range
+scope) use the shared `RowTarget`/`LayoutRow`/`DiffPaneState` model described
+in [Diff pane: rows, cursor, and comments](#diff-pane-rows-cursor-and-comments)
+above — Status uses the same model for its worktree comments (see
+[Status view](#status-view-net-worktree-diff-and-comments) below). The cursor
+is clamped to the (possibly-shrunk) target list after every relist and resets
+to the top on a file or mode change, with one deliberate exception: `]`/`[`
+(comment navigation) switch the file first, then place the cursor on the
+target comment rather than the top.
+
+## Status view: net worktree diff and comments
+
+The Status diff pane always shows the selected file's **net `HEAD`-vs-worktree
+diff** (`Repo::file_diff_head_vs_worktree(&FileEntry)`, a sibling of `diff`/
+`diff_sides` in `git/diff.rs`), labeled `pending · HEAD→worktree` — not the
+per-section (staged xor unstaged) diff a milestone-6 session showed for the
+selected file. Because strix stages whole files, not hunks, this is identical
+to the old per-section diff for a file that's *only* staged or *only*
+unstaged; it differs only for a file staged and then re-edited, where the
+pane now shows the combined change (documented as a net-tree-diff caveat, not
+a bug — see [Usage](../getting-started/usage.md#on-uncommitted-work)). A path
+listed in both the Staged and Changes sections is one net diff, one comment
+target, and one `● n` badge (`ui/staging.rs`, keyed by path, not by
+`(section, path)`). A conflicted file has no clean net diff to comment on;
+binary and submodule files have no code lines to anchor to; an unborn `HEAD`
+treats the old side as empty (worktree content shows as additions only).
+
+Comments on this pane are `Scope::WorkTree` — see
+[the lifecycle in Comments store](#comments-store) above for how they track
+edits, staging, and commits. `App::worktree_facts` computes the per-comment
+`FileFacts` (`Present`/`Gone`, plus the `resolved_in_head` signal) the sweep
+engine needs each refresh, resolving a renamed file by its `orig_path` so a
+committed rename doesn't silently orphan or lose the note, and treating a
+pending (uncommitted) deletion as retained rather than swept — only an
+unambiguous worktree-local deletion under an unchanged `HEAD` sweeps
+unconditionally.
 
 ## Configuration write-back
 
@@ -213,26 +360,40 @@ phase:
 - Stashing
 - Remote operations (push, pull, fetch)
 - Hunk-level or line-level staging (file-level only)
-- A daemon or long-running session: review comments are a plain JSON file on
-  disk (`.git/strix/comments.json`), read and written by whichever process
-  (TUI or `strix comment`) happens to run, never a background service.
+- A daemon or long-running session: comments are a plain JSON file on disk
+  (`.git/strix/comments.json`), read and written by whichever process (TUI or
+  `strix comment`) happens to run, never a background service.
+- Comments in the History view (still absent — only Status and Review carry
+  them); the staged/unstaged distinction isn't itself commentable (a comment
+  anchors to the net diff, not to a section).
 
 Reviewing a branch against its base (`strix diff <base>`) is explicitly **in
 scope** — it's the foundation for strix becoming the review surface for
-agent-written code. Inline review comments (`c`/`x`/`]`/`[` in a review
-session, plus `strix comment` for agents — see [Review view](#review-view)
-and [comments store](#comments-store) above) build directly on it, and the
-bundled `strix-review` skill (see
-[skill distribution](#skill-distribution)) teaches agents that loop.
+agent-written code. Inline comments — on uncommitted work in the Status view
+or in a `strix diff` review session (`c`/double-click to add or edit, `X`/
+`[x]` to delete, `]`/`[` to navigate — never `x`, which stays the Changes-pane
+discard key), plus `strix comment` for agents — build directly on it (see
+[Diff pane: rows, cursor, and comments](#diff-pane-rows-cursor-and-comments),
+[Status view](#status-view-net-worktree-diff-and-comments), and
+[comments store](#comments-store) above), and the bundled `strix-review`
+skill (see [skill distribution](#skill-distribution)) teaches agents both the
+committed-range and the working-tree loop.
 
 Keeping the surface area narrow otherwise is the point: strix earns its place
-by doing "review a changeset and stage it," "browse history," and now
-"review a branch against its base, with inline comments" very well, not by
+by doing "review a changeset and stage it," "browse history," and "review a
+changeset — working tree or branch — with inline comments" very well, not by
 covering everything `git` does.
 
 ## Testing
 
 - **Render tests** build an `App`, call `dump_frame`, and assert on the text
   grid — fast, deterministic, no terminal required.
+- **Colour assertions** use shared `tests/common` helpers (`cell_fg`/`cell_bg`/
+  `row_has_fg`/`row_has_bg`) against the same `TestBackend` render path
+  `dump_frame` uses, for cases text alone can't cover — the cursor highlight,
+  a stale comment's dimmed accent, and split-view word emphasis.
 - **Git tests** create a temp repo (`git init` in a `tempfile::tempdir`),
   exercise the git layer, and assert on the results.
+- **Mouse tests** render a frame, then drive `on_mouse_at` with explicit
+  `Instant`s so double-click timing is asserted deterministically, without
+  sleeping.

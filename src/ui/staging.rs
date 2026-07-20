@@ -90,7 +90,8 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
                 if selection == app.selected {
                     selected_item = Some(index);
                 }
-                items.push(file_item(entry, section, theme));
+                let comments = app.status_comment_count(&entry.path);
+                items.push(file_item(entry, section, comments, theme));
             }
         }
     }
@@ -109,15 +110,29 @@ fn section_header(label: &str, count: usize, theme: &Theme) -> ListItem<'static>
     )))
 }
 
-fn file_item(entry: &FileEntry, section: Section, theme: &Theme) -> ListItem<'static> {
+fn file_item(
+    entry: &FileEntry,
+    section: Section,
+    comments: usize,
+    theme: &Theme,
+) -> ListItem<'static> {
     let color = marker_color(section, entry.change, theme);
-    ListItem::new(Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             format!("  {} ", entry.change.marker()),
             Style::new().fg(color).add_modifier(Modifier::BOLD),
         ),
         Span::styled(entry.display_path(), Style::new().fg(theme.fg)),
-    ]))
+    ];
+    // A `● n` badge on files carrying worktree comments (count is path-keyed, so a
+    // file in both the staged and unstaged sections shows its total on each row).
+    if comments > 0 {
+        spans.push(Span::styled(
+            format!("  ● {comments}"),
+            Style::new().fg(theme.comment),
+        ));
+    }
+    ListItem::new(Line::from(spans))
 }
 
 fn marker_color(section: Section, change: Change, theme: &Theme) -> Color {
