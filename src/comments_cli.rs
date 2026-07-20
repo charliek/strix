@@ -268,8 +268,8 @@ fn add_range(
         let id = store.take_id();
         let entry = store.branches.entry(branch.to_string()).or_default();
         // The session-open pass (`strix diff`) records a review range; do it
-        // defensively here too, mirroring `App::submit_comment_input` — an
-        // `--range` given explicitly with none stored yet becomes the active one.
+        // defensively here too, mirroring `App::save_comment` — an `--range` given
+        // explicitly with none stored yet becomes the active one.
         if entry.active_range.is_none() {
             entry.active_range = Some(target.clone());
         }

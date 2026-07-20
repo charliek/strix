@@ -7,7 +7,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use syntect::parsing::SyntaxReference;
 
-use crate::app::{sbs_columns, App, BoxPart, BoxRow, LayoutRow, RowContent};
+use crate::app::{sbs_columns, App, BoxPart, BoxRow, EditorPart, LayoutRow, RowContent};
 use crate::comments::Side;
 use crate::git::{DiffLine, FileDiff, LineKind};
 use crate::ui::syntax::syntax_for;
@@ -121,6 +121,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
                 screen_y,
                 &mut x_rects,
             ),
+            RowContent::Editor(part) => editor_row_line(row, part, theme, inner, left_w, right_w),
         };
         let in_cursor = cursor.as_ref().is_some_and(|span| span.contains(&i));
         out.push(mark_cursor_row(line, in_cursor, theme));
@@ -329,9 +330,22 @@ fn box_row_line(
         );
     }
 
+    frame_side_columns(box_spans, row.side, left_w, right_w, theme)
+}
+
+/// Wrap a box's own spans into its side-by-side column, padding the other column
+/// with a divider + equal-height blank; a full-width (`None`) box passes through.
+/// Shared by the comment-box and editor renderers.
+fn frame_side_columns(
+    box_spans: Vec<Span<'static>>,
+    side: Option<Side>,
+    left_w: usize,
+    right_w: usize,
+    theme: &Theme,
+) -> Line<'static> {
     let divider = || Span::styled("│", Style::new().fg(theme.border));
     let blank = |w: usize| Span::styled(" ".repeat(w), Style::new().bg(theme.bg));
-    let spans = match row.side {
+    let spans = match side {
         None => box_spans,
         Some(Side::Old) => {
             let mut spans = box_spans;
@@ -423,6 +437,130 @@ fn box_bottom_spans(box_w: usize, border: Style) -> Vec<Span<'static>> {
         Span::styled("─".repeat(box_w - 2), border),
         Span::styled("╯", border),
     ]
+}
+
+/// Render one physical row of the in-place editor box (plan §3.5). Mirrors
+/// `box_row_line`'s side-column placement, but the accent is the focus colour (an
+/// active input) and the body draws a reversed caret cell — no `[x]`, since the
+/// editor is dismissed with Esc/Enter, not a click.
+fn editor_row_line(
+    row: &LayoutRow,
+    part: &EditorPart,
+    theme: &Theme,
+    inner: Rect,
+    left_w: usize,
+    right_w: usize,
+) -> Line<'static> {
+    let box_w = match row.side {
+        None => inner.width as usize,
+        Some(Side::Old) => left_w,
+        Some(Side::New) => right_w,
+    };
+    let accent = theme.border_focused;
+    let border = Style::new().fg(accent);
+    let title_style = Style::new().fg(accent).add_modifier(Modifier::BOLD);
+    let body_style = Style::new().fg(theme.fg);
+    let caret_style = body_style.add_modifier(Modifier::REVERSED);
+
+    let box_spans = match part {
+        EditorPart::Title(text) => editor_title_spans(text, box_w, border, title_style),
+        EditorPart::Body { text, caret } => {
+            editor_body_spans(text, *caret, box_w, border, body_style, caret_style)
+        }
+        EditorPart::Bottom => box_bottom_spans(box_w, border),
+    };
+
+    frame_side_columns(box_spans, row.side, left_w, right_w, theme)
+}
+
+/// The editor box top border with its title: `╭─ ✎ you — <file> R<line> ────╮`,
+/// truncated to fit. Like `box_title_spans` but without the `[x]` close cell.
+fn editor_title_spans(
+    title: &str,
+    box_w: usize,
+    border: Style,
+    accent: Style,
+) -> Vec<Span<'static>> {
+    if box_w == 0 {
+        return Vec::new();
+    }
+    if box_w < 2 {
+        return vec![Span::styled("─".repeat(box_w), border)];
+    }
+    if box_w < 5 {
+        // Corners + fill; too narrow for a title.
+        return vec![
+            Span::styled("╭", border),
+            Span::styled("─".repeat(box_w - 2), border),
+            Span::styled("╮", border),
+        ];
+    }
+    // `╭─ ` (3) + title + ` ` (1) + fill + `╮` (1) totals box_w.
+    let (fit, w) = fit_display(title, box_w - 5);
+    let fill = box_w - 5 - w;
+    let mut spans = vec![Span::styled("╭─ ", border)];
+    if !fit.is_empty() {
+        spans.push(Span::styled(fit, accent));
+    }
+    spans.push(Span::styled(format!(" {}", "─".repeat(fill)), border));
+    spans.push(Span::styled("╮", border));
+    spans
+}
+
+/// An editor body row: `│ <text with caret> │`. `text` is already wrapped to the
+/// content width; the caret cell (at display column `caret`) is drawn reversed, and
+/// a caret past the text end reverses a trailing blank.
+fn editor_body_spans(
+    text: &str,
+    caret: Option<usize>,
+    box_w: usize,
+    border: Style,
+    body: Style,
+    caret_style: Style,
+) -> Vec<Span<'static>> {
+    if box_w == 0 {
+        return Vec::new();
+    }
+    // Below `│ x │` there is no room for content; degrade to a bare border column.
+    if box_w < 4 {
+        return vec![Span::styled("│".repeat(box_w), border)];
+    }
+    let content_w = box_w - 4;
+    let mut content: Vec<Span<'static>> = Vec::new();
+    let mut col = 0;
+    for ch in text.chars() {
+        let w = char_width(ch);
+        if col + w > content_w {
+            break;
+        }
+        let style = if caret == Some(col) {
+            caret_style
+        } else {
+            body
+        };
+        content.push(Span::styled(ch.to_string(), style));
+        col += w;
+    }
+    // The caret sits past the drawn text (empty line, or end of a short line): pad
+    // up to it, then a reversed blank so it's visible.
+    if let Some(cc) = caret {
+        if cc >= col && cc < content_w {
+            if cc > col {
+                content.push(Span::styled(" ".repeat(cc - col), body));
+                col = cc;
+            }
+            content.push(Span::styled(" ".to_string(), caret_style));
+            col += 1;
+        }
+    }
+    if col < content_w {
+        content.push(Span::styled(" ".repeat(content_w - col), body));
+    }
+    let mut spans = vec![Span::styled("│", border), Span::styled(" ", body)];
+    spans.extend(content);
+    spans.push(Span::styled(" ", body));
+    spans.push(Span::styled("│", border));
+    spans
 }
 
 /// Fit `s` into `max` display columns (unicode-width aware), returning the

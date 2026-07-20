@@ -172,6 +172,20 @@ pub enum RowContent {
     },
     /// One physical row of a comment box.
     Box(BoxRow),
+    /// One physical row of the in-place comment editor (plan §3.5).
+    Editor(EditorPart),
+}
+
+/// Which physical part of the in-place editor box a row draws. The editor mirrors
+/// a saved comment box (title / body / bottom) but is editable and caret-bearing.
+pub enum EditorPart {
+    /// The top border, carrying the editor title (`✎ you — <file> R<line>`).
+    Title(String),
+    /// A wrapped body display row; `caret` is the caret's display column within
+    /// the content area when the caret falls on this row.
+    Body { text: String, caret: Option<usize> },
+    /// The bottom border.
+    Bottom,
 }
 
 /// The render payload for one physical row of a comment box: the comment id (for
@@ -227,6 +241,20 @@ enum BoxPlacement {
     Sbs { left_w: usize, right_w: usize },
 }
 
+impl BoxPlacement {
+    /// The row `side` (a side-by-side column, or `None` for full-width) and box
+    /// width for a box anchored on `side`.
+    fn column_for(self, side: Side) -> (Option<Side>, usize) {
+        match self {
+            BoxPlacement::Unified(w) => (None, w),
+            BoxPlacement::Sbs { left_w, right_w } => match side {
+                Side::Old => (Some(Side::Old), left_w),
+                Side::New => (Some(Side::New), right_w),
+            },
+        }
+    }
+}
+
 /// A side-by-side code row before comment boxes are interleaved: a hunk header or
 /// a paired line (either side may be blank).
 enum SbsCode {
@@ -250,14 +278,191 @@ pub enum RowTarget {
     Code(usize),
     Comment(u64),
     Orphan(u64),
+    /// The in-place editor box (plan §3.5). Only ever one at a time; keys route to
+    /// it before the keymap, so the file cursor never navigates onto it.
+    Editor,
 }
 
-/// The in-place comment editor's state. A placeholder for now — the editor is
-/// still the centered `Modal::CommentInput`; a later commit moves editing into
-/// [`DiffPaneState::editing`] and fills this in. Never constructed in C1.
-#[derive(Debug)]
-#[allow(dead_code)]
-struct CommentEdit;
+/// The in-place comment editor's state (plan §3.5): a multi-line buffer plus the
+/// caret, and the authoring identity captured *at open* so a checkout / watcher
+/// reload mid-edit can't cross-save. The editor renders as a box at the anchor,
+/// its position recomputed from `anchor` each layout build (never a captured row
+/// index), and Enter persists exactly these fields.
+///
+/// The caret is `(line, col_char)` over the buffer's **hard lines** (`\n`
+/// separated); `preferred_col` is the display column up/down try to keep. Wrapping
+/// is display-only, so the caret never addresses a wrapped sub-row.
+#[derive(Clone, Debug)]
+struct CommentEdit {
+    /// The note text, hard lines separated by `\n`.
+    buffer: String,
+    /// The comment's text captured at open (empty for a new comment). The save's
+    /// no-op check compares `buffer` against *this*, not the current live comment —
+    /// so an untouched editor writes nothing even if a concurrent writer changed the
+    /// note underneath, never clobbering that change (plan §3.5).
+    original_text: String,
+    /// Caret as `(hard-line index, char index within that line)`.
+    cursor: (usize, usize),
+    /// The display column up/down aim to preserve; recomputed on any horizontal
+    /// move or edit, retained across a run of up/down (plan §3.5).
+    preferred_col: usize,
+    /// The anchor captured at open — the box is placed by re-resolving this each
+    /// frame, and a new comment persists it verbatim.
+    anchor: CommentAnchor,
+    /// How a *new* comment is scoped, captured at open.
+    scope: Scope,
+    /// The inbox key the save lands under, captured at open (checkout can't move it).
+    branch_key: String,
+    /// `Some(id)` when editing an existing human note (updates text only), `None`
+    /// for a new comment.
+    editing_id: Option<u64>,
+    /// The baseline HEAD stamped on a *new* worktree comment, captured at open.
+    base: Option<String>,
+}
+
+/// One editing operation on the [`CommentEdit`] buffer, so a single method covers
+/// every editor key. All movement/edit indices are char-based; byte offsets are
+/// derived only at the mutation site so multibyte text is never split.
+enum EditOp {
+    Insert(char),
+    Newline,
+    Backspace,
+    Delete,
+    Left,
+    Right,
+    Up,
+    Down,
+    Home,
+    End,
+}
+
+impl CommentEdit {
+    /// A fresh editor for a new comment on `anchor`, caret at the empty start.
+    fn new_comment(anchor: CommentAnchor, plan: SubmitPlan) -> Self {
+        CommentEdit {
+            buffer: String::new(),
+            original_text: String::new(),
+            cursor: (0, 0),
+            preferred_col: 0,
+            anchor,
+            scope: plan.scope,
+            branch_key: plan.branch,
+            editing_id: None,
+            base: plan.base,
+        }
+    }
+
+    /// An editor pre-filled to edit human note `id`, caret at the buffer end.
+    fn edit(text: String, anchor: CommentAnchor, id: u64, plan: SubmitPlan) -> Self {
+        let last = line_count(&text).saturating_sub(1);
+        let col = char_count(line_str(&text, last));
+        let preferred_col = display_col(line_str(&text, last), col);
+        CommentEdit {
+            original_text: text.clone(),
+            buffer: text,
+            cursor: (last, col),
+            preferred_col,
+            anchor,
+            scope: plan.scope,
+            branch_key: plan.branch,
+            editing_id: Some(id),
+            base: plan.base,
+        }
+    }
+
+    /// Apply one editing operation to the buffer + caret. Pure (no width): wrapping
+    /// is a render concern, so up/down navigate hard lines by the preferred display
+    /// column only.
+    fn apply(&mut self, op: EditOp) {
+        let (l, c) = self.cursor;
+        match op {
+            EditOp::Insert(ch) => {
+                let at = byte_of(&self.buffer, l, c);
+                self.buffer.insert(at, ch);
+                self.cursor = (l, c + 1);
+                self.recompute_preferred();
+            }
+            EditOp::Newline => {
+                let at = byte_of(&self.buffer, l, c);
+                self.buffer.insert(at, '\n');
+                self.cursor = (l + 1, 0);
+                self.recompute_preferred();
+            }
+            EditOp::Backspace => {
+                if c > 0 {
+                    let start = byte_of(&self.buffer, l, c - 1);
+                    let end = byte_of(&self.buffer, l, c);
+                    self.buffer.replace_range(start..end, "");
+                    self.cursor = (l, c - 1);
+                } else if l > 0 {
+                    let prev_len = char_count(line_str(&self.buffer, l - 1));
+                    let ls = line_start_byte(&self.buffer, l);
+                    self.buffer.replace_range(ls - 1..ls, ""); // drop the joining '\n'
+                    self.cursor = (l - 1, prev_len);
+                }
+                self.recompute_preferred();
+            }
+            EditOp::Delete => {
+                let len = char_count(line_str(&self.buffer, l));
+                if c < len {
+                    let start = byte_of(&self.buffer, l, c);
+                    let end = byte_of(&self.buffer, l, c + 1);
+                    self.buffer.replace_range(start..end, "");
+                } else if l + 1 < line_count(&self.buffer) {
+                    let nl = line_start_byte(&self.buffer, l) + line_str(&self.buffer, l).len();
+                    self.buffer.replace_range(nl..nl + 1, ""); // drop the next '\n'
+                }
+                self.recompute_preferred();
+            }
+            EditOp::Left => {
+                if c > 0 {
+                    self.cursor = (l, c - 1);
+                } else if l > 0 {
+                    self.cursor = (l - 1, char_count(line_str(&self.buffer, l - 1)));
+                }
+                self.recompute_preferred();
+            }
+            EditOp::Right => {
+                let len = char_count(line_str(&self.buffer, l));
+                if c < len {
+                    self.cursor = (l, c + 1);
+                } else if l + 1 < line_count(&self.buffer) {
+                    self.cursor = (l + 1, 0);
+                }
+                self.recompute_preferred();
+            }
+            EditOp::Home => {
+                self.cursor = (l, 0);
+                self.recompute_preferred();
+            }
+            EditOp::End => {
+                self.cursor = (l, char_count(line_str(&self.buffer, l)));
+                self.recompute_preferred();
+            }
+            // Up/Down move between hard lines, landing at the char nearest the
+            // retained preferred display column (not recomputed here).
+            EditOp::Up => {
+                if l > 0 {
+                    let col = col_at_display(line_str(&self.buffer, l - 1), self.preferred_col);
+                    self.cursor = (l - 1, col);
+                }
+            }
+            EditOp::Down => {
+                if l + 1 < line_count(&self.buffer) {
+                    let col = col_at_display(line_str(&self.buffer, l + 1), self.preferred_col);
+                    self.cursor = (l + 1, col);
+                }
+            }
+        }
+    }
+
+    /// Reset the preferred display column to the caret's current display offset
+    /// within its hard line (unwrapped), after any non-vertical caret change.
+    fn recompute_preferred(&mut self) {
+        let (l, c) = self.cursor;
+        self.preferred_col = display_col(line_str(&self.buffer, l), c);
+    }
+}
 
 /// A diff pane's cursor + editor state, owned by each view that has a cursor.
 /// The cursor names a [`RowTarget`] (logical), not a physical row: `None` is the
@@ -268,10 +473,9 @@ struct CommentEdit;
 #[derive(Debug, Default)]
 struct DiffPaneState {
     cursor: Option<RowTarget>,
-    /// The in-place editor slot, filled in when it lands; always `None` in C1
-    /// (the editor is still `Modal::CommentInput`). Kept here so the later
-    /// commit doesn't reshape this struct.
-    #[allow(dead_code)]
+    /// The in-place editor slot: `Some` while a comment is being authored/edited
+    /// in this pane (plan §3.5). Keys route here before the keymap; the layout
+    /// expands to show the editor box, recomputed from the edit's anchor.
     editing: Option<CommentEdit>,
     /// The `[x]` close-cell rect of each visible comment box, recorded during
     /// render (mirrors `App::divider_x`). Keyed by comment id. C8 hit-tests a
@@ -279,10 +483,10 @@ struct DiffPaneState {
     x_rects: RefCell<HashMap<u64, Rect>>,
 }
 
-/// A comment's anchor, captured *by value* when the input modal opens so a
-/// watcher reload that rebuilds the diff mid-typing can't dangle it. Submit
-/// persists exactly these fields; if the diff moved underneath, the comment
-/// simply re-anchors (or orphans) honestly on the next pass (plan §3.4).
+/// A comment's anchor, captured *by value* when the in-place editor opens so a
+/// watcher reload that rebuilds the diff mid-typing can't dangle it. Save persists
+/// exactly these fields; if the diff moved underneath, the comment simply
+/// re-anchors (or orphans) honestly on the next pass (plan §3.4).
 #[derive(Clone, Debug)]
 pub struct CommentAnchor {
     pub file: String,
@@ -302,26 +506,6 @@ pub enum Modal {
     },
     /// The keybinding help overlay.
     Help,
-    /// The single-line review-comment editor (add or edit). `cursor` is a char
-    /// index into `buffer`; `anchor` is captured by value at open; `editing` is
-    /// `Some(id)` when editing an existing human comment, `None` for a new one.
-    ///
-    /// `branch`/`scope`/`base` are the **authoring identity captured at open**: a
-    /// watcher `reload()` (which modals gate input but not) plus an external
-    /// checkout can move the current branch/HEAD while the editor is open, so the
-    /// submit persists to the inbox the comment was authored against — never the
-    /// current one (plan §3.5, landed early here to close the cross-branch leak).
-    /// `scope`/`base` scope a *new* comment; an edit reuses `branch` and updates
-    /// text only.
-    CommentInput {
-        buffer: String,
-        cursor: usize,
-        anchor: CommentAnchor,
-        editing: Option<u64>,
-        branch: String,
-        scope: Scope,
-        base: Option<String>,
-    },
 }
 
 /// Review-session state: the resolved range, its changed-file list, and the
@@ -728,6 +912,10 @@ impl App {
 
         if self.modal.is_some() {
             self.on_key_modal(key);
+        } else if self.editing() {
+            // The in-place editor captures every key *before* the keymap (plan
+            // §3.5): a typed `c`/`x`/`]` inserts rather than triggering its action.
+            self.on_key_editor(key);
         } else if key.code == KeyCode::Esc {
             // Esc leaves the history view; it is not in the keymap (so the modal's
             // own Esc handling stays first). A no-op in the status and review
@@ -1297,7 +1485,7 @@ impl App {
     fn cursor_comment_id(&self) -> Option<u64> {
         match self.review_cursor_target()? {
             RowTarget::Comment(id) | RowTarget::Orphan(id) => Some(id),
-            RowTarget::Code(_) => None,
+            RowTarget::Code(_) | RowTarget::Editor => None,
         }
     }
 
@@ -1480,11 +1668,11 @@ impl App {
         }
     }
 
-    /// Handle `c` in the review view (diff focus): open the input modal to add a
-    /// comment on the code row under the cursor, or to edit the human comment
+    /// Handle `c` in the review view (diff focus): open the in-place editor to add
+    /// a comment on the code row under the cursor, or to edit the human comment
     /// under it. Gates per plan §3.4: a non-authoring session, the file list, a
     /// hunk row, and an agent note each Info-flash instead of opening; an
-    /// offscreen cursor only reveals (act-and-reveal), no modal.
+    /// offscreen cursor only reveals (act-and-reveal), no editor.
     fn review_comment_action(&mut self) {
         let Some(review) = self.review.as_ref() else {
             return;
@@ -1502,19 +1690,19 @@ impl App {
         if !self.reveal_cursor_before_acting() {
             return;
         }
-        self.open_comment_input_at_cursor();
+        self.open_editor_at_cursor();
     }
 
-    /// Open the comment-input modal for the row under the (already-revealed) diff
+    /// Open the in-place editor for the row under the (already-revealed) diff
     /// cursor: edit the human note under it, refuse an agent note, or anchor a new
     /// comment on a code row (a hunk header or unanchorable row flashes). Shared by
     /// the status and review comment actions once their per-view gates have run;
     /// `active_comment`/`cursor_code_anchor` resolve against whichever view is
-    /// active, so `submit_comment_input` scopes the note correctly.
-    fn open_comment_input_at_cursor(&mut self) {
+    /// active, so `save_comment` scopes the note correctly.
+    fn open_editor_at_cursor(&mut self) {
         // Capture the authoring identity *now*, at open: a watcher `reload()` plus
         // an external checkout can move the current branch/HEAD while the editor is
-        // open, and the submit must land where the note was authored. `None` means
+        // open, and the save must land where the note was authored. `None` means
         // the active view can't author (a non-authoring review / History) — no open.
         let Some(identity) = self.authoring_identity() else {
             return;
@@ -1523,21 +1711,18 @@ impl App {
         if let Some(id) = self.cursor_comment_id() {
             match self.active_comment(id) {
                 Some(comment) if comment.source == Source::Human => {
-                    let cursor = comment.text.chars().count();
-                    self.modal = Some(Modal::CommentInput {
-                        buffer: comment.text.clone(),
-                        cursor,
-                        anchor: CommentAnchor {
-                            file: comment.file.clone(),
-                            side: comment.side,
-                            line: comment.line,
-                            context: comment.context.clone(),
-                        },
-                        editing: Some(id),
-                        branch: identity.branch,
-                        scope: identity.scope,
-                        base: identity.base,
-                    });
+                    let anchor = CommentAnchor {
+                        file: comment.file.clone(),
+                        side: comment.side,
+                        line: comment.line,
+                        context: comment.context.clone(),
+                    };
+                    self.set_editor(CommentEdit::edit(
+                        comment.text.clone(),
+                        anchor,
+                        id,
+                        identity,
+                    ));
                 }
                 Some(_) => self.flash = Some(Flash::info("agent note — read-only")),
                 // Vanished between the row build and now (a concurrent rm): no-op.
@@ -1548,19 +1733,21 @@ impl App {
         // A code row: anchor a new comment, unless it's a hunk header (or a
         // binary/submodule file with no text anchor).
         match self.cursor_code_anchor() {
-            Some(anchor) => {
-                self.modal = Some(Modal::CommentInput {
-                    buffer: String::new(),
-                    cursor: 0,
-                    anchor,
-                    editing: None,
-                    branch: identity.branch,
-                    scope: identity.scope,
-                    base: identity.base,
-                });
-            }
+            Some(anchor) => self.set_editor(CommentEdit::new_comment(anchor, identity)),
             None => self.flash = Some(Flash::info("can't comment here")),
         }
+    }
+
+    /// Install `edit` as the active pane's in-place editor, drop the cached row
+    /// layout so it re-expands with the editor box, and reveal the caret. A no-op
+    /// in a cursor-less view (History), where `authoring_identity` already
+    /// returned `None` and this is never reached.
+    fn set_editor(&mut self, edit: CommentEdit) {
+        if let Some(pane) = self.active_pane_mut() {
+            pane.editing = Some(edit);
+        }
+        self.invalidate_comment_rows();
+        self.editor_reveal();
     }
 
     /// The authoring identity for a *new or edited* comment in the active view,
@@ -1590,12 +1777,12 @@ impl App {
         }
     }
 
-    /// Handle `c` in the status view (diff focus): open the input modal to add a
-    /// worktree comment on the net-diff code row under the cursor, or to edit the
+    /// Handle `c` in the status view (diff focus): open the in-place editor to add
+    /// a worktree comment on the net-diff code row under the cursor, or to edit the
     /// human comment under it. Mirrors `review_comment_action`: the file list, an
     /// offscreen cursor (reveal only), a conflicted/binary file, a hunk row, and an
     /// agent note each flash instead of opening. A worktree comment stamps its
-    /// scope + baseline HEAD at submit time (`submit_comment_input`).
+    /// scope + baseline HEAD (captured at open by `authoring_identity`).
     fn status_comment_action(&mut self) {
         if self.focus != Focus::Diff {
             self.flash = Some(Flash::info("focus the diff to comment"));
@@ -1615,7 +1802,7 @@ impl App {
                 return;
             }
         }
-        self.open_comment_input_at_cursor();
+        self.open_editor_at_cursor();
     }
 
     /// The anchor for a new comment on the code row under the cursor, or `None`
@@ -1640,171 +1827,344 @@ impl App {
         lines.get(li).and_then(|line| anchor_for_line(line, file))
     }
 
-    /// Route a key to the comment input modal. Handles the editing branch of
-    /// [`on_key_modal`], run before the y/n confirm match. Plain characters
-    /// insert (char-boundary safe); Backspace/Delete/arrows/Home/End edit;
-    /// Enter submits; Esc cancels. Ctrl/Alt-modified keys are ignored (Ctrl-C is
-    /// already handled upstream, before modal routing).
-    fn on_key_comment_input(&mut self, key: KeyEvent) {
-        let modified = key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
-        match key.code {
-            KeyCode::Esc => self.modal = None,
-            KeyCode::Enter => self.submit_comment_input(),
-            KeyCode::Backspace if !modified => self.comment_input_edit(InputEdit::Backspace),
-            KeyCode::Delete if !modified => self.comment_input_edit(InputEdit::Delete),
-            KeyCode::Left if !modified => self.comment_input_edit(InputEdit::Left),
-            KeyCode::Right if !modified => self.comment_input_edit(InputEdit::Right),
-            KeyCode::Home if !modified => self.comment_input_edit(InputEdit::Home),
-            KeyCode::End if !modified => self.comment_input_edit(InputEdit::End),
-            KeyCode::Char(ch) if !modified => self.comment_input_edit(InputEdit::Insert(ch)),
-            _ => {}
-        }
+    /// The active pane's in-place editor, if open — the single read accessor every
+    /// editor query goes through.
+    fn editor(&self) -> Option<&CommentEdit> {
+        self.active_pane().and_then(|pane| pane.editing.as_ref())
     }
 
-    /// Apply one editing operation to the open comment-input buffer. All indices
-    /// are char indices, converted to byte offsets only at the mutation site so
-    /// multibyte text (CJK, emoji, combining marks) is never split.
-    fn comment_input_edit(&mut self, edit: InputEdit) {
-        let Some(Modal::CommentInput { buffer, cursor, .. }) = self.modal.as_mut() else {
-            return;
-        };
-        let len = buffer.chars().count();
-        match edit {
-            InputEdit::Insert(ch) => {
-                let at = char_byte_index(buffer, *cursor);
-                buffer.insert(at, ch);
-                *cursor += 1;
-            }
-            InputEdit::Backspace => {
-                if *cursor > 0 {
-                    let start = char_byte_index(buffer, *cursor - 1);
-                    let end = char_byte_index(buffer, *cursor);
-                    buffer.replace_range(start..end, "");
-                    *cursor -= 1;
-                }
-            }
-            InputEdit::Delete => {
-                if *cursor < len {
-                    let start = char_byte_index(buffer, *cursor);
-                    let end = char_byte_index(buffer, *cursor + 1);
-                    buffer.replace_range(start..end, "");
-                }
-            }
-            InputEdit::Left => *cursor = cursor.saturating_sub(1),
-            InputEdit::Right => *cursor = (*cursor + 1).min(len),
-            InputEdit::Home => *cursor = 0,
-            InputEdit::End => *cursor = len,
-        }
+    /// Whether the active pane has the in-place editor open. Keys route to the
+    /// editor while this holds (before the keymap), so a mode/history/file-change
+    /// key inserts as text instead of firing — the block-while-editing pin (§3.5).
+    fn editing(&self) -> bool {
+        self.editor().is_some()
     }
 
-    /// Submit the comment input (Enter). Transactional per plan §3.1.5: a
-    /// whitespace-only buffer cancels with no write; otherwise mutate a fresh
-    /// store read (new → push; edit → update text only, or flash "comment was
-    /// removed" if it vanished), persist, and only on success replace the
-    /// in-memory set + invalidate row caches + close the modal. A write failure
-    /// flashes and leaves the modal (buffer intact) so the user can retry or Esc.
-    fn submit_comment_input(&mut self) {
-        let Some(Modal::CommentInput {
-            buffer,
-            anchor,
-            editing,
-            branch,
-            scope,
-            base,
-            ..
-        }) = self.modal.as_ref()
+    /// Mutate the open editor, then drop the cached layout so the box re-expands and
+    /// the caret row is recomputed on next build. A no-op (no invalidation) when the
+    /// editor is closed — the single write path both `editor_edit` and the paste seam
+    /// funnel through.
+    fn with_editor(&mut self, f: impl FnOnce(&mut CommentEdit)) {
+        let Some(edit) = self
+            .active_pane_mut()
+            .and_then(|pane| pane.editing.as_mut())
         else {
             return;
         };
-        // Empty / whitespace-only submit is a cancel — no store write.
-        if buffer.trim().is_empty() {
-            self.modal = None;
+        f(edit);
+        self.invalidate_comment_rows();
+    }
+
+    /// Route a key to the in-place editor (plan §3.5), run before the keymap when
+    /// `editing()`. Enter saves; Esc discards; a newline is Shift+Enter, Alt+Enter,
+    /// or Ctrl-J; plain chars insert (including `c`/`x`/`]`); other Ctrl/Alt chords
+    /// are ignored. Ctrl-C is already handled upstream (hard-quit, before routing).
+    fn on_key_editor(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        match key.code {
+            // Newline chords: Shift+Enter is unreliable on terminals without
+            // keyboard-enhancement, so Alt+Enter and Ctrl-J are equal fallbacks.
+            KeyCode::Enter if shift || alt => self.editor_edit(EditOp::Newline),
+            KeyCode::Char('j') if ctrl => self.editor_edit(EditOp::Newline),
+            KeyCode::Enter => self.save_edit(),
+            KeyCode::Esc => self.discard_edit(),
+            KeyCode::Backspace if !ctrl && !alt => self.editor_edit(EditOp::Backspace),
+            KeyCode::Delete if !ctrl && !alt => self.editor_edit(EditOp::Delete),
+            KeyCode::Left if !ctrl && !alt => self.editor_edit(EditOp::Left),
+            KeyCode::Right if !ctrl && !alt => self.editor_edit(EditOp::Right),
+            KeyCode::Up if !ctrl && !alt => self.editor_edit(EditOp::Up),
+            KeyCode::Down if !ctrl && !alt => self.editor_edit(EditOp::Down),
+            KeyCode::Home if !ctrl && !alt => self.editor_edit(EditOp::Home),
+            KeyCode::End if !ctrl && !alt => self.editor_edit(EditOp::End),
+            KeyCode::Char(ch) if !ctrl && !alt => self.editor_edit(EditOp::Insert(ch)),
+            _ => {} // other Ctrl/Alt-modified keys are ignored
+        }
+        // The box may have grown/shrunk or the caret moved; keep it in view.
+        self.editor_reveal();
+    }
+
+    /// Apply one editor operation to the active pane's buffer.
+    fn editor_edit(&mut self, op: EditOp) {
+        self.with_editor(|edit| edit.apply(op));
+    }
+
+    /// Insert `text` (which may carry newlines) at the caret — the bracketed-paste
+    /// seam. The event loop's `Event::Paste` handler calls this, and tests call it
+    /// directly (dump-frame/press tests can't emit a real paste). A no-op when the
+    /// editor is closed, so a stray paste never leaks into the diff.
+    pub fn on_paste(&mut self, text: &str) {
+        if !self.editing() {
             return;
         }
-        let text = buffer.clone();
-        let anchor = anchor.clone();
-        let editing = *editing;
-        // Persist to the identity captured when the editor opened, *not* the current
-        // branch/HEAD: a checkout + watcher reload mid-typing must land the note in
-        // the inbox it was authored against (plan §3.5). The status view records a
-        // `WorkTree` comment stamped with the baseline HEAD; a review records a
-        // `Range` comment under its exact range.
-        let plan = SubmitPlan {
-            branch: branch.clone(),
-            scope: scope.clone(),
-            base: base.clone(),
-        };
-        let dir = self.repo.strix_dir();
+        self.flash = None;
+        self.editor_insert_str(text);
+        self.editor_reveal();
+    }
 
-        let result = comments::mutate(&dir, |store| {
-            match editing {
-                None => {
-                    // `take_id` scans every branch, so mint before borrowing the
-                    // entry (which would conflict with the scan's shared borrow).
-                    let id = store.take_id();
-                    let created_at = comments::now_secs();
-                    let entry = store.branches.entry(plan.branch.clone()).or_default();
-                    // The session-open pass records a review range; do it
-                    // defensively here too (a worktree plan carries no range).
-                    if let Scope::Range { range } = &plan.scope {
-                        record_range(entry, range);
-                    }
-                    entry.comments.push(Comment {
-                        scope: plan.scope.clone(),
-                        id,
-                        source: Source::Human,
-                        file: anchor.file.clone(),
-                        side: anchor.side,
-                        line: anchor.line,
-                        text: text.clone(),
-                        context: anchor.context.clone(),
-                        orphaned: false,
-                        created_at,
-                        base: plan.base.clone(),
-                        stale: false,
-                    });
-                    SubmitOutcome::Added(entry.comments.clone())
-                }
-                Some(id) => {
-                    let entry = store.branches.entry(plan.branch.clone()).or_default();
-                    if let Scope::Range { range } = &plan.scope {
-                        record_range(entry, range);
-                    }
-                    match entry.comments.iter_mut().find(|c| c.id == id) {
-                        Some(comment) => {
-                            comment.text = text.clone();
-                            SubmitOutcome::Updated(entry.comments.clone())
-                        }
-                        None => SubmitOutcome::Vanished(entry.comments.clone()),
-                    }
+    /// Insert a (possibly multi-line) string, normalising `\r\n`/`\r` to editor
+    /// newlines so pasted line breaks become real lines rather than dropped
+    /// control chars.
+    fn editor_insert_str(&mut self, text: &str) {
+        self.with_editor(|edit| {
+            for ch in text.replace("\r\n", "\n").replace('\r', "\n").chars() {
+                if ch == '\n' {
+                    edit.apply(EditOp::Newline);
+                } else {
+                    edit.apply(EditOp::Insert(ch));
                 }
             }
         });
-        match result {
+    }
+
+    /// Scroll the diff so the editor caret row stays visible, rerun after each
+    /// keystroke (the box grows as text is typed). A box taller than the viewport
+    /// can't be shown whole, so this reveals the *caret* row rather than the whole
+    /// box — which never loops (plan §3.5).
+    fn editor_reveal(&mut self) {
+        let Some(caret) = self.editor_caret_physical_row() else {
+            return;
+        };
+        let viewport = self.diff_viewport.get() as usize;
+        if viewport == 0 {
+            return;
+        }
+        let count = self.review_row_count();
+        let top = self.diff_scroll.min(self.diff_max_scroll());
+        let new_top = if caret < top {
+            caret
+        } else if caret >= top + viewport {
+            caret - viewport + 1
+        } else {
+            top
+        };
+        let max_top = count.saturating_sub(viewport);
+        self.diff_scroll = new_top.min(max_top);
+    }
+
+    /// The physical layout row the editor caret sits on — the editor body row whose
+    /// caret column is set. `None` when the editor is closed.
+    fn editor_caret_physical_row(&self) -> Option<usize> {
+        if !self.editing() {
+            return None;
+        }
+        self.diff_layout(self.diff_pane_width())
+            .iter()
+            .position(|row| {
+                matches!(
+                    &row.content,
+                    RowContent::Editor(EditorPart::Body { caret: Some(_), .. })
+                )
+            })
+    }
+
+    /// Save the editor (Enter). Empty/whitespace → cancel (no write, an edit keeps
+    /// its original text); a no-op edit (text unchanged) → no write; otherwise
+    /// persist via `save_comment` and, only on success, replace the in-memory set +
+    /// close the editor. A failed write keeps the editor open with its buffer intact
+    /// and flashes (plan §3.5).
+    fn save_edit(&mut self) {
+        let Some(edit) = self.editor() else {
+            return;
+        };
+        let text = edit.buffer.clone();
+        let original_text = edit.original_text.clone();
+        let editing_id = edit.editing_id;
+        let scope = edit.scope.clone();
+        let branch = edit.branch_key.clone();
+        let anchor = edit.anchor.clone();
+        let base = edit.base.clone();
+        // Empty / whitespace-only save is a cancel — no store write (deletion is
+        // the separate `X` action, never an empty save).
+        if text.trim().is_empty() {
+            self.close_editor();
+            return;
+        }
+        // A no-op edit writes nothing. Compare against the text captured *at open*,
+        // never the current live comment: an untouched editor must not overwrite a
+        // value a concurrent writer changed underneath (codex fix #1). A local edit
+        // is still elided fresh-side in `save_comment` when the stored text already
+        // matches the buffer.
+        if editing_id.is_some() && text == original_text {
+            self.close_editor();
+            return;
+        }
+        match self.save_comment(&scope, &branch, &anchor, &text, editing_id, &base) {
             Ok(outcome) => {
-                let (set, flash) = match outcome {
-                    SubmitOutcome::Added(set) => (set, Flash::info("comment added")),
-                    SubmitOutcome::Updated(set) => (set, Flash::info("comment updated")),
-                    SubmitOutcome::Vanished(set) => (set, Flash::info("comment was removed")),
+                let (id, set, flash) = match outcome {
+                    SubmitOutcome::Added { id, set } => {
+                        (Some(id), set, Flash::info("comment added"))
+                    }
+                    SubmitOutcome::Updated { id, set } => {
+                        (Some(id), set, Flash::info("comment updated"))
+                    }
+                    SubmitOutcome::Vanished { set } => {
+                        (None, set, Flash::info("comment was removed"))
+                    }
                 };
-                self.apply_active_comments(set);
-                self.invalidate_comment_rows();
-                // A `Vanished` submit (the edited comment was removed underneath)
-                // shrinks the row list; re-pin the cursor so it can't linger on
-                // the deleted target (matches the delete path above).
-                self.clamp_review_cursor();
-                self.modal = None;
+                // Install the persisted set into the view *only* when the current
+                // inbox is still the branch the editor authored against. A checkout +
+                // reload mid-edit swings the active inbox; the note still lands under
+                // its captured branch, but the now-active view keeps its own set —
+                // it already reloaded — rather than showing the old branch's comments
+                // (codex fix #3).
+                let same_branch = self.active_branch_key().as_deref() == Some(branch.as_str());
+                if same_branch {
+                    self.apply_active_comments(set);
+                }
+                self.close_editor();
+                if same_branch {
+                    // Land the cursor on the saved note's box (whatever it renders as).
+                    if let Some(id) = id {
+                        let target = self
+                            .comment_row_index(id)
+                            .and_then(|row| self.review_target_at(row));
+                        self.set_review_cursor(target);
+                    }
+                }
                 self.flash = Some(flash);
             }
             Err(err) => {
                 tracing::warn!("saving comment failed: {err:#}");
-                // The modal stays open with the buffer intact so the user can
-                // retry or Esc (plan §3.1.5).
+                // The editor stays open with its buffer intact so the user can
+                // retry or Esc (plan §3.5).
                 self.flash = Some(Flash::error(format!("comments: {err}")));
             }
         }
+    }
+
+    /// The inbox key the active view currently reads (its own comment set lives
+    /// under it); `None` in History. Gates whether a save's returned set is applied
+    /// to the view — after a checkout mid-edit the active inbox differs from the
+    /// branch the editor authored against (codex fix #3).
+    fn active_branch_key(&self) -> Option<String> {
+        match self.view {
+            ViewMode::Status => Some(self.status_branch_key.clone()),
+            ViewMode::Review => self.review.as_ref().map(|r| r.branch_key.clone()),
+            ViewMode::History => None,
+        }
+    }
+
+    /// Discard the editor (Esc): revert an edit / cancel a new comment, no write.
+    fn discard_edit(&mut self) {
+        self.close_editor();
+    }
+
+    /// Close the editor: drop the edit slot, invalidate the row cache (its box is
+    /// gone, or a saved box takes its place), and clamp the cursor to the new list.
+    fn close_editor(&mut self) {
+        if let Some(pane) = self.active_pane_mut() {
+            pane.editing = None;
+        }
+        self.invalidate_comment_rows();
+        self.clamp_review_cursor();
+    }
+
+    /// Persist a comment creation/edit transactionally (plan §3.5), factored out so
+    /// the editor's save path is the single writer. The add and edit paths are
+    /// deliberately **separate transactions** (codex fix #2):
+    ///
+    /// - **New comment** — the only path that may create the branch entry
+    ///   (`or_default`) or record its `active_range`; fresh-read `mutate`, push with
+    ///   the captured anchor/scope/base.
+    /// - **Edit** — touches *only* the existing fresh record's `text`, run through
+    ///   `mutate_if_changed`: it never `or_default`s (an edit can't resurrect a
+    ///   removed branch) and never `record_range`s (no stale metadata restore). The
+    ///   write is elided (nothing persisted) when the branch entry is gone, the
+    ///   comment id vanished (→ `Vanished`), or the stored text already equals the
+    ///   buffer — so a concurrent value is never clobbered by a no-op edit.
+    fn save_comment(
+        &self,
+        scope: &Scope,
+        branch: &str,
+        anchor: &CommentAnchor,
+        text: &str,
+        editing_id: Option<u64>,
+        base: &Option<String>,
+    ) -> anyhow::Result<SubmitOutcome> {
+        let dir = self.repo.strix_dir();
+        match editing_id {
+            None => comments::mutate(&dir, |store| {
+                // `take_id` scans every branch, so mint before borrowing the entry
+                // (which would conflict with the scan's shared borrow).
+                let id = store.take_id();
+                let created_at = comments::now_secs();
+                let entry = store.branches.entry(branch.to_string()).or_default();
+                // The session-open pass records a review range; do it defensively
+                // here too (a worktree plan carries no range).
+                if let Scope::Range { range } = scope {
+                    record_range(entry, range);
+                }
+                entry.comments.push(Comment {
+                    scope: scope.clone(),
+                    id,
+                    source: Source::Human,
+                    file: anchor.file.clone(),
+                    side: anchor.side,
+                    line: anchor.line,
+                    text: text.to_string(),
+                    context: anchor.context.clone(),
+                    orphaned: false,
+                    created_at,
+                    base: base.clone(),
+                    stale: false,
+                });
+                SubmitOutcome::Added {
+                    id,
+                    set: entry.comments.clone(),
+                }
+            }),
+            Some(id) => comments::mutate_if_changed(&dir, |store| {
+                // No `or_default`: a removed branch entry stays removed (the edit
+                // vanishes rather than resurrecting it with stale metadata).
+                let Some(entry) = store.branches.get_mut(branch) else {
+                    return (SubmitOutcome::Vanished { set: Vec::new() }, false);
+                };
+                match entry.comments.iter().position(|c| c.id == id) {
+                    None => (
+                        SubmitOutcome::Vanished {
+                            set: entry.comments.clone(),
+                        },
+                        false,
+                    ),
+                    // Fresh text already matches the buffer: no write (protects a
+                    // concurrent change from a stale-buffer clobber).
+                    Some(pos) if entry.comments[pos].text == text => (
+                        SubmitOutcome::Updated {
+                            id,
+                            set: entry.comments.clone(),
+                        },
+                        false,
+                    ),
+                    Some(pos) => {
+                        entry.comments[pos].text = text.to_string();
+                        (
+                            SubmitOutcome::Updated {
+                                id,
+                                set: entry.comments.clone(),
+                            },
+                            true,
+                        )
+                    }
+                }
+            }),
+        }
+    }
+
+    /// Whether the in-place editor is open (test accessor + dump-frame guard).
+    pub fn editor_open(&self) -> bool {
+        self.editing()
+    }
+
+    /// The editor's current buffer, or `None` when it is closed (test accessor).
+    pub fn editor_buffer(&self) -> Option<String> {
+        self.editor().map(|edit| edit.buffer.clone())
+    }
+
+    /// The editor caret as `(hard-line, char)`, or `None` when closed (test accessor).
+    pub fn editor_cursor(&self) -> Option<(usize, usize)> {
+        self.editor().map(|edit| edit.cursor)
     }
 
     /// The diff cursor's physical row index (into the active mode's row list);
@@ -1823,7 +2183,11 @@ impl App {
     /// list is focused or in History. A comment box spans several rows, so the
     /// whole box is highlighted, not just its first row.
     pub fn review_cursor_highlight(&self) -> Option<Range<usize>> {
-        if self.diff_focused() && self.active_pane().is_some() {
+        // While the in-place editor is open its box shows a caret, not the box
+        // selection highlight — so the anchor row isn't highlighted underneath it.
+        if self.editing() {
+            None
+        } else if self.diff_focused() && self.active_pane().is_some() {
             self.review_cursor_span()
         } else {
             None
@@ -2068,13 +2432,18 @@ impl App {
         self.flash = None;
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                // Grabbing a split bar starts a resize instead of a pane click.
-                if self.on_divider(pos) {
-                    self.dragging_divider = true;
-                } else if self.on_hdivider(pos) {
-                    self.dragging_hdivider = true;
+                if self.editing() {
+                    // A click inside the open editor keeps it (no routing); a click
+                    // outside commits it (save if non-empty, else cancel) then routes
+                    // the click — the click-outside-saves pin (plan §3.5).
+                    if !self.click_in_editor(pos) {
+                        self.commit_editor_for_click();
+                        if !self.editing() {
+                            self.route_left_down(pos);
+                        }
+                    }
                 } else {
-                    self.on_click(pos);
+                    self.route_left_down(pos);
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) if self.dragging_divider => {
@@ -2093,6 +2462,67 @@ impl App {
         }
         self.sync_active();
         true
+    }
+
+    /// Route a left-button press that isn't consumed by the editor: grab a split
+    /// bar (starting a resize), else hit-test the pane. The pre-editor `Down(Left)`
+    /// behaviour, factored out so the click-outside-saves path can reuse it.
+    fn route_left_down(&mut self, pos: Position) {
+        if self.on_divider(pos) {
+            self.dragging_divider = true;
+        } else if self.on_hdivider(pos) {
+            self.dragging_hdivider = true;
+        } else {
+            self.on_click(pos);
+        }
+    }
+
+    /// Whether `pos` lands within the open editor box, so a click there keeps
+    /// editing rather than committing + routing. In side-by-side the editor occupies
+    /// only its anchor's column, so a click in the *other* column is outside (codex
+    /// fix #4): the row's `side` bounds the horizontal hit-test.
+    fn click_in_editor(&self, pos: Position) -> bool {
+        let diff = self.diff_area.get();
+        if !diff.contains(pos) {
+            return false;
+        }
+        let offset = self.diff_scroll.min(self.diff_max_scroll());
+        let row_idx = offset + (pos.y - diff.y) as usize;
+        // Copy the row's target + side out so the layout borrow doesn't outlive it.
+        let Some((target, side)) = self
+            .diff_layout(self.diff_pane_width())
+            .get(row_idx)
+            .map(|row| (row.target, row.side))
+        else {
+            return false;
+        };
+        if target != RowTarget::Editor {
+            return false;
+        }
+        let rel_x = (pos.x - diff.x) as usize;
+        let (left_w, _) = sbs_columns(diff.width);
+        match side {
+            // Full-width (unified, or a full-width orphan block): any column hits.
+            None => true,
+            // The old column is `[0, left_w)`; the divider at `left_w` is neither.
+            Some(Side::Old) => rel_x < left_w,
+            // The new column starts just past the divider: `[left_w + 1, width)`.
+            Some(Side::New) => rel_x > left_w,
+        }
+    }
+
+    /// Commit the editor for a click that landed outside it: save when the buffer
+    /// is non-empty, else cancel (plan §3.5). On a save-write failure the editor
+    /// stays open (and the caller then skips routing the click).
+    fn commit_editor_for_click(&mut self) {
+        let empty = self
+            .editor()
+            .is_none_or(|edit| edit.buffer.trim().is_empty());
+        if empty {
+            self.close_editor();
+        } else {
+            self.save_edit();
+        }
     }
 
     /// Which pane (if any) a screen position falls in.
@@ -2247,6 +2677,15 @@ impl App {
     }
 
     fn on_scroll(&mut self, pos: Position, down: bool) {
+        // Wheel scroll while editing is allowed but only moves the diff (the editor
+        // stays anchored); a scroll over the file list is ignored so the file can't
+        // change mid-edit (plan §3.5).
+        if self.editing() {
+            if self.diff_area.get().contains(pos) {
+                self.scroll_diff(down, SCROLL_STEP);
+            }
+            return;
+        }
         match self.view {
             ViewMode::History => {
                 self.history_scroll(pos, down);
@@ -2323,12 +2762,6 @@ impl App {
     fn on_key_modal(&mut self, key: KeyEvent) {
         if matches!(self.modal, Some(Modal::Help)) {
             self.modal = None; // any key dismisses the help overlay
-            return;
-        }
-        // The text editor handles its own keys (typing, editing, submit/cancel)
-        // before the y/n confirm match below.
-        if matches!(self.modal, Some(Modal::CommentInput { .. })) {
-            self.on_key_comment_input(key);
             return;
         }
         match key.code {
@@ -2964,17 +3397,22 @@ impl App {
 
     /// Build the physical layout for the active diff at pane width `width`: the
     /// code rows for the current mode interleaved with comment boxes, or (for an
-    /// empty/binary/no diff) just the orphan boxes.
+    /// empty/binary/no diff) just the orphan boxes. When the in-place editor is
+    /// open its box is injected too — after the anchored code line for a new
+    /// comment, or in place of the edited comment's box (plan §3.5).
     fn build_layout(&self, width: u16) -> Vec<LayoutRow> {
-        match self.active_diff() {
+        let mut rows = match self.active_diff() {
             Some(FileDiff::Text(lines)) if !lines.is_empty() => {
                 let (orphans, placements) = self.active_placements(lines);
+                // A new-comment editor anchors after this diff-line index (re-resolved
+                // from the anchor every build, never a captured row — plan §3.5).
+                let editor_line = self.editor_new_anchor_line(lines);
                 match self.diff_mode {
                     DiffMode::Unified => {
-                        self.build_unified_layout(lines, &orphans, &placements, width)
+                        self.build_unified_layout(lines, &orphans, &placements, width, editor_line)
                     }
                     DiffMode::SideBySide => {
-                        self.build_sbs_layout(lines, &orphans, &placements, width)
+                        self.build_sbs_layout(lines, &orphans, &placements, width, editor_line)
                     }
                 }
             }
@@ -2993,17 +3431,33 @@ impl App {
                 }
                 rows
             }
+        };
+        // Orphan fallback: an open editor that resolved to no row — its anchor no
+        // longer maps to a diff line, or the edited comment vanished — renders as a
+        // full-width block at the diff top (plan §3.5).
+        if self.editing()
+            && !rows
+                .iter()
+                .any(|r| matches!(r.content, RowContent::Editor(_)))
+        {
+            let mut block = Vec::new();
+            self.push_editor_box(&mut block, BoxPlacement::Unified(width as usize));
+            block.append(&mut rows);
+            rows = block;
         }
+        rows
     }
 
     /// The unified physical layout: an orphan block at the top, then each diff
-    /// line followed by any comment boxes anchored to it (full-width).
+    /// line followed by any comment boxes anchored to it (full-width), and the
+    /// new-comment editor box after its anchor line when `editor_line` matches.
     fn build_unified_layout(
         &self,
         lines: &[DiffLine],
         orphans: &[u64],
         placements: &BTreeMap<usize, Vec<u64>>,
         width: u16,
+        editor_line: Option<usize>,
     ) -> Vec<LayoutRow> {
         let place = BoxPlacement::Unified(width as usize);
         let mut rows = Vec::with_capacity(lines.len() + orphans.len());
@@ -3021,6 +3475,9 @@ impl App {
             for &id in comments_after(placements, index) {
                 self.push_comment_box(&mut rows, id, false, place);
             }
+            if editor_line == Some(index) {
+                self.push_editor_box(&mut rows, place);
+            }
         }
         rows
     }
@@ -3035,6 +3492,7 @@ impl App {
         orphans: &[u64],
         placements: &BTreeMap<usize, Vec<u64>>,
         width: u16,
+        editor_line: Option<usize>,
     ) -> Vec<LayoutRow> {
         let (left_w, right_w) = sbs_columns(width);
         let place = BoxPlacement::Sbs { left_w, right_w };
@@ -3081,6 +3539,12 @@ impl App {
                             }
                         }
                     }
+                    // A new-comment editor anchors to this pair when its diff-line
+                    // index (the anchor's side) matches either side of the pair; it
+                    // takes its own anchor-side column (chosen in `push_editor_box`).
+                    if editor_line.is_some() && (editor_line == left || editor_line == right) {
+                        self.push_editor_box(&mut rows, place);
+                    }
                 }
             }
         }
@@ -3102,13 +3566,13 @@ impl App {
         let Some(comment) = self.active_comment(id) else {
             return;
         };
-        let (side, box_w) = match placement {
-            BoxPlacement::Unified(w) => (None, w),
-            BoxPlacement::Sbs { left_w, right_w } => match comment.side {
-                Side::Old => (Some(Side::Old), left_w),
-                Side::New => (Some(Side::New), right_w),
-            },
-        };
+        // Editing this comment? Its box becomes the in-place editor, rendered where
+        // the saved box would have been (plan §3.5).
+        if self.editor_edits_comment(id) {
+            self.push_editor_box(rows, placement);
+            return;
+        }
+        let (side, box_w) = placement.column_for(comment.side);
         let target = if orphan {
             RowTarget::Orphan(id)
         } else {
@@ -3134,6 +3598,59 @@ impl App {
                 }),
             });
         }
+    }
+
+    /// Expand the in-place editor into its physical box rows (title / wrapped +
+    /// caret-marked body / bottom) sharing [`RowTarget::Editor`] (plan §3.5). The
+    /// box takes the anchor-side column in side-by-side placement; the body is
+    /// wrapped and the caret located now (both feed the render and the reveal).
+    fn push_editor_box(&self, rows: &mut Vec<LayoutRow>, placement: BoxPlacement) {
+        let Some(edit) = self.editor() else {
+            return;
+        };
+        let (side, box_w) = placement.column_for(edit.anchor.side);
+        let view = editor_view(&edit.buffer, edit.cursor, box_body_width(box_w));
+        let mut parts = vec![EditorPart::Title(editor_title_text(&edit.anchor))];
+        for (i, text) in view.rows.into_iter().enumerate() {
+            let caret = (i == view.caret_row).then_some(view.caret_col);
+            parts.push(EditorPart::Body { text, caret });
+        }
+        parts.push(EditorPart::Bottom);
+        for (subrow, part) in parts.into_iter().enumerate() {
+            rows.push(LayoutRow {
+                target: RowTarget::Editor,
+                subrow: subrow as u16,
+                side,
+                hit: HitRegion::Code,
+                content: RowContent::Editor(part),
+            });
+        }
+    }
+
+    /// The diff-line index a *new*-comment editor anchors after, re-resolved from
+    /// the editor's stored anchor (never a captured row). `None` when the editor is
+    /// closed, is editing an existing comment (its box carries the editor instead),
+    /// or the anchor no longer maps to a line on the selected file — the last two
+    /// route to the orphan-block fallback in `build_layout`.
+    fn editor_new_anchor_line(&self, lines: &[DiffLine]) -> Option<usize> {
+        let edit = self.editor()?;
+        if edit.editing_id.is_some() {
+            return None;
+        }
+        let anchor = &edit.anchor;
+        if self.active_diff_path().as_deref() != Some(anchor.file.as_str()) {
+            return None;
+        }
+        lines
+            .iter()
+            .position(|line| line_no(line, anchor.side) == Some(anchor.line))
+    }
+
+    /// Whether the open editor is editing comment `id` (so its box renders the
+    /// editor in place of the saved note).
+    fn editor_edits_comment(&self, id: u64) -> bool {
+        self.editor()
+            .is_some_and(|edit| edit.editing_id == Some(id))
     }
 
     /// The comment placements for the diff being rendered: the orphaned ids (for
@@ -3600,10 +4117,10 @@ fn is_worktree_scope(comment: &Comment) -> bool {
     matches!(comment.scope, Scope::WorkTree)
 }
 
-/// The inbox + scope decisions [`App::submit_comment_input`] captures once per
-/// submit: which branch entry to write, how a *new* comment is scoped, and its
-/// baseline HEAD (worktree only). A `Scope::Range` plan also records its range on
-/// the branch entry — derived from `scope`, so it isn't stored twice.
+/// The inbox + scope decisions [`App::authoring_identity`] captures once, at
+/// editor open: which branch entry to write, how a *new* comment is scoped, and
+/// its baseline HEAD (worktree only). A `Scope::Range` plan also records its range
+/// on the branch entry — derived from `scope`, so it isn't stored twice.
 struct SubmitPlan {
     branch: String,
     scope: Scope,
@@ -3729,26 +4246,23 @@ fn blob_contains_line(bytes: &[u8], text: &str) -> bool {
         .any(|line| line == text)
 }
 
-/// One editing operation on the comment-input buffer, so a single method covers
-/// every key (keeps char-index → byte-offset conversion in one place).
-enum InputEdit {
-    Insert(char),
-    Backspace,
-    Delete,
-    Left,
-    Right,
-    Home,
-    End,
-}
-
-/// What a submit did to the store, each carrying the branch's resulting comment
-/// set for the in-memory replace.
+/// What a save did to the store; each variant carries the branch's resulting
+/// comment set for the in-memory replace, and the created/edited id for cursor
+/// placement.
 enum SubmitOutcome {
-    Added(Vec<Comment>),
-    Updated(Vec<Comment>),
-    /// The edited comment was removed concurrently (a rm between open and submit):
+    Added {
+        id: u64,
+        set: Vec<Comment>,
+    },
+    Updated {
+        id: u64,
+        set: Vec<Comment>,
+    },
+    /// The edited comment was removed concurrently (a rm between open and save):
     /// the edit is dropped and the caller flashes "comment was removed".
-    Vanished(Vec<Comment>),
+    Vanished {
+        set: Vec<Comment>,
+    },
 }
 
 /// The byte offset of char index `idx` in `s`, or `s.len()` when `idx` is at or
@@ -3758,6 +4272,67 @@ fn char_byte_index(s: &str, idx: usize) -> usize {
         .nth(idx)
         .map(|(byte, _)| byte)
         .unwrap_or(s.len())
+}
+
+/// The byte offset where hard line `line` begins in `buf` (0 for line 0). Each
+/// preceding line contributes its bytes plus the `\n` that terminates it.
+fn line_start_byte(buf: &str, line: usize) -> usize {
+    buf.split('\n').take(line).map(|l| l.len() + 1).sum()
+}
+
+/// The text of hard line `line` in `buf` (without its `\n`), or `""` past the end.
+fn line_str(buf: &str, line: usize) -> &str {
+    buf.split('\n').nth(line).unwrap_or("")
+}
+
+/// The byte offset of caret `(line, col)` in `buf`, composing the two
+/// char-boundary-safe helpers so an insert/replace never splits a multibyte char.
+fn byte_of(buf: &str, line: usize, col: usize) -> usize {
+    line_start_byte(buf, line) + char_byte_index(line_str(buf, line), col)
+}
+
+/// The number of hard lines in `buf` (always ≥ 1; a trailing `\n` yields a final
+/// empty line, matching the editor's caret model).
+fn line_count(buf: &str) -> usize {
+    buf.split('\n').count()
+}
+
+/// The char count of `s` (the editor addresses hard lines by char index).
+fn char_count(s: &str) -> usize {
+    s.chars().count()
+}
+
+/// One char's display width for the editor: a tab shows as 4 columns, control
+/// chars as 0 (dropped on display), everything else via the shared `char_width`.
+/// Matches the render-side sanitisation so caret columns line up with what's drawn.
+fn editor_char_width(ch: char) -> usize {
+    match ch {
+        '\t' => 4,
+        c if c.is_control() => 0,
+        c => crate::ui::char_width(c),
+    }
+}
+
+/// The display column of char index `col` within hard line `line` (unwrapped) —
+/// the caret's horizontal offset, the source of the up/down preferred column.
+fn display_col(line: &str, col: usize) -> usize {
+    line.chars().take(col).map(editor_char_width).sum()
+}
+
+/// The char index on `line` nearest to (but not past) display column `target` —
+/// the inverse of [`display_col`], for landing up/down at the preferred column.
+fn col_at_display(line: &str, target: usize) -> usize {
+    let mut used = 0;
+    let mut col = 0;
+    for ch in line.chars() {
+        let w = editor_char_width(ch);
+        if used + w > target {
+            break;
+        }
+        used += w;
+        col += 1;
+    }
+    col
 }
 
 /// Record `range` as the branch's reviewed range when it has none yet — a
@@ -3860,6 +4435,103 @@ fn box_title_text(comment: &Comment, orphan: bool) -> String {
         Source::Agent => "agent",
     };
     format!("{marker} {who} — {} R{}", comment.file, comment.line)
+}
+
+/// The title text for the in-place editor box: `✎ you — <file> R<line>`, the pencil
+/// marking it as the active input (vs a settled `●` note). Truncated by the renderer.
+fn editor_title_text(anchor: &CommentAnchor) -> String {
+    format!("✎ you — {} R{}", anchor.file, anchor.line)
+}
+
+/// The editor buffer wrapped to a body content width, plus the caret's position.
+struct EditorView {
+    /// The body display rows (each hard line contributes ≥ 1 row).
+    rows: Vec<String>,
+    /// The row index (into `rows`) the caret sits on.
+    caret_row: usize,
+    /// The caret's display column within the content area of `rows[caret_row]`.
+    caret_col: usize,
+}
+
+/// Lay the editor `buffer` out for a body of `width` display columns and locate the
+/// caret `(hard-line, char)`. Hard lines split on `\n`; each is char-wrapped by
+/// display width (tabs → 4 cols, control dropped, wide/combining via `char_width`).
+/// The caret maps to the wrapped row + column it falls in; a caret exactly filling
+/// a wrapped row rolls to a fresh row so it always has a drawable cell.
+fn editor_view(buffer: &str, cursor: (usize, usize), width: usize) -> EditorView {
+    let width = width.max(1);
+    let (cline, ccol) = cursor;
+    let mut rows: Vec<String> = Vec::new();
+    let mut caret_row = 0;
+    let mut caret_col = 0;
+    for (li, hard) in buffer.split('\n').enumerate() {
+        let base = rows.len();
+        let wrapped = wrap_display_row(hard, width);
+        if li == cline {
+            let chars: Vec<char> = hard.chars().collect();
+            let ccol = ccol.min(chars.len());
+            // The caret's wrapped row = the last one starting at or before `ccol`.
+            let mut r = 0;
+            for (i, (_, start)) in wrapped.iter().enumerate() {
+                if *start <= ccol {
+                    r = i;
+                } else {
+                    break;
+                }
+            }
+            let start = wrapped[r].1;
+            let col: usize = chars[start..ccol]
+                .iter()
+                .map(|&c| editor_char_width(c))
+                .sum();
+            // Caret at the very end of a full wrapped row: roll to a fresh row so it
+            // has a cell to draw (else it would land in column `width`, off the box).
+            if col >= width && ccol == chars.len() {
+                rows.extend(wrapped.into_iter().map(|(text, _)| text));
+                caret_row = rows.len();
+                caret_col = 0;
+                rows.push(String::new());
+                continue;
+            }
+            caret_row = base + r;
+            caret_col = col;
+        }
+        rows.extend(wrapped.into_iter().map(|(text, _)| text));
+    }
+    EditorView {
+        rows,
+        caret_row,
+        caret_col,
+    }
+}
+
+/// Char-wrap one hard `line` into display rows of at most `width` columns, each
+/// paired with the char index (into the hard line) where it begins — so the caret
+/// can be mapped back onto a wrapped row. Always yields at least one (possibly
+/// empty) row; a single char wider than `width` overflows its own row rather than
+/// looping.
+fn wrap_display_row(line: &str, width: usize) -> Vec<(String, usize)> {
+    let mut rows: Vec<(String, usize)> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0;
+    let mut cur_start = 0;
+    for (ci, ch) in line.chars().enumerate() {
+        let w = editor_char_width(ch);
+        if cur_w + w > width && cur_w > 0 {
+            rows.push((std::mem::take(&mut cur), cur_start));
+            cur_w = 0;
+            cur_start = ci;
+        }
+        // Tabs display as spaces and control chars vanish, matching the render pass.
+        match ch {
+            '\t' => cur.push_str("    "),
+            c if c.is_control() => {}
+            c => cur.push(c),
+        }
+        cur_w += w;
+    }
+    rows.push((cur, cur_start));
+    rows
 }
 
 /// The word-wrap width for a box's body: the box's total width less its two
