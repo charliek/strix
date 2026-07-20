@@ -182,7 +182,9 @@ jobs:
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
-          gh release edit "${tag}" --draft=false --latest
+          # This job has no checkout, so `gh` can't infer the repo from a git
+          # remote (it errors "not a git repository"). Pass it explicitly.
+          gh release edit "${tag}" --draft=false --latest -R "${GITHUB_REPOSITORY}"
           echo "::notice::Release ${tag} published (not draft, marked latest)."
 
   # ─── render + push Formula/strix.rb to charliek/homebrew-tap ───
