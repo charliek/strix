@@ -40,6 +40,11 @@ pub fn cell_fg(buf: &Buffer, x: u16, y: u16) -> Option<Color> {
     buf.cell((x, y)).map(|c| c.fg)
 }
 
+/// The background colour at cell `(x, y)`, if any.
+pub fn cell_bg(buf: &Buffer, x: u16, y: u16) -> Option<Color> {
+    buf.cell((x, y)).map(|c| c.bg)
+}
+
 /// Whether any cell in buffer row `y` carries foreground colour `fg`.
 pub fn row_has_fg(buf: &Buffer, y: u16, fg: Color) -> bool {
     let area = buf.area;

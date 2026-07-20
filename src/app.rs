@@ -11,6 +11,7 @@ use ratatui::crossterm::event::{
 use ratatui::layout::{Position, Rect};
 use ratatui::style::Color;
 use ratatui::widgets::ListState;
+use similar::{ChangeTag, TextDiff};
 use syntect::parsing::SyntaxReference;
 
 use crate::comments::{self, Comment, FileFacts, Scope, Side, Source};
@@ -203,6 +204,12 @@ pub enum RowContent {
     Pair {
         left: Option<usize>,
         right: Option<usize>,
+        /// Word-diff emphasis for a genuinely modified pair (plan §3.7):
+        /// `None` for an unchanged context pair, a pure addition/deletion, or a
+        /// zipped pair whose two sides are too dissimilar to be a real edit of
+        /// one another. Computed once when the layout is built (`pair_emphasis`),
+        /// not per render.
+        emphasis: Option<PairEmphasis>,
     },
     /// One physical row of a comment box.
     Box(BoxRow),
@@ -3755,12 +3762,25 @@ impl App {
                             .or(left)
                             .expect("a side-by-side pair always has a side"),
                     );
+                    // A genuine modified pair is a zipped deletion + addition
+                    // (distinct indices); a context pair repeats one line on
+                    // both sides (`left == right`) and never gets word emphasis.
+                    let emphasis = match (left, right) {
+                        (Some(l), Some(r)) if l != r => {
+                            pair_emphasis(&lines[l].text, &lines[r].text)
+                        }
+                        _ => None,
+                    };
                     rows.push(LayoutRow {
                         target,
                         subrow: 0,
                         side: None,
                         hit: HitRegion::Code,
-                        content: RowContent::Pair { left, right },
+                        content: RowContent::Pair {
+                            left,
+                            right,
+                            emphasis,
+                        },
                     });
                     // Old-side comments (on the left index) emit before new-side
                     // (on the right), matching `ordered_comment_ids`. A context
@@ -4919,4 +4939,80 @@ fn flush_pairs(rows: &mut Vec<SbsCode>, deletions: &mut Vec<usize>, additions: &
     }
     deletions.clear();
     additions.clear();
+}
+
+/// Per-side changed character ranges for a side-by-side modified pair's
+/// word-diff emphasis (plan §3.7): offsets into each side's *sanitized* text
+/// (the same sanitization `highlighted_content` applies at render time, so
+/// these ranges line up with the rendered tokens). Computed once when the
+/// layout is built (see `pair_emphasis`) and read by the renderer every
+/// frame — the char diff itself is never recomputed per render, only on a
+/// layout rebuild (width/mode/diff/comments change).
+#[derive(Clone, Debug, Default)]
+pub struct PairEmphasis {
+    pub old_ranges: Vec<Range<usize>>,
+    pub new_ranges: Vec<Range<usize>>,
+}
+
+/// Similarity ratio (0.0–1.0, from `similar`'s char-level diff) below which a
+/// zipped `Pair` is treated as a pure add+del with no word emphasis. `flush_pairs`
+/// zips a run of deletions against the *next* run of additions positionally, not
+/// semantically (plan §2), so two adjacent-but-unrelated lines that merely
+/// landed in the same zip shouldn't light up as if one were an edit of the
+/// other. 0.6 requires most of the line to still match — comfortably above
+/// "half changed" while still catching typical one- or few-word edits (whose
+/// ratio is well above it) and rejecting a wholesale line rewrite.
+const PAIR_SIMILARITY_THRESHOLD: f32 = 0.6;
+
+/// The word-diff emphasis for a side-by-side pair's two lines (plan §3.7), or
+/// `None` when the pair isn't a genuine edit of the same line. Sanitizes both
+/// sides exactly as `highlighted_content` does (so char offsets align), then
+/// diffs them char-by-char with `similar`; below `PAIR_SIMILARITY_THRESHOLD`
+/// the pair is discarded (probably two unrelated lines that merely zipped
+/// together — plan §2/§3.7). A whitespace-only edit still clears the
+/// threshold (the two texts are otherwise identical) and is emphasized like
+/// any other change.
+fn pair_emphasis(old_text: &str, new_text: &str) -> Option<PairEmphasis> {
+    let old_clean = crate::ui::diff_view::sanitize(old_text);
+    let new_clean = crate::ui::diff_view::sanitize(new_text);
+    let diff = TextDiff::from_chars(old_clean.as_str(), new_clean.as_str());
+    if diff.ratio() < PAIR_SIMILARITY_THRESHOLD {
+        return None;
+    }
+    let mut old_ranges = Vec::new();
+    let mut new_ranges = Vec::new();
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            ChangeTag::Delete => {
+                push_char(
+                    &mut old_ranges,
+                    change.old_index().expect("delete has an old index"),
+                );
+            }
+            ChangeTag::Insert => {
+                push_char(
+                    &mut new_ranges,
+                    change.new_index().expect("insert has a new index"),
+                );
+            }
+            ChangeTag::Equal => {}
+        }
+    }
+    if old_ranges.is_empty() && new_ranges.is_empty() {
+        return None;
+    }
+    Some(PairEmphasis {
+        old_ranges,
+        new_ranges,
+    })
+}
+
+/// Append char index `idx` to `ranges`, merging into the last range when it
+/// directly extends it (`similar`'s per-side indices arrive in increasing
+/// order, so a run of consecutive changed chars collapses to one range).
+fn push_char(ranges: &mut Vec<Range<usize>>, idx: usize) {
+    match ranges.last_mut() {
+        Some(last) if last.end == idx => last.end += 1,
+        _ => ranges.push(idx..idx + 1),
+    }
 }

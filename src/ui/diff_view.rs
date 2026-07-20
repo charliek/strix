@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ops::Range;
 
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -7,7 +8,9 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use syntect::parsing::SyntaxReference;
 
-use crate::app::{sbs_columns, App, BoxPart, BoxRow, EditorPart, LayoutRow, RowContent};
+use crate::app::{
+    sbs_columns, App, BoxPart, BoxRow, EditorPart, LayoutRow, PairEmphasis, RowContent,
+};
 use crate::comments::Side;
 use crate::git::{DiffLine, FileDiff, LineKind};
 use crate::ui::syntax::syntax_for;
@@ -108,9 +111,21 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         let line = match &row.content {
             RowContent::Line(li) => unified_line(app, &lines[*li], theme, syntax, body_width),
             RowContent::Hunk(h) => hunk_line(&lines[*h], theme),
-            RowContent::Pair { left, right } => {
-                sbs_pair_line(app, *left, *right, lines, theme, syntax, left_w, right_w)
-            }
+            RowContent::Pair {
+                left,
+                right,
+                emphasis,
+            } => sbs_pair_line(
+                app,
+                *left,
+                *right,
+                lines,
+                theme,
+                syntax,
+                left_w,
+                right_w,
+                emphasis.as_ref(),
+            ),
             RowContent::Box(boxed) => box_row_line(
                 row,
                 boxed,
@@ -196,11 +211,15 @@ fn unified_line(
         &line.text,
         body_width.saturating_sub(SIGN_WIDTH),
         bg,
+        // Word-diff emphasis is a side-by-side feature only (plan §3.7).
+        None,
     ));
     Line::from(spans)
 }
 
 /// One side-by-side code row: the old cell, the centre divider, the new cell.
+/// `emphasis` carries the pair's word-diff changed-char ranges (plan §3.7),
+/// `None` unless this is a genuinely modified pair.
 #[allow(clippy::too_many_arguments)]
 fn sbs_pair_line(
     app: &App,
@@ -211,6 +230,7 @@ fn sbs_pair_line(
     syntax: &SyntaxReference,
     left_w: usize,
     right_w: usize,
+    emphasis: Option<&PairEmphasis>,
 ) -> Line<'static> {
     let mut spans = cell(
         app,
@@ -219,6 +239,7 @@ fn sbs_pair_line(
         theme,
         syntax,
         left_w,
+        emphasis.map(|e| e.old_ranges.as_slice()),
     );
     spans.push(Span::styled("│", Style::new().fg(theme.border)));
     spans.extend(cell(
@@ -228,6 +249,7 @@ fn sbs_pair_line(
         theme,
         syntax,
         right_w,
+        emphasis.map(|e| e.new_ranges.as_slice()),
     ));
     Line::from(spans)
 }
@@ -246,19 +268,34 @@ fn cell(
     theme: &Theme,
     syntax: &SyntaxReference,
     width: usize,
+    emph_ranges: Option<&[Range<usize>]>,
 ) -> Vec<Span<'static>> {
     let Some(line) = line else {
         return vec![Span::styled(" ".repeat(width), Style::new().bg(theme.bg))];
     };
-    let (number, active_kind, active_bg) = match side {
-        Col::Old => (line.old_no, LineKind::Deletion, theme.del_bg),
-        Col::New => (line.new_no, LineKind::Addition, theme.add_bg),
+    let (number, active_kind, active_bg, emph_bg) = match side {
+        Col::Old => (
+            line.old_no,
+            LineKind::Deletion,
+            theme.del_bg,
+            theme.del_emph,
+        ),
+        Col::New => (
+            line.new_no,
+            LineKind::Addition,
+            theme.add_bg,
+            theme.add_emph,
+        ),
     };
-    let bg = if line.kind == active_kind {
-        active_bg
-    } else {
-        theme.bg
-    };
+    let active = line.kind == active_kind;
+    let bg = if active { active_bg } else { theme.bg };
+    // Emphasis only ever applies to this side's changed line (the other side of
+    // a modified pair never carries this side's ranges); guard on `active`
+    // defensively even though `App::pair_emphasis` only ever sets ranges for a
+    // real deletion/addition pairing.
+    let emphasis = emph_ranges
+        .filter(|_| active)
+        .map(|ranges| (ranges, emph_bg));
     let gutter_w = sbs_gutter_width(app.show_line_numbers);
     let mut spans = Vec::new();
     if app.show_line_numbers {
@@ -272,6 +309,7 @@ fn cell(
         &line.text,
         width.saturating_sub(gutter_w),
         bg,
+        emphasis,
     ));
     spans
 }
@@ -591,7 +629,29 @@ fn fit_display(s: &str, max: usize) -> (String, usize) {
 
 /// Syntax-highlight `text` into spans (each token's colour over the line's
 /// background), expanding tabs, dropping control chars, and padding to `width`
-/// so the background fills the row.
+/// so the background fills the row. `emphasis`, when given, is a side-by-side
+/// modified pair's changed-char ranges over this same sanitized text plus the
+/// emphasis background to use for them (plan §3.7): each char's background is
+/// decided against the ranges (`char_bg`), intersecting the word-diff with the
+/// syntax-token spans below without touching foreground colour.
+///
+/// Two non-obvious invariants:
+/// - **Truncation stops the whole line, not just the current token.** The first
+///   char that doesn't fit exits the outer token loop too (a labeled break), so
+///   a later, differently-highlighted token can't render past the cut — which
+///   would otherwise also desync `char_idx` from `emphasis`'s ranges (nothing
+///   advances it over the skipped remainder), corrupting every emphasis lookup
+///   for the rest of the line.
+/// - **A zero-width char (a combining mark/ZWJ) never forces a span break.** A
+///   terminal only combines it with the preceding base character when both are
+///   written in the same span/string; splitting it into its own span stranded
+///   it in a zero-width cell that got overwritten by the trailing padding,
+///   silently dropping the change it renders (e.g. an accent in a modified
+///   pair). It's glued onto the current chunk regardless of its own `char_bg`
+///   — the chunk keeps the base character's background rather than switching
+///   for just the mark — so a word-diff range landing only on the mark itself
+///   is not visually distinguished; this is the documented fallback over
+///   splitting the cluster.
 fn highlighted_content(
     app: &App,
     syntax: &SyntaxReference,
@@ -599,25 +659,45 @@ fn highlighted_content(
     text: &str,
     width: usize,
     bg: Color,
+    emphasis: Option<(&[Range<usize>], Color)>,
 ) -> Vec<Span<'static>> {
     let clean = sanitize(text);
     let mut spans = Vec::new();
-    let mut used = 0;
-    for (color, piece) in app.highlight(syntax, theme_name, &clean).iter() {
+    let mut used = 0; // display columns consumed, for width truncation/padding
+    let mut char_idx = 0; // char offset into `clean`, aligned with `emphasis`'s ranges
+    'tokens: for (color, piece) in app.highlight(syntax, theme_name, &clean).iter() {
         if used >= width {
             break;
         }
         let mut chunk = String::new();
+        let mut chunk_bg = bg;
         for ch in piece.chars() {
             let ch_width = char_width(ch);
             if used + ch_width > width {
-                break;
+                if !chunk.is_empty() {
+                    spans.push(Span::styled(chunk, Style::new().fg(*color).bg(chunk_bg)));
+                }
+                break 'tokens;
             }
+            if ch_width == 0 && !chunk.is_empty() {
+                chunk.push(ch);
+                char_idx += 1;
+                continue;
+            }
+            let ch_bg = char_bg(char_idx, emphasis, bg);
+            if !chunk.is_empty() && ch_bg != chunk_bg {
+                spans.push(Span::styled(
+                    std::mem::take(&mut chunk),
+                    Style::new().fg(*color).bg(chunk_bg),
+                ));
+            }
+            chunk_bg = ch_bg;
             chunk.push(ch);
             used += ch_width;
+            char_idx += 1;
         }
         if !chunk.is_empty() {
-            spans.push(Span::styled(chunk, Style::new().fg(*color).bg(bg)));
+            spans.push(Span::styled(chunk, Style::new().fg(*color).bg(chunk_bg)));
         }
     }
     if used < width {
@@ -626,9 +706,23 @@ fn highlighted_content(
     spans
 }
 
+/// The background for sanitized-text char `idx`: `emph_bg` when `idx` falls in
+/// one of `emphasis`'s changed-char ranges, else the line's base `bg` (plan
+/// §3.7). The per-char decision is what lets a changed span's emphasis
+/// intersect with the syntax-highlighted token spans above (each token can
+/// straddle an emphasis-range boundary and split into an emphasized/base run).
+fn char_bg(idx: usize, emphasis: Option<(&[Range<usize>], Color)>, bg: Color) -> Color {
+    match emphasis {
+        Some((ranges, emph_bg)) if ranges.iter().any(|r| r.contains(&idx)) => emph_bg,
+        _ => bg,
+    }
+}
+
 /// Normalise a line for display in one pass: expand tabs and drop control
-/// characters so file content can't inject terminal escape sequences.
-fn sanitize(text: &str) -> String {
+/// characters so file content can't inject terminal escape sequences. `pub(crate)`
+/// so `App::pair_emphasis` (plan §3.7) can diff the exact same text the renderer
+/// shows, keeping its changed-char-range offsets aligned with these tokens.
+pub(crate) fn sanitize(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
         match ch {
