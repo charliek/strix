@@ -1,6 +1,6 @@
 use std::io::{self, Stdout, Write};
 use std::sync::mpsc::Receiver;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ratatui::backend::{CrosstermBackend, TestBackend};
@@ -145,14 +145,20 @@ fn handle_event(app: &mut App, event: Event) -> bool {
             app.on_key(key);
             true
         }
-        Event::Mouse(mouse) => app.on_mouse(mouse),
+        // The event loop stamps the double-click clock as it dispatches (plan §3.6).
+        Event::Mouse(mouse) => app.on_mouse_at(mouse, Instant::now()),
         // A bracketed paste: its newlines insert into the open comment editor
         // instead of each Enter saving the note (plan §3.5).
         Event::Paste(text) => {
             app.on_paste(&text);
             true
         }
-        Event::Resize(_, _) => true,
+        // A resize breaks a pending double-click chain before the redraw rebuilds
+        // the layout (plan §3.6).
+        Event::Resize(_, _) => {
+            app.on_resize();
+            true
+        }
         _ => false,
     }
 }

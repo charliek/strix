@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -55,6 +56,9 @@ fn startup_comment_gc(repo: &Repo) -> anyhow::Result<()> {
 const MARKER_ZONE: u16 = 4;
 /// Lines scrolled per mouse-wheel notch in the diff pane.
 const SCROLL_STEP: u16 = 3;
+/// How close in time two identical left-clicks must fall to count as a
+/// double-click (plan §3.6). Semantic (same [`HitTarget`]), not pixel-based.
+const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
 /// Default width (columns) of the Changes panel. It is a fixed width, not a
 /// percentage, so widening the terminal grows the diff rather than this panel.
 const DEFAULT_CHANGES_WIDTH: u16 = 32;
@@ -155,6 +159,36 @@ pub enum HitRegion {
     Code,
     Close(u64),
     Body(u64),
+}
+
+/// The *semantic* region a click landed on, the part of a [`HitTarget`] that
+/// distinguishes one double-click candidate from another (plan §3.6): a specific
+/// code line (by diff-line index), a comment box, or its `[x]` close cell. Two
+/// clicks are a double-click only when their whole `HitTarget`s (region included)
+/// are equal, so adjacent rows or a different box never false-fire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClickRegion {
+    Code(usize),
+    Comment(u64),
+    Close(u64),
+}
+
+/// What a left-click resolved to on the diff pane — the semantic double-click
+/// key (plan §3.6). Built by [`App::hit_target`] for a click position; two
+/// `Down(Left)`s are a double-click when their `HitTarget`s are equal within
+/// [`DOUBLE_CLICK_WINDOW`]. `generation` is the layout-rebuild counter (a resize,
+/// mode toggle, or comment mutation bumps it), so any relayout between the two
+/// clicks — including a scroll that moved rows — makes the equality fail; `view`
+/// and `file` guard against a view switch or a file change producing the same
+/// row index. Only produced for the cursor-bearing views' (Status/Review) diff
+/// rows: a click in the file list, the marker zone, or History yields `None`, so
+/// those never open the editor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HitTarget {
+    generation: u64,
+    view: ViewMode,
+    file: Option<String>,
+    region: ClickRegion,
 }
 
 /// What a physical [`LayoutRow`] draws. Code rows carry diff-line indices (a
@@ -639,6 +673,19 @@ pub struct App {
     /// or on any comment/diff mutation. `None` until first built for the current
     /// diff. This is the concrete backing store behind the C1 cursor seam.
     layout: RefCell<Option<CachedLayout>>,
+    /// A monotonically-increasing counter bumped every time the physical
+    /// [`layout`] is rebuilt (a resize, a diff-mode toggle, or any comment/diff
+    /// mutation via `invalidate_comment_rows`). It is the `generation` field of a
+    /// [`HitTarget`]: a relayout between two clicks changes it, so a stale
+    /// double-click can't fire against a layout that no longer matches. `Cell`
+    /// because the rebuild happens on the render path's `&self` (plan §3.6).
+    layout_generation: Cell<u64>,
+    /// The last recognized single left-click, for semantic double-click detection
+    /// (plan §3.6): its [`HitTarget`] and the instant it happened. A second click
+    /// with an equal `HitTarget` within [`DOUBLE_CLICK_WINDOW`] is a double-click.
+    /// Reset (`None`) after a recognized double-click, a consumed `[x]`, any drag
+    /// or scroll, and any click that isn't a plain diff-row single click.
+    last_click: Option<(Instant, HitTarget)>,
 
     /// The status view's worktree-comment inbox (the checked-out branch's
     /// `Scope::WorkTree` set) and its diff-pane cursor/editor. Status has no
@@ -783,6 +830,8 @@ impl App {
             diff_content_rows: Cell::new(0),
             highlight_cache: RefCell::new(HashMap::new()),
             layout: RefCell::new(None),
+            layout_generation: Cell::new(0),
+            last_click: None,
             status_comments: Vec::new(),
             status_branch_key,
             status_pane: DiffPaneState::default(),
@@ -909,6 +958,13 @@ impl App {
             return;
         }
         self.flash = None;
+        // Any keyboard input breaks a pending double-click chain (plan §3.6): a
+        // real double-click is two mouse clicks with no key between them, so this
+        // never drops one, and it subsumes every keyboard scroll/nav (Ctrl-D, j/k)
+        // that moves `diff_scroll` without rebuilding the layout. Cleared here at
+        // the entry point rather than in the reveal/scroll helpers, which a single
+        // click's own reveal also runs through.
+        self.last_click = None;
 
         if self.modal.is_some() {
             self.on_key_modal(key);
@@ -1619,14 +1675,10 @@ impl App {
 
     /// Delete the comment under the diff-pane cursor (`Action::DeleteComment`,
     /// `X`) — Status (worktree) and Review (range) alike, via the shared
-    /// cursor/comment-set seam (diff focus only). Transactional per plan §3.1.5:
-    /// mutate a fresh store read, persist, and only on success replace the
-    /// in-memory set + invalidate the row caches; a failure leaves everything
-    /// unchanged and flashes. A code/hunk-row cursor is a silent no-op, matching
-    /// how milestone 6 treated `x` on a non-comment row. Deletion needs no
-    /// authoring gate of its own: `authoring_identity` already yields `None` for
-    /// a non-authoring review, where no comments are ever loaded to land the
-    /// cursor on in the first place.
+    /// cursor/comment-set seam (diff focus only). A code/hunk-row cursor is a
+    /// silent no-op, matching how milestone 6 treated `x` on a non-comment row.
+    /// Resolves the cursor to a comment id, then defers to
+    /// [`App::delete_comment_id`] for the transactional delete.
     fn delete_cursor_comment(&mut self) {
         if !self.diff_focused() {
             return;
@@ -1640,6 +1692,17 @@ impl App {
         let Some(id) = self.cursor_comment_id() else {
             return; // code / hunk row: no-op
         };
+        self.delete_comment_id(id);
+    }
+
+    /// Delete comment `id` from the active view's inbox transactionally (plan
+    /// §3.1.5): mutate a fresh store read, and only on success replace the
+    /// in-memory set + invalidate the row caches + clamp the cursor. Shared by the
+    /// `X` key (via [`delete_cursor_comment`], which resolves the cursor's id) and
+    /// the `[x]` mouse click (which names the id directly). `authoring_identity`
+    /// yields the inbox key + gates a non-authoring review — where no comments load
+    /// to click on in the first place.
+    fn delete_comment_id(&mut self, id: u64) {
         let Some(identity) = self.authoring_identity() else {
             return;
         };
@@ -2238,7 +2301,8 @@ impl App {
             self.load_history();
         }
         self.view = ViewMode::History;
-        // Hidden left column ⇒ the Diff is the only visible pane to focus.
+        self.last_click = None; // a view change resets the double-click tracker (§3.6)
+                                // Hidden left column ⇒ the Diff is the only visible pane to focus.
         self.history_focus = if self.show_changes {
             HistoryFocus::Graph
         } else {
@@ -2254,9 +2318,10 @@ impl App {
     fn exit_history(&mut self) {
         // Return to the session's home view (status or review), not always status.
         self.view = self.home_view();
-        // Respect the hidden-panel invariant in whichever home we return to:
-        // when the left panel is hidden, focus must be the only visible pane
-        // (Diff), or keys would route to an invisible selection.
+        self.last_click = None; // a view change resets the double-click tracker (§3.6)
+                                // Respect the hidden-panel invariant in whichever home we return to:
+                                // when the left panel is hidden, focus must be the only visible pane
+                                // (Diff), or keys would route to an invisible selection.
         self.focus = if self.show_changes {
             Focus::Staging
         } else {
@@ -2408,8 +2473,27 @@ impl App {
         self.load_commit_files();
     }
 
-    /// Handle a mouse event; returns whether the frame should be redrawn.
+    /// Handle a mouse event; returns whether the frame should be redrawn. A thin
+    /// wrapper over [`App::on_mouse_at`] that stamps the current instant — the seam
+    /// tests drive with explicit instants so double-click timing needs no sleeps
+    /// (plan §3.6). The event loop calls `on_mouse_at` directly with `Instant::now`.
     pub fn on_mouse(&mut self, event: MouseEvent) -> bool {
+        self.on_mouse_at(event, Instant::now())
+    }
+
+    /// Break a pending double-click chain on a terminal resize (plan §3.6). The
+    /// layout rebuilds on the next redraw (bumping the generation), but a second
+    /// click queued at the same coordinates could be dispatched *before* that
+    /// redraw and match the pre-resize target — so clear the tracker eagerly here.
+    /// Called from the event loop's resize arm.
+    pub fn on_resize(&mut self) {
+        self.last_click = None;
+    }
+
+    /// Handle a mouse event at logical time `now` (the injectable double-click
+    /// clock, plan §3.6). `now` matters only for `Down(Left)`; every other kind
+    /// ignores it.
+    pub fn on_mouse_at(&mut self, event: MouseEvent, now: Instant) -> bool {
         // A modal captures all input, including the mouse.
         if self.modal.is_some() {
             return false;
@@ -2420,8 +2504,9 @@ impl App {
         };
 
         // Free movement (no button held) only updates the hover affordance: it
-        // must not clear the error toast or recompute the diff, and it redraws
-        // only when the highlighted state actually changes.
+        // must not clear the error toast, recompute the diff, or touch the
+        // double-click tracker (motion between two clicks must not break the
+        // double), and it redraws only when the highlighted state actually changes.
         if let MouseEventKind::Moved = event.kind {
             let was = self.hovering_divider || self.hovering_hdivider;
             self.hovering_divider = self.on_divider(pos);
@@ -2431,37 +2516,196 @@ impl App {
 
         self.flash = None;
         match event.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                if self.editing() {
-                    // A click inside the open editor keeps it (no routing); a click
-                    // outside commits it (save if non-empty, else cancel) then routes
-                    // the click — the click-outside-saves pin (plan §3.5).
-                    if !self.click_in_editor(pos) {
-                        self.commit_editor_for_click();
-                        if !self.editing() {
-                            self.route_left_down(pos);
-                        }
-                    }
-                } else {
-                    self.route_left_down(pos);
+            MouseEventKind::Down(MouseButton::Left) => self.on_left_down(pos, now),
+            // Any drag resets the double-click tracker (plan §3.6), then continues
+            // an in-progress split-bar resize.
+            MouseEventKind::Drag(MouseButton::Left) => {
+                self.last_click = None;
+                if self.dragging_divider {
+                    self.resize_changes(pos);
+                } else if self.dragging_hdivider {
+                    self.resize_committed(pos);
                 }
-            }
-            MouseEventKind::Drag(MouseButton::Left) if self.dragging_divider => {
-                self.resize_changes(pos)
-            }
-            MouseEventKind::Drag(MouseButton::Left) if self.dragging_hdivider => {
-                self.resize_committed(pos)
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 self.dragging_divider = false;
                 self.dragging_hdivider = false;
             }
-            MouseEventKind::ScrollDown => self.on_scroll(pos, true),
-            MouseEventKind::ScrollUp => self.on_scroll(pos, false),
+            // A scroll resets the tracker: the rows shift under a fixed cursor, so
+            // a click before and after a scroll must not read as a double (plan §3.6).
+            MouseEventKind::ScrollDown => {
+                self.last_click = None;
+                self.on_scroll(pos, true);
+            }
+            MouseEventKind::ScrollUp => {
+                self.last_click = None;
+                self.on_scroll(pos, false);
+            }
             _ => {}
         }
         self.sync_active();
         true
+    }
+
+    /// Handle a left-button press with double-click detection (plan §3.6). The
+    /// editor-open interaction from C7 stays first (a click inside keeps it, a
+    /// click outside commits then routes); a click on an `[x]` deletes that note
+    /// (a single click, before any double-click logic); otherwise a single click
+    /// routes as before, and a second identical click within the window opens the
+    /// editor (a code line → new comment, a comment box → edit it).
+    fn on_left_down(&mut self, pos: Position, now: Instant) {
+        // Editor open (C7): a click inside keeps editing; a click outside commits
+        // (save if non-empty, else cancel) then routes. A failed save keeps the
+        // editor open and swallows the click. A click while editing is never a
+        // double-click candidate, so the tracker is cleared either way.
+        if self.editing() {
+            if self.click_in_editor(pos) {
+                self.last_click = None;
+                return;
+            }
+            self.commit_editor_for_click();
+            if self.editing() {
+                self.last_click = None; // save failed; the editor kept the click
+                return;
+            }
+        }
+
+        let target = self.hit_target(pos);
+        // The `[x]` close cell deletes its note on a single click, handled before
+        // the double-click logic and resetting the tracker so the next click can't
+        // false-fire against it (plan §3.6).
+        if let Some(HitTarget {
+            region: ClickRegion::Close(id),
+            ..
+        }) = target
+        {
+            self.delete_comment_id(id);
+            self.last_click = None;
+            return;
+        }
+
+        // Decide double-click *before* routing (routing has no bearing on the
+        // semantic target), then always route the single click so today's
+        // behaviour — focus, cursor move, marker-zone stage — is preserved.
+        let double = target
+            .as_ref()
+            .is_some_and(|t| is_double_click(self.last_click.as_ref(), now, t));
+        self.route_left_down(pos);
+        if double {
+            self.double_click_comment(pos);
+            // A recognized double-click resets the tracker so a triple-click's
+            // third press can't re-fire it (plan §3.6).
+            self.last_click = None;
+        } else {
+            // Remember a plain diff-row single click as the next double's first
+            // half; anything else (the file list, marker zone, outside) clears it.
+            self.last_click = target.map(|t| (now, t));
+        }
+    }
+
+    /// The physical diff row `pos` falls on, or `None` when `pos` is outside the
+    /// diff pane. The click→row arithmetic shared by [`App::hit_target`] and
+    /// [`App::place_diff_cursor`]; clamps to the same offset the renderer paints
+    /// with (diff_view.rs clamps identically).
+    fn diff_row_at(&self, pos: Position) -> Option<usize> {
+        let diff = self.diff_area.get();
+        if !diff.contains(pos) {
+            return None;
+        }
+        let offset = self.diff_scroll.min(self.diff_max_scroll());
+        Some(offset + (pos.y - diff.y) as usize)
+    }
+
+    /// Whether `pos.x` lands in the diff-pane column a row with column `side`
+    /// occupies: the left column for `Some(Old)`, the right column (past the
+    /// centre divider) for `Some(New)`, any column for a full-width `None` row.
+    /// Shared by the editor click-test and the double-click hit-test so a click on
+    /// a side-by-side box's blank sibling column, or the centre divider, isn't
+    /// mistaken for the box itself. Callers ensure `pos` is inside the diff pane
+    /// (so `pos.x >= diff.x`).
+    fn in_side_column(&self, pos: Position, side: Option<Side>) -> bool {
+        let diff = self.diff_area.get();
+        let rel_x = (pos.x - diff.x) as usize;
+        let (left_w, _) = sbs_columns(diff.width);
+        match side {
+            // Full-width (unified, or a full-width orphan block): any column hits.
+            None => true,
+            // The old column is `[0, left_w)`; the divider at `left_w` is neither.
+            Some(Side::Old) => rel_x < left_w,
+            // The new column starts just past the divider: `[left_w + 1, width)`.
+            Some(Side::New) => rel_x > left_w,
+        }
+    }
+
+    /// The semantic [`HitTarget`] a click position resolves to, or `None` when it
+    /// isn't a double-click candidate: outside the diff pane, past its last row, on
+    /// the in-place editor, or in a view with no diff cursor (History). Reuses the
+    /// C1 physical→logical seam (`review_target_at`) for the row and C6's recorded
+    /// `[x]` rects (`comment_close_rect`) to split a box's close cell from its body.
+    fn hit_target(&self, pos: Position) -> Option<HitTarget> {
+        self.active_pane()?;
+        let row_idx = self.diff_row_at(pos)?;
+        // Read the physical row's target *and* column side; a side-by-side box
+        // spans only its own column, so the column bounds the box hit-test.
+        let (target, side) = self
+            .diff_layout(self.diff_pane_width())
+            .get(row_idx)
+            .map(|row| (row.target, row.side))?;
+        let region = match target {
+            RowTarget::Code(line) => ClickRegion::Code(line),
+            RowTarget::Comment(id) | RowTarget::Orphan(id) => {
+                // In side-by-side the box occupies only its anchor-side column: a
+                // click on the blank sibling column or the centre divider is not on
+                // the box, so it's no double-click target (mirrors `click_in_editor`).
+                if !self.in_side_column(pos, side) {
+                    return None;
+                }
+                // The `[x]` cell (recorded during render) takes precedence over the
+                // rest of the box, so a click on it deletes rather than edits.
+                if self.comment_close_rect(id).is_some_and(|r| r.contains(pos)) {
+                    ClickRegion::Close(id)
+                } else {
+                    ClickRegion::Comment(id)
+                }
+            }
+            // The in-place editor isn't a double-click target (its own click
+            // handling ran above).
+            RowTarget::Editor => return None,
+        };
+        Some(HitTarget {
+            generation: self.layout_generation.get(),
+            view: self.view,
+            file: self.active_diff_path(),
+            region,
+        })
+    }
+
+    /// Open the in-place editor for a recognized double-click on a diff row (plan
+    /// §3.6): place the cursor on the clicked row (Review's single-click routing
+    /// already did; Status's did not), then run the view's comment action — which
+    /// adds on a code line, edits a human note, or flashes an agent note read-only,
+    /// exactly like the `c` key. A no-op in History (no cursor / no `hit_target`).
+    fn double_click_comment(&mut self, pos: Position) {
+        self.place_diff_cursor(pos);
+        match self.view {
+            ViewMode::Status => self.status_comment_action(),
+            ViewMode::Review => self.review_comment_action(),
+            ViewMode::History => {}
+        }
+    }
+
+    /// Focus the diff pane and move its cursor onto the clicked physical row, so
+    /// the editor anchors where the user double-clicked. A no-op for a click
+    /// outside the diff or past its last row (the cursor stays put).
+    fn place_diff_cursor(&mut self, pos: Position) {
+        self.focus_active_diff();
+        let Some(row) = self.diff_row_at(pos) else {
+            return;
+        };
+        if row < self.review_row_count() {
+            let target = self.review_target_at(row);
+            self.set_review_cursor(target);
+        }
     }
 
     /// Route a left-button press that isn't consumed by the editor: grab a split
@@ -2482,12 +2726,9 @@ impl App {
     /// only its anchor's column, so a click in the *other* column is outside (codex
     /// fix #4): the row's `side` bounds the horizontal hit-test.
     fn click_in_editor(&self, pos: Position) -> bool {
-        let diff = self.diff_area.get();
-        if !diff.contains(pos) {
+        let Some(row_idx) = self.diff_row_at(pos) else {
             return false;
-        }
-        let offset = self.diff_scroll.min(self.diff_max_scroll());
-        let row_idx = offset + (pos.y - diff.y) as usize;
+        };
         // Copy the row's target + side out so the layout borrow doesn't outlive it.
         let Some((target, side)) = self
             .diff_layout(self.diff_pane_width())
@@ -2499,16 +2740,9 @@ impl App {
         if target != RowTarget::Editor {
             return false;
         }
-        let rel_x = (pos.x - diff.x) as usize;
-        let (left_w, _) = sbs_columns(diff.width);
-        match side {
-            // Full-width (unified, or a full-width orphan block): any column hits.
-            None => true,
-            // The old column is `[0, left_w)`; the divider at `left_w` is neither.
-            Some(Side::Old) => rel_x < left_w,
-            // The new column starts just past the divider: `[left_w + 1, width)`.
-            Some(Side::New) => rel_x > left_w,
-        }
+        // In side-by-side the editor occupies only its anchor's column, so a click
+        // in the *other* column is outside it (codex fix #4).
+        self.in_side_column(pos, side)
     }
 
     /// Commit the editor for a click that landed outside it: save when the buffer
@@ -3384,6 +3618,11 @@ impl App {
             .is_none_or(|cached| cached.width != width || cached.mode != self.diff_mode);
         if stale {
             let rows = self.build_layout(width);
+            // Every actual rebuild bumps the layout generation, the double-click
+            // `HitTarget`'s `generation` field (plan §3.6): a resize, mode toggle,
+            // or comment mutation (via `invalidate_comment_rows` → `layout = None`)
+            // all funnel through here, so a relayout between two clicks is caught.
+            self.layout_generation.set(self.layout_generation.get() + 1);
             *self.layout.borrow_mut() = Some(CachedLayout {
                 width,
                 mode: self.diff_mode,
@@ -4020,6 +4259,9 @@ impl App {
             DiffMode::SideBySide => DiffMode::Unified,
         };
         self.diff_scroll = 0;
+        // A mode change relayouts the whole diff; drop any half-formed double-click
+        // so a click before it can't pair with one after (plan §3.6).
+        self.last_click = None;
         // The two modes have different row lists (a `Code` index means a
         // different physical row), so the cursor doesn't carry over — reset to
         // the top (plan §3.4).
@@ -4115,6 +4357,21 @@ fn is_review_scope(comment: &Comment, range_input: &str) -> bool {
 /// comments out of the status inbox.
 fn is_worktree_scope(comment: &Comment) -> bool {
     matches!(comment.scope, Scope::WorkTree)
+}
+
+/// Whether a left-click on `target` at `now` completes a double-click of the
+/// previous click `prev` (plan §3.6): `prev` exists, its [`HitTarget`] equals
+/// `target`, and the two fall within [`DOUBLE_CLICK_WINDOW`]. Pure and
+/// clock-injected (the caller passes `now`), so tests assert the timing boundary
+/// with explicit instants instead of sleeping. `saturating_duration_since` guards
+/// against a non-monotonic clock rather than panicking.
+fn is_double_click(prev: Option<&(Instant, HitTarget)>, now: Instant, target: &HitTarget) -> bool {
+    match prev {
+        Some((then, prev_target)) => {
+            prev_target == target && now.saturating_duration_since(*then) <= DOUBLE_CLICK_WINDOW
+        }
+        None => false,
+    }
 }
 
 /// The inbox + scope decisions [`App::authoring_identity`] captures once, at
