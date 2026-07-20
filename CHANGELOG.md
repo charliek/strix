@@ -8,6 +8,18 @@ Each release below is headed by a `## vX.Y.Z` entry added by
 `/release-workflows:release`; `release.yml` turns that section into the GitHub
 Release notes.
 
+## v0.0.4 — 2026-07-20
+
+Release-pipeline fix. **No functional changes to strix** — the binary is
+identical to v0.0.3.
+
+### CI
+- `finalize-release` now passes `-R "${GITHUB_REPOSITORY}"` to `gh release edit`.
+  The job has no checkout, so `gh` couldn't infer the repo (`fatal: not a git
+  repository`) and exited 1 — which skipped the Homebrew formula update and the
+  apt republish for v0.0.3. This release republishes both through the fixed
+  pipeline (the v0.0.3 GitHub release itself, with its assets, shipped fine).
+
 ## v0.0.3 — 2026-07-20
 
 The review-workflow track: strix becomes the review surface for agent-written
