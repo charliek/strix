@@ -1,5 +1,6 @@
 use std::cell::{Cell, Ref, RefCell};
 use std::collections::{BTreeMap, HashMap};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -143,33 +144,97 @@ impl Flash {
     }
 }
 
-/// A side-by-side row, referencing diff lines by index into the file's
-/// `Vec<DiffLine>`. Indices (not borrows) let the row layout be computed once
-/// per file and cached on `App` without a self-referential borrow. Comment rows
-/// carry the comment *id* (not a vec index), so a concurrent removal can't shift
-/// a row onto the wrong comment.
+/// Where a click on a physical [`LayoutRow`] lands. Recorded per row so a later
+/// commit (C8) can turn a click into an action without re-deriving geometry:
+/// `Code` is a code/hunk line; `Body(id)` is anywhere on comment `id`'s box;
+/// `Close(id)` is the box's `[x]` close cell — resolved by C8 against the finer
+/// [`DiffPaneState`] `x_rects` rect, since a whole-row `hit` can't split the
+/// title row's `[x]` from its text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HitRegion {
+    Code,
+    Close(u64),
+    Body(u64),
+}
+
+/// What a physical [`LayoutRow`] draws. Code rows carry diff-line indices (a
+/// unified line, a side-by-side hunk header, or a side-by-side pair); a comment
+/// box expands to several `Box` rows sharing one [`RowTarget`].
+pub enum RowContent {
+    /// A unified diff line (index into the file's `Vec<DiffLine>`).
+    Line(usize),
+    /// A side-by-side hunk header (index into `Vec<DiffLine>`), spanning both columns.
+    Hunk(usize),
+    /// A side-by-side pair of diff lines (either side may be blank).
+    Pair {
+        left: Option<usize>,
+        right: Option<usize>,
+    },
+    /// One physical row of a comment box.
+    Box(BoxRow),
+}
+
+/// The render payload for one physical row of a comment box: the comment id (for
+/// the `[x]` rect), whether the note has drifted (`stale` → a dim accent), and
+/// which part of the box this row draws. The `● you`/`⚠ orphan` marker lives in
+/// the pre-formatted title text, so it isn't repeated here.
+pub struct BoxRow {
+    pub id: u64,
+    pub stale: bool,
+    pub part: BoxPart,
+}
+
+/// Which physical part of a comment box a row draws.
+pub enum BoxPart {
+    /// The top border, carrying the title text (`● you — <file> R<line>`); the
+    /// renderer truncates it to the box width and appends the right-aligned `[x]`.
+    Title(String),
+    /// A body line, already word-wrapped to the box's inner width.
+    Body(String),
+    /// The bottom border.
+    Bottom,
+}
+
+/// One physical row of the diff pane's layout: the logical [`RowTarget`] it
+/// belongs to, its 0-based offset within that target (`subrow`), the side column
+/// a side-by-side box occupies (`None` for unified, full-width, and code rows),
+/// the click [`HitRegion`], and the render `content`. A code line is exactly one
+/// `LayoutRow`; a comment box is N rows sharing one `target`. The layout is
+/// cached width-keyed (see [`App::diff_layout`]), so a resize rebuilds it while
+/// preserving the logical targets.
+pub struct LayoutRow {
+    pub target: RowTarget,
+    pub subrow: u16,
+    pub side: Option<Side>,
+    pub hit: HitRegion,
+    pub content: RowContent,
+}
+
+/// The cached physical layout plus the `(width, mode)` it was built for, so a
+/// resize or a diff-mode toggle rebuilds it (the logical `RowTarget`s survive).
+struct CachedLayout {
+    width: u16,
+    mode: DiffMode,
+    rows: Vec<LayoutRow>,
+}
+
+/// How a comment box is placed when building its rows: full-width (unified, or an
+/// orphan block) at the given width, or into one side-by-side column (the side is
+/// taken from the comment's own anchor side).
 #[derive(Clone, Copy)]
-pub enum SbsRow {
+enum BoxPlacement {
+    Unified(usize),
+    Sbs { left_w: usize, right_w: usize },
+}
+
+/// A side-by-side code row before comment boxes are interleaved: a hunk header or
+/// a paired line (either side may be blank).
+enum SbsCode {
     Hunk(usize),
     Pair {
         left: Option<usize>,
         right: Option<usize>,
     },
-    /// A full-width review comment anchored below its line (spans both columns).
-    Comment(u64),
-    /// A full-width orphaned review comment, shown in the top-of-diff block.
-    Orphan(u64),
-}
-
-/// A unified-diff row: a diff line (by index), or a full-width review comment
-/// anchored below its line, or an orphaned comment in the top-of-diff block.
-/// Making unified row-driven (rather than a strict 1:1 lines→rows map) is what
-/// lets comments inject rows; metrics count rows, so scrolling reaches them.
-#[derive(Clone, Copy)]
-pub enum URow {
-    Line(usize),
-    Comment(u64),
-    Orphan(u64),
 }
 
 /// The *logical* selectable unit the diff cursor addresses, decoupled from the
@@ -208,32 +273,10 @@ struct DiffPaneState {
     /// commit doesn't reshape this struct.
     #[allow(dead_code)]
     editing: Option<CommentEdit>,
-}
-
-/// The logical target a unified row renders. The physical↔logical bridge for
-/// unified mode (see [`RowTarget`]).
-fn urow_target(row: &URow) -> RowTarget {
-    match *row {
-        URow::Line(li) => RowTarget::Code(li),
-        URow::Comment(id) => RowTarget::Comment(id),
-        URow::Orphan(id) => RowTarget::Orphan(id),
-    }
-}
-
-/// The logical target a side-by-side row renders. A `Pair` always has at least
-/// one side (`flush_pairs` never emits an empty pair), so its present side's
-/// line index is a stable per-row identity.
-fn sbs_target(row: &SbsRow) -> RowTarget {
-    match *row {
-        SbsRow::Hunk(i) => RowTarget::Code(i),
-        SbsRow::Pair { left, right } => RowTarget::Code(
-            right
-                .or(left)
-                .expect("a side-by-side pair always has a side"),
-        ),
-        SbsRow::Comment(id) => RowTarget::Comment(id),
-        SbsRow::Orphan(id) => RowTarget::Orphan(id),
-    }
+    /// The `[x]` close-cell rect of each visible comment box, recorded during
+    /// render (mirrors `App::divider_x`). Keyed by comment id. C8 hit-tests a
+    /// click against these to delete the note; C6 only records them.
+    x_rects: RefCell<HashMap<u64, Rect>>,
 }
 
 /// A comment's anchor, captured *by value* when the input modal opens so a
@@ -393,23 +436,25 @@ pub struct App {
     /// number gutter, SBS's per-column 5-char gutter). The sign column in
     /// unified mode is unaffected. Toggled with `n`; from `Config.line_numbers`.
     pub show_line_numbers: bool,
-    pub diff_scroll: u16,
-    /// Inner height + total content rows of the diff pane from the last render,
-    /// so scrolling can clamp to the content in either mode. Interior-mutable
-    /// because rendering takes `&App`.
+    /// The diff pane's scroll offset, in physical layout rows (a `usize` since a
+    /// few long comment boxes can push a diff past `u16::MAX` rows).
+    pub diff_scroll: usize,
+    /// Inner height (terminal rows, `u16`) and total physical content rows
+    /// (`usize`) of the diff pane from the last render, so scrolling can clamp to
+    /// the content in either mode. Interior-mutable because rendering takes `&App`.
     diff_viewport: Cell<u16>,
-    diff_content_rows: Cell<u16>,
+    diff_content_rows: Cell<usize>,
     /// Per-file caches that make scrolling cheap: syntax-highlighted lines keyed
-    /// by their (sanitised) text, and the side-by-side row layout. Both are
-    /// cleared whenever `sync_diff` recomputes `current_diff`, so they never
+    /// by their (sanitised) text, and the diff pane's physical row layout. Both
+    /// are cleared whenever `sync_diff` recomputes `current_diff`, so they never
     /// outlive the file they describe. Interior-mutable because rendering, which
     /// fills them, takes `&App`.
     highlight_cache: RefCell<HashMap<String, HighlightedLine>>,
-    sbs_rows: RefCell<Option<Vec<SbsRow>>>,
-    /// The unified row layout (diff lines interleaved with comment rows), cached
-    /// beside `sbs_rows` and invalidated at the same points plus on any comment
-    /// mutation. `None` until first built for the current diff.
-    unified_rows: RefCell<Option<Vec<URow>>>,
+    /// The diff pane's physical [`LayoutRow`] list (code rows interleaved with
+    /// multi-row comment boxes), rebuilt when the pane width or diff mode changes,
+    /// or on any comment/diff mutation. `None` until first built for the current
+    /// diff. This is the concrete backing store behind the C1 cursor seam.
+    layout: RefCell<Option<CachedLayout>>,
 
     /// The status view's worktree-comment inbox (the checked-out branch's
     /// `Scope::WorkTree` set) and its diff-pane cursor/editor. Status has no
@@ -553,8 +598,7 @@ impl App {
             diff_viewport: Cell::new(0),
             diff_content_rows: Cell::new(0),
             highlight_cache: RefCell::new(HashMap::new()),
-            sbs_rows: RefCell::new(None),
-            unified_rows: RefCell::new(None),
+            layout: RefCell::new(None),
             status_comments: Vec::new(),
             status_branch_key,
             status_pane: DiffPaneState::default(),
@@ -1050,14 +1094,24 @@ impl App {
 
     /// Move the diff cursor by `step` physical rows (clamped), then scroll the
     /// viewport so it stays visible ("act-and-reveal", plan §3.4). The cursor is
-    /// re-pinned to the [`RowTarget`] at the new physical row.
+    /// re-pinned to the [`RowTarget`] at the new physical row. A multi-row comment
+    /// box shares one target across N physical rows, so a downward step never
+    /// stalls inside the current box: it starts past the box's own last row, which
+    /// makes `j`/`k` cross a whole box in one step (plan §3.0).
     fn review_move_cursor(&mut self, down: bool, step: usize) {
         let count = self.review_row_count();
-        let current = self.review_cursor();
+        if count == 0 {
+            return;
+        }
+        let (start, end) = self
+            .review_cursor_span()
+            .map_or((0, 1), |span| (span.start, span.end));
         let next = if down {
-            (current + step).min(count.saturating_sub(1))
+            // `.max(end)` skips the rest of the current target's own rows, so a
+            // one-row step off a box lands on the next distinct target.
+            (start + step).max(end).min(count - 1)
         } else {
-            current.saturating_sub(step)
+            start.saturating_sub(step)
         };
         let target = self.review_target_at(next);
         self.set_review_cursor(target);
@@ -1074,34 +1128,43 @@ impl App {
         }
     }
 
-    /// Scroll the diff viewport so the cursor row is visible: no-op when it
-    /// already is, otherwise snap the top edge to bring it just into view.
+    /// Scroll the diff viewport so the cursor target is visible: no-op when it
+    /// already is, otherwise snap the top edge to bring it into view. The cursor
+    /// target may span several physical rows (a comment box), so this reveals the
+    /// whole `[start, end)` span — but a box taller than the viewport can't be
+    /// fully shown, so it top-aligns to the box's first row rather than looping
+    /// (plan §3.4).
     fn review_reveal_cursor(&mut self) {
         if self.active_pane().is_none() {
             return;
         }
-        let cursor = self.review_cursor();
         let viewport = self.diff_viewport.get() as usize;
         if viewport == 0 {
             return;
         }
+        let Some(span) = self.review_cursor_span() else {
+            return;
+        };
+        let (start, end) = (span.start, span.end);
         let count = self.review_row_count();
-        let top = self.diff_scroll as usize;
-        let new_top = if cursor < top {
-            cursor
-        } else if cursor >= top + viewport {
-            cursor + 1 - viewport
+        let top = self.diff_scroll;
+        let new_top = if start < top || end.saturating_sub(start) >= viewport {
+            // Above the viewport, or taller than it: top-align the box's first row.
+            start
+        } else if end > top + viewport {
+            // Below the viewport and it fits: pull the box's last row into view.
+            end - viewport
         } else {
             top
         };
         // Never scroll past the last full page of content.
         let max_top = count.saturating_sub(viewport);
-        self.diff_scroll = new_top.min(max_top).min(u16::MAX as usize) as u16;
+        self.diff_scroll = new_top.min(max_top);
     }
 
-    /// Whether the diff cursor row currently lies within the visible viewport,
-    /// tested against the same clamped offset the renderer paints with (so a
-    /// wheel scroll that pushed it offscreen reads as not-visible).
+    /// Whether the diff cursor target's first row lies within the visible
+    /// viewport, tested against the same clamped offset the renderer paints with
+    /// (so a wheel scroll that pushed it offscreen reads as not-visible).
     fn review_cursor_visible(&self) -> bool {
         if self.active_pane().is_none() {
             return false;
@@ -1111,7 +1174,7 @@ impl App {
         if viewport == 0 {
             return false;
         }
-        let top = self.diff_scroll.min(self.diff_max_scroll()) as usize;
+        let top = self.diff_scroll.min(self.diff_max_scroll());
         cursor >= top && cursor < top + viewport
     }
 
@@ -1128,59 +1191,52 @@ impl App {
         false
     }
 
-    /// The number of rows the active diff mode renders for the selected file: the
-    /// unified/side-by-side row list, or (for an empty/binary diff) the orphan
-    /// block that renders in its place. The cursor indexes into this list.
-    fn review_row_count(&self) -> usize {
-        match self.active_diff() {
-            Some(FileDiff::Text(lines)) if !lines.is_empty() => match self.diff_mode {
-                DiffMode::Unified => self.unified_rows(lines).len(),
-                DiffMode::SideBySide => self.sbs_rows(lines).len(),
-            },
-            // Empty/binary/no diff: the only selectable rows are orphan comments.
-            _ => self.selected_file_orphans().len(),
-        }
+    /// The pane inner width of the last render, the key the physical layout is
+    /// built for. The cursor seam reads it so an input event handled before the
+    /// next render sees the same width-keyed layout the last frame drew.
+    fn diff_pane_width(&self) -> u16 {
+        self.diff_area.get().width
     }
 
-    /// The logical [`RowTarget`] at physical row `index` in the active diff
-    /// mode's layout, or `None` when the row list is shorter. This is the
-    /// physical→logical half of the cursor seam; every cursor op reads through
-    /// it, so a later commit can map one target across several physical rows
-    /// (comment boxes) without changing cursor logic.
+    /// The number of physical rows the active diff renders for the selected file
+    /// (code rows plus every row of each comment box). The cursor indexes into
+    /// this count; scroll metrics count the same rows.
+    fn review_row_count(&self) -> usize {
+        self.diff_layout(self.diff_pane_width()).len()
+    }
+
+    /// The logical [`RowTarget`] at physical row `index` in the layout, or `None`
+    /// when the row list is shorter. The physical→logical half of the cursor
+    /// seam; every cursor op reads through it, so one target can span several
+    /// physical rows (a comment box) without changing cursor logic.
     fn review_target_at(&self, index: usize) -> Option<RowTarget> {
-        match self.active_diff() {
-            Some(FileDiff::Text(lines)) if !lines.is_empty() => match self.diff_mode {
-                DiffMode::Unified => self.unified_rows(lines).get(index).map(urow_target),
-                DiffMode::SideBySide => self.sbs_rows(lines).get(index).map(sbs_target),
-            },
-            // Empty/binary diff: every rendered row is an orphan comment.
-            _ => self
-                .selected_file_orphans()
-                .get(index)
-                .map(|&id| RowTarget::Orphan(id)),
-        }
+        self.diff_layout(self.diff_pane_width())
+            .get(index)
+            .map(|row| row.target)
     }
 
     /// The first physical row `target` occupies, or `None` when it isn't in the
     /// current layout (e.g. its comment was removed). The logical→physical half
     /// of the cursor seam.
     fn review_index_of(&self, target: RowTarget) -> Option<usize> {
-        match self.active_diff() {
-            Some(FileDiff::Text(lines)) if !lines.is_empty() => match self.diff_mode {
-                DiffMode::Unified => self
-                    .unified_rows(lines)
-                    .iter()
-                    .position(|row| urow_target(row) == target),
-                DiffMode::SideBySide => self
-                    .sbs_rows(lines)
-                    .iter()
-                    .position(|row| sbs_target(row) == target),
-            },
-            _ => self
-                .selected_file_orphans()
-                .iter()
-                .position(|&id| RowTarget::Orphan(id) == target),
-        }
+        self.diff_layout(self.diff_pane_width())
+            .iter()
+            .position(|row| row.target == target)
+    }
+
+    /// The `[start, end)` physical-row span of the cursor's target: its first row
+    /// through the last consecutive row that shares the target (a code line is one
+    /// row; a comment box is N). Drives the full-box cursor highlight, the reveal,
+    /// and the box-crossing move. `None` when nothing is selectable.
+    fn review_cursor_span(&self) -> Option<Range<usize>> {
+        let target = self.review_cursor_target()?;
+        let layout = self.diff_layout(self.diff_pane_width());
+        let start = layout.iter().position(|row| row.target == target)?;
+        let len = layout[start..]
+            .iter()
+            .take_while(|row| row.target == target)
+            .count();
+        Some(start..start + len)
     }
 
     /// The target the cursor rests on: the pinned one, or (when unset after a
@@ -1761,15 +1817,14 @@ impl App {
             .unwrap_or(0)
     }
 
-    /// The cursor row to highlight while rendering — `Some(idx)` only in the
-    /// review view with the diff pane focused (plan §3.4); `None` otherwise, so
-    /// the highlight never shows while the file list is focused. In C1 a target
-    /// spans one physical row, so a single index suffices.
-    pub fn review_cursor_highlight(&self) -> Option<usize> {
-        // Any cursor-bearing view (status or review) highlights its cursor row
-        // while its diff pane is focused; History has no cursor.
+    /// The `[start, end)` physical-row span to highlight while rendering — `Some`
+    /// only in a cursor-bearing view (status or review) with the diff pane focused
+    /// (plan §3.4); `None` otherwise, so the highlight never shows while the file
+    /// list is focused or in History. A comment box spans several rows, so the
+    /// whole box is highlighted, not just its first row.
+    pub fn review_cursor_highlight(&self) -> Option<Range<usize>> {
         if self.diff_focused() && self.active_pane().is_some() {
-            Some(self.review_cursor())
+            self.review_cursor_span()
         } else {
             None
         }
@@ -2132,7 +2187,7 @@ impl App {
             // Hit-test against the same clamped offset the renderer paints with
             // (diff_view.rs clamps to diff_max_scroll); a raw diff_scroll would
             // desync clicks after content shrank at max scroll (finding 5).
-            let offset = self.diff_scroll.min(self.diff_max_scroll()) as usize;
+            let offset = self.diff_scroll.min(self.diff_max_scroll());
             let row = offset + (pos.y - diff.y) as usize;
             let count = self.review_row_count();
             if row < count {
@@ -2242,7 +2297,9 @@ impl App {
     fn scroll_diff(&mut self, down: bool, step: u16) {
         // Clamp to the current content first: a same-file refresh may have shrunk
         // the diff below the preserved offset, and scrolling up must not stay
-        // stuck past the new end (metrics are fresh here, post-render).
+        // stuck past the new end (metrics are fresh here, post-render). The step is
+        // a small terminal-row count (`u16`); the offset it moves is a `usize`.
+        let step = step as usize;
         let max = self.diff_max_scroll();
         let current = self.diff_scroll.min(max);
         self.diff_scroll = if down {
@@ -2429,11 +2486,10 @@ impl App {
             // top (`None`), resolved to row 0 by the next render.
             self.status_pane.cursor = None;
         }
-        // The cached highlights / row layouts describe the previous diff; drop
+        // The cached highlights / row layout describe the previous diff; drop
         // them so the new one is recomputed lazily on next render.
         self.highlight_cache.borrow_mut().clear();
-        *self.sbs_rows.borrow_mut() = None;
-        *self.unified_rows.borrow_mut() = None;
+        *self.layout.borrow_mut() = None;
         // An in-place refresh may have shrunk the row list under a pinned cursor
         // (e.g. an edit removed lines); clamp it to the new layout. A fresh file
         // already reset the cursor above, so clamp only the same-file case.
@@ -2764,11 +2820,10 @@ impl App {
         }
     }
 
-    /// Drop the comment-bearing row caches so the next render rebuilds them (after
-    /// any comment mutation or reload).
+    /// Drop the physical row layout so the next render rebuilds it (after any
+    /// comment mutation or reload — a box appeared, vanished, or changed).
     fn invalidate_comment_rows(&self) {
-        *self.unified_rows.borrow_mut() = None;
-        *self.sbs_rows.borrow_mut() = None;
+        *self.layout.borrow_mut() = None;
     }
 
     /// A successful review refresh clears a lingering review failure flash, so a
@@ -2857,8 +2912,7 @@ impl App {
     fn reset_diff_view(&mut self) {
         self.diff_scroll = 0;
         self.highlight_cache.borrow_mut().clear();
-        *self.sbs_rows.borrow_mut() = None;
-        *self.unified_rows.borrow_mut() = None;
+        *self.layout.borrow_mut() = None;
     }
 
     /// Syntax-highlight one already-sanitised line, memoised per file so
@@ -2883,35 +2937,203 @@ impl App {
         computed
     }
 
-    /// The side-by-side row layout for the current diff, computed once per file
-    /// and cached. Rows reference `lines` by index; review comments inject
-    /// full-width rows below their anchor (and an orphan block at the top).
-    pub fn sbs_rows(&self, lines: &[DiffLine]) -> Ref<'_, Vec<SbsRow>> {
-        if self.sbs_rows.borrow().is_none() {
-            let (orphans, placements) = self.active_placements(lines);
-            *self.sbs_rows.borrow_mut() = Some(side_by_side_rows_with_comments(
-                lines,
-                &orphans,
-                &placements,
-            ));
+    /// The diff pane's physical [`LayoutRow`] list at pane width `width`, computed
+    /// once per `(diff, comments, mode, width)` and cached. Code lines map 1:1 to
+    /// rows; each comment box expands to several rows sharing one `RowTarget`. A
+    /// changed width or diff mode rebuilds it (preserving the logical targets).
+    /// This is the single backing store read by both the cursor seam and the
+    /// renderer.
+    pub fn diff_layout(&self, width: u16) -> Ref<'_, Vec<LayoutRow>> {
+        let stale = self
+            .layout
+            .borrow()
+            .as_ref()
+            .is_none_or(|cached| cached.width != width || cached.mode != self.diff_mode);
+        if stale {
+            let rows = self.build_layout(width);
+            *self.layout.borrow_mut() = Some(CachedLayout {
+                width,
+                mode: self.diff_mode,
+                rows,
+            });
         }
-        Ref::map(self.sbs_rows.borrow(), |cached| {
-            cached.as_ref().expect("filled above")
+        Ref::map(self.layout.borrow(), |cached| {
+            &cached.as_ref().expect("filled above").rows
         })
     }
 
-    /// The unified row layout for the current diff: diff lines interleaved with
-    /// comment rows (and a top orphan block), computed once per (diff, comments)
-    /// and cached beside `sbs_rows`.
-    pub fn unified_rows(&self, lines: &[DiffLine]) -> Ref<'_, Vec<URow>> {
-        if self.unified_rows.borrow().is_none() {
-            let (orphans, placements) = self.active_placements(lines);
-            *self.unified_rows.borrow_mut() =
-                Some(unified_rows_with_comments(lines, &orphans, &placements));
+    /// Build the physical layout for the active diff at pane width `width`: the
+    /// code rows for the current mode interleaved with comment boxes, or (for an
+    /// empty/binary/no diff) just the orphan boxes.
+    fn build_layout(&self, width: u16) -> Vec<LayoutRow> {
+        match self.active_diff() {
+            Some(FileDiff::Text(lines)) if !lines.is_empty() => {
+                let (orphans, placements) = self.active_placements(lines);
+                match self.diff_mode {
+                    DiffMode::Unified => {
+                        self.build_unified_layout(lines, &orphans, &placements, width)
+                    }
+                    DiffMode::SideBySide => {
+                        self.build_sbs_layout(lines, &orphans, &placements, width)
+                    }
+                }
+            }
+            // Empty/binary/no diff: the only selectable rows are orphan boxes,
+            // rendered full-width (there are no columns to anchor them into).
+            _ => {
+                let orphans = self.selected_file_orphans();
+                let mut rows = Vec::new();
+                for &id in &orphans {
+                    self.push_comment_box(
+                        &mut rows,
+                        id,
+                        true,
+                        BoxPlacement::Unified(width as usize),
+                    );
+                }
+                rows
+            }
         }
-        Ref::map(self.unified_rows.borrow(), |cached| {
-            cached.as_ref().expect("filled above")
-        })
+    }
+
+    /// The unified physical layout: an orphan block at the top, then each diff
+    /// line followed by any comment boxes anchored to it (full-width).
+    fn build_unified_layout(
+        &self,
+        lines: &[DiffLine],
+        orphans: &[u64],
+        placements: &BTreeMap<usize, Vec<u64>>,
+        width: u16,
+    ) -> Vec<LayoutRow> {
+        let place = BoxPlacement::Unified(width as usize);
+        let mut rows = Vec::with_capacity(lines.len() + orphans.len());
+        for &id in orphans {
+            self.push_comment_box(&mut rows, id, true, place);
+        }
+        for index in 0..lines.len() {
+            rows.push(LayoutRow {
+                target: RowTarget::Code(index),
+                subrow: 0,
+                side: None,
+                hit: HitRegion::Code,
+                content: RowContent::Line(index),
+            });
+            for &id in comments_after(placements, index) {
+                self.push_comment_box(&mut rows, id, false, place);
+            }
+        }
+        rows
+    }
+
+    /// The side-by-side physical layout: the orphan block, then paired code rows,
+    /// each followed by its comment boxes. A box occupies its comment's anchor-side
+    /// column (old for a deletion, new for an addition/context); the other column
+    /// renders as blank sibling rows so the two sides stay aligned (plan §3.4).
+    fn build_sbs_layout(
+        &self,
+        lines: &[DiffLine],
+        orphans: &[u64],
+        placements: &BTreeMap<usize, Vec<u64>>,
+        width: u16,
+    ) -> Vec<LayoutRow> {
+        let (left_w, right_w) = sbs_columns(width);
+        let place = BoxPlacement::Sbs { left_w, right_w };
+        let mut rows = Vec::new();
+        for &id in orphans {
+            // Orphan boxes have no live anchor side; keep them full-width at top.
+            self.push_comment_box(&mut rows, id, true, BoxPlacement::Unified(width as usize));
+        }
+        for row in side_by_side_rows(lines) {
+            match row {
+                SbsCode::Hunk(i) => rows.push(LayoutRow {
+                    target: RowTarget::Code(i),
+                    subrow: 0,
+                    side: None,
+                    hit: HitRegion::Code,
+                    content: RowContent::Hunk(i),
+                }),
+                SbsCode::Pair { left, right } => {
+                    let target = RowTarget::Code(
+                        right
+                            .or(left)
+                            .expect("a side-by-side pair always has a side"),
+                    );
+                    rows.push(LayoutRow {
+                        target,
+                        subrow: 0,
+                        side: None,
+                        hit: HitRegion::Code,
+                        content: RowContent::Pair { left, right },
+                    });
+                    // Old-side comments (on the left index) emit before new-side
+                    // (on the right), matching `ordered_comment_ids`. A context
+                    // Pair is one diff line on both sides (left == right), so emit
+                    // its comments once (they carry the new side themselves).
+                    if let Some(l) = left {
+                        for &id in comments_after(placements, l) {
+                            self.push_comment_box(&mut rows, id, false, place);
+                        }
+                    }
+                    if let Some(r) = right {
+                        if Some(r) != left {
+                            for &id in comments_after(placements, r) {
+                                self.push_comment_box(&mut rows, id, false, place);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        rows
+    }
+
+    /// Expand comment `id` into its physical box rows (title / wrapped body /
+    /// bottom border) and append them to `rows`, all sharing one `RowTarget`. In
+    /// side-by-side placement the box takes its own comment's anchor-side column;
+    /// the body is word-wrapped to the box's inner width now (the width is in the
+    /// cache key). A comment that vanished between placement and here is skipped.
+    fn push_comment_box(
+        &self,
+        rows: &mut Vec<LayoutRow>,
+        id: u64,
+        orphan: bool,
+        placement: BoxPlacement,
+    ) {
+        let Some(comment) = self.active_comment(id) else {
+            return;
+        };
+        let (side, box_w) = match placement {
+            BoxPlacement::Unified(w) => (None, w),
+            BoxPlacement::Sbs { left_w, right_w } => match comment.side {
+                Side::Old => (Some(Side::Old), left_w),
+                Side::New => (Some(Side::New), right_w),
+            },
+        };
+        let target = if orphan {
+            RowTarget::Orphan(id)
+        } else {
+            RowTarget::Comment(id)
+        };
+        let mut parts = vec![BoxPart::Title(box_title_text(&comment, orphan))];
+        parts.extend(
+            wrap_comment_body(&comment.text, box_body_width(box_w))
+                .into_iter()
+                .map(BoxPart::Body),
+        );
+        parts.push(BoxPart::Bottom);
+        for (subrow, part) in parts.into_iter().enumerate() {
+            rows.push(LayoutRow {
+                target,
+                subrow: subrow as u16,
+                side,
+                hit: HitRegion::Body(id),
+                content: RowContent::Box(BoxRow {
+                    id,
+                    stale: comment.stale,
+                    part,
+                }),
+            });
+        }
     }
 
     /// The comment placements for the diff being rendered: the orphaned ids (for
@@ -3206,17 +3428,34 @@ impl App {
 
     /// Largest valid diff scroll offset, from the last render's content rows
     /// and viewport height.
-    pub fn diff_max_scroll(&self) -> u16 {
+    pub fn diff_max_scroll(&self) -> usize {
         self.diff_content_rows
             .get()
-            .saturating_sub(self.diff_viewport.get())
+            .saturating_sub(self.diff_viewport.get() as usize)
     }
 
-    /// Record the diff pane's inner height and the total rows the current mode
-    /// renders (called while rendering), so scrolling clamps to the content.
-    pub fn set_diff_metrics(&self, viewport: u16, content_rows: u16) {
+    /// Record the diff pane's inner height (`viewport`, a terminal-row count) and
+    /// the total physical rows the current layout renders (called while
+    /// rendering), so scrolling clamps to the content.
+    pub fn set_diff_metrics(&self, viewport: u16, content_rows: usize) {
         self.diff_viewport.set(viewport);
         self.diff_content_rows.set(content_rows);
+    }
+
+    /// Record the `[x]` close-cell rects of the comment boxes drawn this frame, on
+    /// the active view's pane (Status or Review; History has no cursor pane, so a
+    /// no-op). C8 hit-tests a click against these to delete a note.
+    pub fn set_x_rects(&self, rects: HashMap<u64, Rect>) {
+        if let Some(pane) = self.active_pane() {
+            *pane.x_rects.borrow_mut() = rects;
+        }
+    }
+
+    /// The `[x]` close-cell rect of comment `id`'s box in the active pane, if it's
+    /// currently rendered. Recorded during render; consumed by C8's click routing.
+    pub fn comment_close_rect(&self, id: u64) -> Option<Rect> {
+        self.active_pane()
+            .and_then(|pane| pane.x_rects.borrow().get(&id).copied())
     }
 
     /// The persisted staging list state; rendering borrows it so the scroll
@@ -3271,10 +3510,10 @@ impl App {
     }
 
     /// Flip the line-number gutter on/off. The gutter width is computed fresh
-    /// each render from `show_line_numbers` (see `ui::diff_view`), and neither
-    /// render cache (`highlight_cache`, `sbs_rows`) stores a width — the cached
-    /// highlight spans cover the full line and are trimmed to width after the
-    /// cache lookup, and `sbs_rows` holds only layout indices — so no cache
+    /// each render from `show_line_numbers` (see `ui::diff_view`); the row
+    /// `layout` is keyed by pane width and mode, not the gutter (a comment box
+    /// spans the full pane / column regardless), and the `highlight_cache`'s spans
+    /// cover the full line and are trimmed to width after lookup — so no cache
     /// needs invalidating here.
     fn toggle_line_numbers(&mut self) {
         self.show_line_numbers = !self.show_line_numbers;
@@ -3602,68 +3841,121 @@ fn comments_after(placements: &BTreeMap<usize, Vec<u64>>, index: usize) -> &[u64
     placements.get(&index).map(Vec::as_slice).unwrap_or(&[])
 }
 
-/// The unified row layout: an `⚠ orphaned` block at the top, then each diff line
-/// followed by any comment rows anchored to it.
-fn unified_rows_with_comments(
-    lines: &[DiffLine],
-    orphans: &[u64],
-    placements: &BTreeMap<usize, Vec<u64>>,
-) -> Vec<URow> {
-    let mut rows = Vec::with_capacity(lines.len() + orphans.len());
-    rows.extend(orphans.iter().map(|&id| URow::Orphan(id)));
-    for index in 0..lines.len() {
-        rows.push(URow::Line(index));
-        rows.extend(
-            comments_after(placements, index)
-                .iter()
-                .map(|&id| URow::Comment(id)),
-        );
-    }
-    rows
+/// The left/right column widths for a side-by-side pane of inner width `width`:
+/// a one-cell centre divider between two roughly equal columns. Shared by the
+/// layout builder and the renderer so the two can't disagree on the split.
+pub(crate) fn sbs_columns(width: u16) -> (usize, usize) {
+    let w = width as usize;
+    let left = w.saturating_sub(1) / 2;
+    let right = w.saturating_sub(left + 1);
+    (left, right)
 }
 
-/// The side-by-side row layout with comments: the orphan block, then the paired
-/// rows, each followed by its old-side comments then new-side comments (a Pair
-/// can hold both a deletion and an addition), each side ordered by id.
-fn side_by_side_rows_with_comments(
-    lines: &[DiffLine],
-    orphans: &[u64],
-    placements: &BTreeMap<usize, Vec<u64>>,
-) -> Vec<SbsRow> {
-    let base = side_by_side_rows(lines);
-    let mut rows = Vec::with_capacity(base.len() + orphans.len());
-    rows.extend(orphans.iter().map(|&id| SbsRow::Orphan(id)));
-    for row in base {
-        rows.push(row);
-        if let SbsRow::Pair { left, right } = row {
-            if let Some(l) = left {
-                rows.extend(
-                    comments_after(placements, l)
-                        .iter()
-                        .map(|&id| SbsRow::Comment(id)),
-                );
-            }
-            // A context row is one diff line on both sides (left == right); emit
-            // its comments once. A deletion+addition Pair has distinct indices, so
-            // old-side (left) comments already emitted, then new-side (right).
-            if let Some(r) = right {
-                if Some(r) != left {
-                    rows.extend(
-                        comments_after(placements, r)
-                            .iter()
-                            .map(|&id| SbsRow::Comment(id)),
-                    );
+/// The title text for a comment box: `● you — <file> R<line>` (`⚠` and the last
+/// known file/line for an orphan). The renderer truncates it to the box width.
+fn box_title_text(comment: &Comment, orphan: bool) -> String {
+    let marker = if orphan { '⚠' } else { '●' };
+    let who = match comment.source {
+        Source::Human => "you",
+        Source::Agent => "agent",
+    };
+    format!("{marker} {who} — {} R{}", comment.file, comment.line)
+}
+
+/// The word-wrap width for a box's body: the box's total width less its two
+/// borders and a one-column pad on each side (`│ … │`), floored at 1.
+fn box_body_width(box_width: usize) -> usize {
+    box_width.saturating_sub(4).max(1)
+}
+
+/// Word-wrap comment `text` to `width` display columns (unicode/CJK-aware via
+/// `char_width`), honouring embedded newlines as hard breaks (CLI notes may be
+/// multi-line). Always returns at least one line, so an empty note still draws a
+/// body row inside its box.
+fn wrap_comment_body(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut out = Vec::new();
+    // Normalise line endings, then wrap each hard line as its own paragraph.
+    let normalised = text.replace("\r\n", "\n").replace('\r', "\n");
+    for paragraph in normalised.split('\n') {
+        wrap_paragraph(&sanitize_wrap(paragraph), width, &mut out);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+/// Greedily wrap one paragraph (no embedded newlines) into `out`, breaking at
+/// spaces and hard-splitting any single word longer than `width`.
+fn wrap_paragraph(text: &str, width: usize, out: &mut Vec<String>) {
+    let mut line = String::new();
+    let mut line_w = 0;
+    for word in text.split(' ') {
+        let mut word = word;
+        loop {
+            let word_w: usize = word.chars().map(crate::ui::char_width).sum();
+            let sep = usize::from(line_w > 0);
+            if line_w + sep + word_w <= width {
+                if sep == 1 {
+                    line.push(' ');
+                    line_w += 1;
                 }
+                line.push_str(word);
+                line_w += word_w;
+                break;
             }
+            if line_w > 0 {
+                // The word doesn't fit after the current line; flush and retry it
+                // on a fresh line.
+                out.push(std::mem::take(&mut line));
+                line_w = 0;
+                continue;
+            }
+            // The line is empty and the word still overflows: hard-split it.
+            let (head, rest) = split_at_width(word, width);
+            out.push(head.to_string());
+            word = rest;
         }
     }
-    rows
+    out.push(line);
 }
 
-/// Pair the unified diff lines into side-by-side rows (by index): context lines
-/// appear on both sides; a run of deletions is zipped against the following run
-/// of additions, padding the shorter side with blanks.
-fn side_by_side_rows(lines: &[DiffLine]) -> Vec<SbsRow> {
+/// Split `s` at the first char boundary whose prefix exceeds `width` display
+/// columns, returning `(prefix, rest)`. Always consumes at least one char, so a
+/// wide char in a one-column box can't loop forever.
+fn split_at_width(s: &str, width: usize) -> (&str, &str) {
+    let mut used = 0;
+    for (byte, ch) in s.char_indices() {
+        let w = crate::ui::char_width(ch);
+        if byte > 0 && used + w > width {
+            return (&s[..byte], &s[byte..]);
+        }
+        used += w;
+    }
+    (s, "")
+}
+
+/// Sanitize one line for wrapping: expand tabs to spaces and drop other control
+/// characters (so a note can't inject terminal escapes), mirroring the render
+/// pass's `sanitize`.
+fn sanitize_wrap(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '\t' => out.push_str("    "),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Pair the unified diff lines into side-by-side code rows (by index): context
+/// lines appear on both sides; a run of deletions is zipped against the following
+/// run of additions, padding the shorter side with blanks. Comment boxes are
+/// interleaved by [`App::build_sbs_layout`].
+fn side_by_side_rows(lines: &[DiffLine]) -> Vec<SbsCode> {
     let mut rows = Vec::new();
     let mut deletions: Vec<usize> = Vec::new();
     let mut additions: Vec<usize> = Vec::new();
@@ -3674,14 +3966,14 @@ fn side_by_side_rows(lines: &[DiffLine]) -> Vec<SbsRow> {
             LineKind::Addition => additions.push(i),
             LineKind::Context => {
                 flush_pairs(&mut rows, &mut deletions, &mut additions);
-                rows.push(SbsRow::Pair {
+                rows.push(SbsCode::Pair {
                     left: Some(i),
                     right: Some(i),
                 });
             }
             LineKind::Hunk => {
                 flush_pairs(&mut rows, &mut deletions, &mut additions);
-                rows.push(SbsRow::Hunk(i));
+                rows.push(SbsCode::Hunk(i));
             }
         }
     }
@@ -3689,9 +3981,9 @@ fn side_by_side_rows(lines: &[DiffLine]) -> Vec<SbsRow> {
     rows
 }
 
-fn flush_pairs(rows: &mut Vec<SbsRow>, deletions: &mut Vec<usize>, additions: &mut Vec<usize>) {
+fn flush_pairs(rows: &mut Vec<SbsCode>, deletions: &mut Vec<usize>, additions: &mut Vec<usize>) {
     for i in 0..deletions.len().max(additions.len()) {
-        rows.push(SbsRow::Pair {
+        rows.push(SbsCode::Pair {
             left: deletions.get(i).copied(),
             right: additions.get(i).copied(),
         });

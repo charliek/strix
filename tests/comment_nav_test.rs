@@ -207,8 +207,8 @@ fn far_cursor_move_reveals_the_row_act_and_reveal() {
     }
     assert!(app.diff_scroll > 0, "the viewport followed the cursor down");
     assert!(
-        dump(&app).contains("● you final note"),
-        "the cursor's row was revealed"
+        dump(&app).contains("final note"),
+        "the cursor's box body was revealed"
     );
 }
 
@@ -263,19 +263,19 @@ fn cursor_row_shows_selection_bg_only_when_the_diff_is_focused() {
     select_file(&mut app, "feature.txt");
     app.on_key(key('l')); // focus the diff
 
-    // Park the cursor on the comment row and find its screen row.
+    // Park the cursor on the comment box and find its body row's screen row.
     app.on_key(key(']'));
     let frame = dump(&app);
-    let row = row_of(&frame, "● you cursor mark");
+    let row = row_of(&frame, "cursor mark");
     assert!(
         row_has_bg(&app, row, sel_bg),
-        "the cursor row is painted with the selection background while focused:\n{frame}"
+        "the selected box's body row carries the selection background while focused:\n{frame}"
     );
 
     // Focus the file list: the cursor highlight must disappear from the diff.
     app.on_key(key('h'));
     let frame = dump(&app);
-    let row = row_of(&frame, "● you cursor mark");
+    let row = row_of(&frame, "cursor mark");
     assert!(
         !row_has_bg(&app, row, sel_bg),
         "no cursor highlight while the list is focused:\n{frame}"
@@ -554,7 +554,9 @@ fn clicking_a_diff_row_focuses_the_pane_and_moves_the_cursor() {
     app.on_key(key('l'));
     let frame = dump(&app);
 
-    let screen_row = row_of(&frame, "● you click target") as u16;
+    // Click a code row (the `+ feature` addition), where one physical row maps to
+    // one cursor position — a box body row would pin the cursor to the box's top.
+    let screen_row = row_of(&frame, "+ feature") as u16;
     let diff = app.diff_area();
     app.on_mouse(mouse(
         diff.x + 3,
@@ -566,9 +568,9 @@ fn clicking_a_diff_row_focuses_the_pane_and_moves_the_cursor() {
         !app.review_list_focused(),
         "the click focuses the diff pane"
     );
-    let expected = app.diff_scroll + (screen_row - diff.y);
+    let expected = app.diff_scroll + (screen_row - diff.y) as usize;
     assert_eq!(
-        app.review_cursor() as u16,
+        app.review_cursor(),
         expected,
         "the cursor jumps to the clicked row"
     );
@@ -624,7 +626,7 @@ fn a_click_after_content_shrinks_hits_the_visually_clicked_row() {
     ));
     let clamped = app.diff_scroll.min(app.diff_max_scroll());
     assert_eq!(
-        app.review_cursor() as u16,
+        app.review_cursor(),
         clamped,
         "the click hit the visually top row, not a phantom one row past it:\n{frame}"
     );
@@ -653,10 +655,7 @@ fn capital_x_reveals_an_offscreen_cursor_before_deleting() {
     for _ in 0..12 {
         app.on_mouse(mouse(diff.x + 2, diff.y + 1, MouseEventKind::ScrollDown));
     }
-    assert!(
-        app.diff_scroll as usize > cursor,
-        "the cursor scrolled offscreen"
-    );
+    assert!(app.diff_scroll > cursor, "the cursor scrolled offscreen");
     let before = store_text(repo.path());
 
     app.on_key(key('X'));
@@ -670,8 +669,8 @@ fn capital_x_reveals_an_offscreen_cursor_before_deleting() {
         "the store is untouched by the reveal"
     );
     assert!(
-        dump(&app).contains("● you topnote"),
-        "the cursor's row was scrolled into view"
+        dump(&app).contains("topnote"),
+        "the cursor's box body was scrolled into view"
     );
 
     app.on_key(key('X'));
@@ -778,7 +777,8 @@ fn cycle_visits_a_replaced_line_in_old_then_new_visual_order() {
     for expected in ["aaa", "bbb", "ccc", "aaa"] {
         app.on_key(key(']'));
         let frame = dump(&app);
-        let row = row_of(&frame, &format!("● you {expected}"));
+        // The cursor lands on the box; its body row (the note text) is highlighted.
+        let row = row_of(&frame, expected);
         assert!(
             row_has_bg(&app, row, sel_bg),
             "] placed the cursor on {expected} in visual order:\n{frame}"

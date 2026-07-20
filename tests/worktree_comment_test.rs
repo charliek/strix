@@ -179,12 +179,20 @@ fn c_in_bare_strix_leaves_a_worktree_comment() {
 
     let frame = dump(&app);
     assert!(
-        frame.contains("● you looks off"),
-        "the worktree comment renders:\n{frame}"
+        frame.contains("● you — new.txt R1"),
+        "the worktree comment box renders its title:\n{frame}"
+    );
+    assert!(
+        frame.contains("looks off"),
+        "the box body renders the note text:\n{frame}"
     );
     let content = row_of(&frame, "target line");
-    let note = row_of(&frame, "● you looks off");
-    assert_eq!(note, content + 1, "one row below its anchor:\n{frame}");
+    let title = row_of(&frame, "● you — new.txt R1");
+    assert_eq!(
+        title,
+        content + 1,
+        "the box opens one row below its anchor:\n{frame}"
+    );
 
     // Stored as a `WorkTree` comment stamped with the current HEAD baseline.
     let stored = worktree_comments(repo.path(), "main");

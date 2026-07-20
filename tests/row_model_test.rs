@@ -227,7 +227,7 @@ fn a_wheel_scroll_leaves_the_cursor_target_then_a_move_reveals_it() {
         app.on_mouse(mouse(diff.x + 2, diff.y + 1, MouseEventKind::ScrollDown));
     }
     assert!(
-        app.diff_scroll as usize > cursor,
+        app.diff_scroll > cursor,
         "the wheel pushed the cursor offscreen"
     );
     assert_eq!(
@@ -240,7 +240,7 @@ fn a_wheel_scroll_leaves_the_cursor_target_then_a_move_reveals_it() {
     app.on_key(key('j'));
     assert_eq!(app.review_cursor(), 2, "the move advanced the cursor");
     assert!(
-        (app.diff_scroll as usize) <= app.review_cursor(),
+        app.diff_scroll <= app.review_cursor(),
         "the move scrolled the cursor's row back into view"
     );
 }

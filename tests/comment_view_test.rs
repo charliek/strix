@@ -135,18 +135,26 @@ fn unified_comment_renders_one_row_below_its_anchor() {
     select_file(&mut app, "feature.txt");
 
     let frame = dump(&app);
+    // The box: a titled top border, then the word-wrapped body.
     assert!(
-        frame.contains("● you looks good"),
-        "comment row renders:\n{frame}"
+        frame.contains("● you — feature.txt R1"),
+        "the box title names the author + anchor:\n{frame}"
     );
-    // The anchored content line (the `+ feature` addition) is directly above.
+    assert!(
+        frame.contains("looks good"),
+        "the box body renders the note text:\n{frame}"
+    );
+    // The box's title row sits directly below the anchored `+ feature` line, with
+    // the body on the next row.
     let content = row_of(&frame, "+ feature");
-    let note = row_of(&frame, "● you looks good");
+    let title = row_of(&frame, "● you — feature.txt R1");
+    let body = row_of(&frame, "looks good");
     assert_eq!(
-        note,
+        title,
         content + 1,
-        "comment sits one row below its anchor:\n{frame}"
+        "the box opens one row below its anchor:\n{frame}"
     );
+    assert_eq!(body, content + 2, "the body follows the title:\n{frame}");
 }
 
 #[test]
@@ -163,7 +171,9 @@ fn agent_comment_labels_the_source() {
     );
     let mut app = App::for_review(repo.path().to_path_buf(), &Config::default(), "main").unwrap();
     select_file(&mut app, "feature.txt");
-    assert!(dump(&app).contains("● agent auto note"));
+    let frame = dump(&app);
+    assert!(frame.contains("● agent — feature.txt R1"), "{frame}");
+    assert!(frame.contains("auto note"), "{frame}");
 }
 
 /// A modified line yields a deletion+addition Pair in side-by-side; comments on
@@ -205,11 +215,11 @@ fn sbs_pair_emits_old_side_comment_before_new_side() {
     assert!(!app.review_comment(2).unwrap().orphaned);
     app.on_key(key('d')); // switch to side-by-side
     let frame = dump(&app);
-    let old = row_of(&frame, "● you on old");
-    let new = row_of(&frame, "● you on new");
+    let old = row_of(&frame, "on old");
+    let new = row_of(&frame, "on new");
     assert!(
         old < new,
-        "old-side comment emits before new-side:\n{frame}"
+        "old-side comment box emits before new-side:\n{frame}"
     );
 }
 
@@ -237,14 +247,14 @@ fn orphan_block_renders_at_the_top_of_the_diff() {
     select_file(&mut app, "feature.txt");
     let frame = dump(&app);
     assert!(
-        frame.contains("⚠ you stale note"),
-        "orphan row renders:\n{frame}"
+        frame.contains("⚠ you — feature.txt R99") && frame.contains("stale note"),
+        "orphan box renders (title + body):\n{frame}"
     );
-    let orphan = row_of(&frame, "⚠ you stale note");
-    let live = row_of(&frame, "● you live note");
+    let orphan = row_of(&frame, "stale note");
+    let live = row_of(&frame, "live note");
     assert!(
         orphan < live,
-        "orphan block sits above the anchored rows:\n{frame}"
+        "the orphan block sits above the anchored box:\n{frame}"
     );
 }
 
@@ -342,8 +352,8 @@ fn binary_file_orphan_shows_in_its_block_not_the_footer() {
     select_file(&mut app, "blob.bin");
     let frame = dump(&app);
     assert!(
-        frame.contains("⚠ you on a binary"),
-        "the binary file's orphan renders in its block:\n{frame}"
+        frame.contains("on a binary"),
+        "the binary file's orphan box renders in its block:\n{frame}"
     );
     assert!(
         !frame.contains("orphaned — strix comment list"),
@@ -394,8 +404,8 @@ fn empty_diff_orphan_shows_in_its_block_not_the_footer() {
     select_file(&mut app, "renamed.txt");
     let frame = dump(&app);
     assert!(
-        frame.contains("⚠ you on a rename"),
-        "the empty-diff file's orphan renders in its block:\n{frame}"
+        frame.contains("on a rename"),
+        "the empty-diff file's orphan box renders in its block:\n{frame}"
     );
 }
 
@@ -439,8 +449,8 @@ fn scroll_to_bottom_reaches_a_comment_below_the_last_line() {
     app.on_key(key('G')); // scroll to the bottom
     let frame = dump(&app);
     assert!(
-        frame.contains("● you final note"),
-        "the metrics fix makes the injected last row reachable:\n{frame}"
+        frame.contains("final note"),
+        "the metrics fix makes the injected box reachable:\n{frame}"
     );
 }
 
@@ -503,8 +513,8 @@ fn a_commit_that_edits_the_anchor_line_orphans_it() {
     );
     select_file(&mut app, "feature.txt");
     assert!(
-        dump(&app).contains("⚠ you feature"),
-        "renders in the orphan block"
+        dump(&app).contains("⚠ you — feature.txt"),
+        "renders as an orphan box"
     );
 }
 
@@ -771,7 +781,7 @@ fn checkout_off_the_reviewed_head_disables_authoring() {
         "authoring on: comment loads"
     );
     select_file(&mut app, "feature.txt");
-    assert!(dump(&app).contains("● you feature"));
+    assert!(dump(&app).contains("● you — feature.txt"));
 
     // Move HEAD off the reviewed head (`feature`).
     git(repo.path(), &["checkout", "-q", "main"]);
@@ -783,7 +793,7 @@ fn checkout_off_the_reviewed_head_disables_authoring() {
     );
     let frame = dump(&app);
     assert!(
-        !frame.contains("● you feature"),
-        "no comment rows render once authoring is off:\n{frame}"
+        !frame.contains("● you — feature.txt"),
+        "no comment boxes render once authoring is off:\n{frame}"
     );
 }
