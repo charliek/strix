@@ -1,7 +1,8 @@
-//! Header menu bar scaffold (issue #5, C3): the `View`/`Theme` labels render at
-//! deterministic columns right after the brand, `m` toggles them without
-//! shifting the body, and a narrow terminal keeps the labels while dropping the
-//! branch. Dropdowns / mouse / keyboard nav are C4 and not exercised here.
+//! Header menu bar tests (issue #5). C3 scaffold: the `View`/`Theme` labels
+//! render at deterministic columns right after the brand, `m` toggles them
+//! without shifting the body, and a narrow terminal keeps the labels while
+//! dropping the branch. C4 dropdowns: open-state, rendering, mouse, and keyboard
+//! navigation/activation are exercised in the section below.
 
 mod common;
 
@@ -562,6 +563,9 @@ fn a_click_in_a_stale_dropdown_box_is_consumed_not_routed() {
     assert_eq!(app.open_menu.map(|o| o.menu), Some(MenuId::Theme));
 
     // The recorded (still-drawn) dropdown is View; a click inside it is consumed.
+    // (12, 3) is the "Side by side" row of the *View* box, so a bug that resolved
+    // the click against the mismatched open menu would flip diff_mode.
+    let theme_before = app.theme_name.clone();
     click(&mut app, 12, 3);
     assert!(
         app.open_menu.is_none(),
@@ -572,4 +576,10 @@ fn a_click_in_a_stale_dropdown_box_is_consumed_not_routed() {
         Focus::Diff,
         "the staging pane under the stale box was not actioned"
     );
+    assert_eq!(
+        app.diff_mode,
+        DiffMode::Unified,
+        "no command fired against the mismatched menu/rect"
+    );
+    assert_eq!(app.theme_name, theme_before, "theme unchanged");
 }

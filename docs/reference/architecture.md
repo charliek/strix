@@ -355,12 +355,16 @@ unconditionally.
 ## Menu bar
 
 The `View`/`Theme` labels live inside the existing one-row header, not a new
-row — `ui/menu.rs` is a pure geometry/label module (`header_menu_layout`
+row — `ui/menu.rs` holds the geometry/label helpers (`header_menu_layout`
 lays the two labels left-to-right from a given start column; the dropdown
 renderer draws the open box over `Clear`), shared by two consumers: the
 header draw always paints the labels when `App::show_menu_bar` is set, and,
 when a menu is open, the same layout function's rects are recorded so a
-click can be matched back to a label. `App::open_menu: Option<OpenMenu>`
+click can be matched back to a label. Like the rest of the UI, the render
+pass is a pure function of `App`'s *logical* state and records only mouse
+hit-rects back onto `App` through interior-mutability setters (`Cell`/
+`RefCell`) — the same recorded-rect pattern the staging area, the split
+divider, and the comment-box `[x]` cells already use. `App::open_menu: Option<OpenMenu>`
 (`MenuId` — `View` or `Theme` — plus a highlighted-item index) is the only
 open/closed state; `App::menu_items(MenuId)` builds each dropdown's rows
 fresh on every call (radio/check markers reflecting current state, e.g. the
