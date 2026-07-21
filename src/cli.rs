@@ -38,14 +38,18 @@ pub struct Cli {
 /// subcommand is a distinct entry point (the review-workflow track adds more).
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Review a branch range (a base…head diff), GitHub-PR style.
+    /// Review a branch range (a base…head diff), GitHub-PR style — or, with no
+    /// RANGE, open the working-tree Status surface.
     ///
     /// RANGE is `BASE` (⇒ merge-base(BASE, HEAD)..HEAD), `A...B`
     /// (⇒ merge-base(A, B)..B), or `A..B` (a direct comparison). An empty side
-    /// means HEAD (`main..` ≡ `main..HEAD`).
+    /// means HEAD (`main..` ≡ `main..HEAD`). Bare `strix diff` (no positionals)
+    /// opens Status instead of a review. A lone positional is always taken as
+    /// RANGE (`strix diff main` reviews `main`) — there is no path-only
+    /// `strix diff PATH` form; use bare `strix PATH` for that.
     Diff {
-        /// The range to review.
-        range: String,
+        /// The range to review; omit to open the working-tree Status surface.
+        range: Option<String>,
         /// Path to the git repository (defaults to the current directory).
         path: Option<PathBuf>,
     },
@@ -186,7 +190,7 @@ impl Cli {
     /// positional.
     pub fn target(&self) -> (Option<PathBuf>, Option<String>) {
         match &self.command {
-            Some(Command::Diff { range, path }) => (path.clone(), Some(range.clone())),
+            Some(Command::Diff { range, path }) => (path.clone(), range.clone()),
             Some(Command::Comment { path, .. }) => (path.clone(), None),
             Some(Command::Skill { .. }) => (None, None),
             None => (self.path.clone(), None),
