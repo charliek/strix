@@ -169,8 +169,8 @@ fn good_range_dump_frame_succeeds() {
 
 // `run_bin` always appends `dir` as a trailing positional, which — now that
 // RANGE is optional — would bind to RANGE and exercise range resolution, not
-// Status. These two tests build the process directly, with no trailing
-// positional, so `--current-dir` is the only way the repo path is conveyed.
+// Status. These two tests build the process directly with no trailing
+// positional, conveying the repo path via the process working directory.
 
 #[test]
 fn bare_diff_dump_frame_opens_status() {
@@ -185,11 +185,10 @@ fn bare_diff_dump_frame_opens_status() {
         "bare `diff` (no RANGE) should render a frame: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // The Status empty-state hint is unique to the staging view (Review's is
+    // "No differences in range"); it, not the presence/absence of a generic
+    // truncation ellipsis, is the reliable Status oracle.
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        !stdout.contains("…"),
-        "a Status frame carries no review range label: {stdout}"
-    );
     assert!(
         stdout.contains("working tree clean"),
         "a clean repo's Status frame shows the clean-working-tree hint: {stdout}"
