@@ -8,6 +8,31 @@ Each release below is headed by a `## vX.Y.Z` entry added by
 `/release-workflows:release`; `release.yml` turns that section into the GitHub
 Release notes.
 
+## v0.0.5 — 2026-07-21
+
+Milestone 9 — the top menu bar (completing the hunk-inspired review track) plus a
+polish batch. Merged via #12.
+
+### Added
+- **Top menu bar** — a mouse-first menu bar integrated into the header with two
+  dropdowns: **View** (unified / side-by-side, line numbers, Status / History)
+  and **Theme** (pick from the available themes). Click a title to open; navigate
+  an open menu with the arrows / Tab / Enter / Esc. Visible by default
+  (`menu_bar = false` disables it), toggled with `m` (the remappable
+  `toggle-menu-bar` action); menu changes persist to `config.toml`.
+- **Native Shift+Enter** in the comment editor — strix now enables a terminal
+  keyboard-enhancement protocol, so Shift+Enter inserts a newline on terminals
+  that support it (Ctrl-J and Alt+Enter remain as fallbacks).
+- **Side-by-side gutter tint** — in split view the empty column opposite a *pure*
+  addition / deletion is now shaded (dim green / dim red) instead of flat
+  background, so the changed region reads as anchored. New themable `add_gutter` /
+  `del_gutter` colours (all presets + custom themes; unset inherits the preset).
+
+### Changed
+- **`strix diff` with no range** now opens the working-tree Status surface (the
+  same view as bare `strix`). `strix diff <range> [path]` is unchanged; a lone
+  positional is still always a range.
+
 ## v0.0.4 — 2026-07-20
 
 Release-pipeline fix. **No functional changes to strix** — the binary is
