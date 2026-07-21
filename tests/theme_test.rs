@@ -97,6 +97,55 @@ fn a_custom_theme_can_override_the_emphasis_colours() {
     assert_eq!(theme.del_emph, Color::Rgb(255, 0, 0));
 }
 
+// --- side-by-side empty-column filler shading colours (plan §3.2, C1) ---
+
+#[test]
+fn every_preset_sets_a_distinct_gutter_colour() {
+    for name in Theme::PRESETS {
+        let theme = Theme::preset(name).unwrap();
+        assert_ne!(
+            theme.add_gutter, theme.add_bg,
+            "{name}: add_gutter should read distinctly from the flat add_bg wash"
+        );
+        assert_ne!(
+            theme.add_gutter, theme.bg,
+            "{name}: add_gutter should read distinctly from the base bg"
+        );
+        assert_ne!(
+            theme.del_gutter, theme.del_bg,
+            "{name}: del_gutter should read distinctly from the flat del_bg wash"
+        );
+        assert_ne!(
+            theme.del_gutter, theme.bg,
+            "{name}: del_gutter should read distinctly from the base bg"
+        );
+    }
+}
+
+#[test]
+fn a_custom_theme_without_gutter_colours_falls_back_to_the_base_preset() {
+    // `mine` overrides an unrelated colour but not add_gutter/del_gutter, so an
+    // existing user theme file predating this field is unaffected (plan §3.2).
+    let dir = config_with_themes(&[("mine", "base = \"gruvbox\"\n[colors]\nadd = \"#00ff00\"\n")]);
+
+    let theme = Theme::resolve("mine", Some(dir.path())).1;
+    let gruvbox = Theme::preset("gruvbox").unwrap();
+    assert_eq!(theme.add_gutter, gruvbox.add_gutter);
+    assert_eq!(theme.del_gutter, gruvbox.del_gutter);
+}
+
+#[test]
+fn a_custom_theme_can_override_the_gutter_colours() {
+    let dir = config_with_themes(&[(
+        "mine",
+        "base = \"gruvbox\"\n[colors]\nadd_gutter = \"#00ff00\"\ndel_gutter = \"#ff0000\"\n",
+    )]);
+
+    let theme = Theme::resolve("mine", Some(dir.path())).1;
+    assert_eq!(theme.add_gutter, Color::Rgb(0, 255, 0));
+    assert_eq!(theme.del_gutter, Color::Rgb(255, 0, 0));
+}
+
 // --- resolve: canonical name reporting (§3.5) ---
 
 #[test]

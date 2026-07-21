@@ -33,11 +33,18 @@ pub struct Theme {
     /// §3.7) — brighter/more saturated than `add_bg`'s flat wash, so an edited
     /// substring reads distinctly instead of blending into the whole line.
     pub add_emph: Color,
+    /// Side-by-side filler for the empty old column opposite a pure addition
+    /// (plan §3.2) — a dim green tint between `bg` and `add_bg`, so the change
+    /// reads as anchored instead of the empty side looking like flat background.
+    pub add_gutter: Color,
     pub del: Color,
     pub del_bg: Color,
     /// Side-by-side word-diff emphasis for a changed span on the old side (plan
     /// §3.7); the `del_bg` counterpart to `add_emph`.
     pub del_emph: Color,
+    /// Side-by-side filler for the empty new column opposite a pure deletion
+    /// (plan §3.2); the `del_bg` counterpart to `add_gutter`.
+    pub del_gutter: Color,
     pub hunk: Color,
     pub line_no: Color,
     /// Accent for review comments (the `● you`/`● agent` rows and the file-list
@@ -200,9 +207,11 @@ impl Theme {
             add: rgb(158, 206, 106),
             add_bg: rgb(32, 44, 38),
             add_emph: rgb(46, 92, 58),
+            add_gutter: rgb(26, 36, 31),
             del: rgb(247, 118, 142),
             del_bg: rgb(49, 32, 39),
             del_emph: rgb(100, 42, 60),
+            del_gutter: rgb(40, 28, 33),
             hunk: rgb(125, 207, 255),
             line_no: rgb(60, 67, 99),
             comment: rgb(187, 154, 247),
@@ -239,9 +248,11 @@ impl Theme {
             add: rgb(135, 175, 95),
             add_bg: rgb(31, 42, 31),
             add_emph: rgb(48, 84, 42),
+            add_gutter: rgb(25, 35, 25),
             del: rgb(215, 95, 95),
             del_bg: rgb(42, 31, 31),
             del_emph: rgb(84, 42, 42),
+            del_gutter: rgb(35, 26, 26),
             hunk: rgb(95, 175, 215),
             line_no: rgb(88, 88, 88),
             comment: rgb(175, 135, 215),
@@ -278,9 +289,11 @@ impl Theme {
             add: rgb(80, 161, 79),
             add_bg: rgb(230, 255, 237),
             add_emph: rgb(169, 235, 180),
+            add_gutter: rgb(240, 250, 242),
             del: rgb(228, 86, 73),
             del_bg: rgb(255, 238, 240),
             del_emph: rgb(250, 189, 192),
+            del_gutter: rgb(252, 244, 245),
             hunk: rgb(1, 132, 188),
             line_no: rgb(192, 192, 192),
             comment: rgb(166, 38, 164),
@@ -317,9 +330,11 @@ impl Theme {
             add: rgb(166, 227, 161),
             add_bg: rgb(35, 44, 41),
             add_emph: rgb(48, 84, 63),
+            add_gutter: rgb(30, 38, 35),
             del: rgb(243, 139, 168),
             del_bg: rgb(48, 35, 43),
             del_emph: rgb(94, 48, 70),
+            del_gutter: rgb(41, 30, 37),
             hunk: rgb(137, 220, 235),
             line_no: rgb(69, 71, 90),
             comment: rgb(203, 166, 247),
@@ -356,9 +371,11 @@ impl Theme {
             add: rgb(184, 187, 38),
             add_bg: rgb(50, 54, 31),
             add_emph: rgb(86, 90, 40),
+            add_gutter: rgb(43, 46, 28),
             del: rgb(251, 73, 52),
             del_bg: rgb(58, 36, 32),
             del_emph: rgb(100, 46, 38),
+            del_gutter: rgb(49, 32, 29),
             hunk: rgb(131, 165, 152),
             line_no: rgb(80, 73, 69),
             comment: rgb(211, 134, 155),
@@ -450,9 +467,14 @@ struct ColorsFile {
     /// Unset falls back to the base preset's `add_emph` (plan §3.7) — an
     /// existing user theme file predating this field is unaffected.
     add_emph: Option<String>,
+    /// Unset falls back to the base preset's `add_gutter` (plan §3.2) — an
+    /// existing user theme file predating this field is unaffected.
+    add_gutter: Option<String>,
     del: Option<String>,
     del_bg: Option<String>,
     del_emph: Option<String>,
+    /// Unset falls back to the base preset's `del_gutter` (plan §3.2).
+    del_gutter: Option<String>,
     hunk: Option<String>,
     line_no: Option<String>,
     comment: Option<String>,
@@ -487,9 +509,11 @@ impl ColorsFile {
         set(&self.add, &mut theme.add);
         set(&self.add_bg, &mut theme.add_bg);
         set(&self.add_emph, &mut theme.add_emph);
+        set(&self.add_gutter, &mut theme.add_gutter);
         set(&self.del, &mut theme.del);
         set(&self.del_bg, &mut theme.del_bg);
         set(&self.del_emph, &mut theme.del_emph);
+        set(&self.del_gutter, &mut theme.del_gutter);
         set(&self.hunk, &mut theme.hunk);
         set(&self.line_no, &mut theme.line_no);
         set(&self.comment, &mut theme.comment);
