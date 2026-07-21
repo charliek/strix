@@ -46,8 +46,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     render_footer(frame, footer, app);
 
-    // Overlays draw last, on top of everything.
+    // Overlays draw last, on top of everything. Menus and modals are mutually
+    // exclusive (a modal captures input; opening a menu is mouse-only and mouse
+    // is ignored while a modal is open), so their draw order is immaterial.
     modal::render(frame, app);
+    menu::render_dropdown(frame, app);
 }
 
 /// The status view's body: the Changes panel (fixed width) beside the diff, or
@@ -148,6 +151,9 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     if app.show_menu_bar {
         render_header_with_menu(frame, area, app);
     } else {
+        // Clear any stale title rects so a click can't match a label that is no
+        // longer drawn (mirrors `set_staging_area(Rect::default())`).
+        app.set_menu_title_rects(Vec::new());
         render_header_plain(frame, area, app);
     }
 }
@@ -188,17 +194,29 @@ fn render_header_with_menu(frame: &mut Frame, area: Rect, app: &App) {
     // intersection with `area`), and context + branch are dropped.
     let label_start = area.x.saturating_add(brand_w);
     let labels_w = menu::menus_width();
-    let label_style = Style::new().fg(theme.title);
+    // The open menu's title is highlighted (selection colours) so it reads as
+    // active while its dropdown is showing; the rest use the plain title accent.
+    let open = app.open_menu.map(|o| o.menu);
+    let mut title_rects = Vec::new();
     for (id, rect) in menu::header_menu_layout(label_start, area.y) {
         let cell = rect.intersection(area);
         if cell.width == 0 {
             continue;
         }
+        let style = if open == Some(id) {
+            Style::new().bg(theme.selection_bg).fg(theme.selection_fg)
+        } else {
+            Style::new().fg(theme.title)
+        };
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(menu::menu_cell(id), label_style))),
+            Paragraph::new(Line::from(Span::styled(menu::menu_cell(id), style))),
             cell,
         );
+        // Record the actually-drawn (clamped) cell, so even a clipped label on a
+        // pathologically narrow terminal still hit-tests where it is visible.
+        title_rects.push((id, cell));
     }
+    app.set_menu_title_rects(title_rects);
 
     let labels_end = label_start.saturating_add(labels_w);
     if labels_end >= area.right() {
@@ -552,8 +570,15 @@ mod tests {
         // not be dropped silently — a single ellipsis marks the truncation.
         let out = fit_spans(vec![Span::raw("abcdefghij"), Span::raw(" · history")], 10);
         let text = joined(&out);
-        assert!(text.ends_with('…'), "want a trailing ellipsis, got {text:?}");
-        assert_eq!(text.chars().filter(|&c| c == '…').count(), 1, "one ellipsis");
+        assert!(
+            text.ends_with('…'),
+            "want a trailing ellipsis, got {text:?}"
+        );
+        assert_eq!(
+            text.chars().filter(|&c| c == '…').count(),
+            1,
+            "one ellipsis"
+        );
         assert!(text_width(&text) <= 10, "width {} > 10", text_width(&text));
     }
 }

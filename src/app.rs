@@ -98,12 +98,74 @@ pub enum ViewMode {
 }
 
 /// A top-level menu in the header menu bar. Enumerated by the header renderer
-/// (`ui::menu`) to draw the `View` / `Theme` labels; C4's dropdown open-state
+/// (`ui::menu`) to draw the `View` / `Theme` labels; the dropdown open-state
 /// reuses it as the menu identifier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum MenuId {
+pub enum MenuId {
     View,
     Theme,
+}
+
+/// The open dropdown menu, if any. `item` indexes the **full** row list from
+/// [`App::menu_items`] — separators included — so Up/Down skip separators while
+/// clicks resolve by rect.
+///
+/// Invariant: `open_menu` and [`App::editing`] are mutually exclusive. The key
+/// ladder routes to at most one (modal → editing → menu → keymap), and a mouse
+/// open commits any editor first, so the two states never coexist.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpenMenu {
+    pub menu: MenuId,
+    pub item: usize,
+}
+
+/// One row of a dropdown, built live from state so its marker reflects the
+/// current setting. A `Separator` is a dim rule; an `Item` is an activatable row.
+pub(crate) enum MenuRow {
+    Separator,
+    Item {
+        label: String,
+        marker: Marker,
+        hint: Option<&'static str>,
+        command: MenuCommand,
+    },
+}
+
+/// A row's left-gutter marker: a radio (single-choice group) or a checkbox
+/// (toggle), each rendered in a fixed-width cell so the labels align.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Marker {
+    Radio(bool),
+    Check(bool),
+}
+
+/// What activating a dropdown row does. Resolved by [`App::activate_command`],
+/// which reuses the same mutate+persist pairs as the keyboard actions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MenuCommand {
+    SetDiffMode(DiffMode),
+    SetLineNumbers(bool),
+    GoHome,
+    EnterHistory,
+    SetTheme(String),
+}
+
+/// The recorded hit-map for the open dropdown, mirroring the `x_rects`
+/// interior-mutability pattern: the whole box's `bounds` plus one entry per
+/// **visible** row. Re-recorded every render and cleared to `None` when no menu
+/// is open, so a stale frame can't match a click.
+pub(crate) struct DropdownHit {
+    /// The menu this hit-map was recorded for; validated against `open_menu`
+    /// before a click acts (defensive against a stale frame).
+    pub menu: MenuId,
+    /// The whole box (borders included); a click inside it is consumed.
+    pub bounds: Rect,
+    /// The full-list index of the first visible row (the scroll window's top),
+    /// so a visible row's position maps back to its full-list index for hover.
+    pub window_start: usize,
+    /// One entry per visible row, top to bottom: its activation command (`None`
+    /// for a separator/border) and screen rect.
+    pub rows: Vec<(Option<MenuCommand>, Rect)>,
 }
 
 /// Which sub-pane of the review view receives keyboard input.
@@ -673,6 +735,17 @@ pub struct App {
     /// Whether the top menu bar (the `View`/`Theme` labels in the header) is
     /// shown. On by default; from `Config.menu_bar`, toggled with `m`.
     pub show_menu_bar: bool,
+    /// The open dropdown, or `None` when no menu is open. Opening is mouse-first
+    /// (click a title); keyboard nav drives an already-open menu. Mutually
+    /// exclusive with editing (see [`OpenMenu`]).
+    pub open_menu: Option<OpenMenu>,
+    /// Each top-level title's clickable rect, recorded from the header layout
+    /// every render (interior-mutable, mirroring `x_rects`). Cleared to empty
+    /// when the bar is hidden, so a stale rect can't match after `m`.
+    menu_title_rects: RefCell<Vec<(MenuId, Rect)>>,
+    /// The open dropdown's hit-map (bounds + per-visible-row rects), recorded
+    /// every render and cleared to `None` when no menu is open.
+    menu_dropdown: RefCell<Option<DropdownHit>>,
     /// The diff pane's scroll offset, in physical layout rows (a `usize` since a
     /// few long comment boxes can push a diff past `u16::MAX` rows).
     pub diff_scroll: usize,
@@ -845,6 +918,9 @@ impl App {
             diff_mode: config.diff_mode(),
             show_line_numbers: config.line_numbers(),
             show_menu_bar: config.menu_bar(),
+            open_menu: None,
+            menu_title_rects: RefCell::new(Vec::new()),
+            menu_dropdown: RefCell::new(None),
             diff_scroll: 0,
             diff_viewport: Cell::new(0),
             diff_content_rows: Cell::new(0),
@@ -967,6 +1043,9 @@ impl App {
     /// the file watcher, whose path has no trailing `sync_active` like
     /// `on_key`/`on_mouse`. View-aware: it refreshes whichever view is showing.
     pub fn reload(&mut self) {
+        // A watcher-driven reload can shrink the menu's row list (a theme file
+        // vanished); drop any open dropdown rather than risk a stale `item`.
+        self.open_menu = None;
         self.refresh_active();
         self.sync_active();
     }
@@ -992,6 +1071,10 @@ impl App {
             // The in-place editor captures every key *before* the keymap (plan
             // §3.5): a typed `c`/`x`/`]` inserts rather than triggering its action.
             self.on_key_editor(key);
+        } else if self.open_menu.is_some() {
+            // An open dropdown captures keys before the keymap: arrows/tab
+            // navigate, Enter/Space activate, every other key closes (plan §3.0).
+            self.on_key_menu(key);
         } else if key.code == KeyCode::Esc {
             // Esc leaves the history view; it is not in the keymap (so the modal's
             // own Esc handling stays first). A no-op in the status and review
@@ -1040,6 +1123,13 @@ impl App {
             }
             Action::ToggleMenuBar => {
                 self.show_menu_bar = !self.show_menu_bar;
+                if !self.show_menu_bar {
+                    // Hiding the bar drops any open dropdown and clears the title
+                    // rects synchronously, so a click queued behind this key (the
+                    // event loop drains input before redraw) can't hit a stale rect.
+                    self.open_menu = None;
+                    self.menu_title_rects.borrow_mut().clear();
+                }
                 self.persist_setting(Setting::MenuBar(self.show_menu_bar));
                 return;
             }
@@ -2539,7 +2629,11 @@ impl App {
             let was = self.hovering_divider || self.hovering_hdivider;
             self.hovering_divider = self.on_divider(pos);
             self.hovering_hdivider = self.on_hdivider(pos);
-            return (self.hovering_divider || self.hovering_hdivider) != was;
+            let divider_changed = (self.hovering_divider || self.hovering_hdivider) != was;
+            // Hover slides an *already-open* dropdown (hunk behaviour); it never
+            // opens one (opening is click-only). Redraw when either changes.
+            let menu_changed = self.menu_hover(pos);
+            return divider_changed || menu_changed;
         }
 
         self.flash = None;
@@ -2596,6 +2690,16 @@ impl App {
                 self.last_click = None; // save failed; the editor kept the click
                 return;
             }
+        }
+
+        // Menu hit-testing runs *after* the editor commit block (so a title click
+        // while editing commits the editor first) and *before* the diff-pane
+        // double-click logic. A fully-consumed menu click resets the double-click
+        // tracker (like an `[x]` consumption); a click-away closes the menu but
+        // falls through to route normally.
+        if self.menu_click(pos) {
+            self.last_click = None;
+            return;
         }
 
         let target = self.hit_target(pos);
@@ -4327,11 +4431,353 @@ impl App {
     /// cleared here, the verified staleness hazard. The flash shows the *resolved*
     /// canonical name, so it can never diverge from the theme now on screen.
     fn cycle_theme(&mut self) {
-        let (name, theme) = Theme::cycle(&self.theme_name, self.config_dir.as_deref());
+        // `cycle` picks the next name (resolving to confirm it loads); the shared
+        // tail installs it. The resolved theme is rebuilt in `set_theme_by_name`
+        // — a cheap second resolve that keeps the install path single-sourced.
+        let (name, _) = Theme::cycle(&self.theme_name, self.config_dir.as_deref());
+        self.set_theme_by_name(&name);
+    }
+
+    /// Resolve `name` against the config dir, install it as the active theme,
+    /// clear the (now-stale) highlight cache, and flash the resolved canonical
+    /// name. The shared install tail of `cycle_theme` and the Theme menu's
+    /// `SetTheme` activation, so the two can't diverge. The flash shows the
+    /// resolved name, never the requested one, so it can't name a theme other
+    /// than the one on screen.
+    fn set_theme_by_name(&mut self, name: &str) {
+        let (name, theme) = Theme::resolve(name, self.config_dir.as_deref());
         self.theme = theme;
         self.theme_name = name.clone();
         self.highlight_cache.borrow_mut().clear();
         self.flash = Some(Flash::info(name));
+    }
+
+    // --- Header menu bar dropdowns (issue #5, plan §3.0) ----------------
+
+    /// The rows of `menu`, built fresh from live state so every marker reflects
+    /// the current setting. Shared by the dropdown renderer *and* by nav /
+    /// activation, so the drawn menu and what a click does never drift.
+    pub(crate) fn menu_items(&self, menu: MenuId) -> Vec<MenuRow> {
+        match menu {
+            MenuId::View => {
+                let home = self.home_view();
+                // Dynamic Home label: from a review session the first row reads
+                // "Review" (checked when home), not a dead "Status" control.
+                let home_label = if home == ViewMode::Review {
+                    "Review"
+                } else {
+                    "Status"
+                };
+                vec![
+                    MenuRow::Item {
+                        label: "Unified".to_string(),
+                        marker: Marker::Radio(self.diff_mode == DiffMode::Unified),
+                        hint: Some("d"),
+                        command: MenuCommand::SetDiffMode(DiffMode::Unified),
+                    },
+                    MenuRow::Item {
+                        label: "Side by side".to_string(),
+                        marker: Marker::Radio(self.diff_mode == DiffMode::SideBySide),
+                        hint: None,
+                        command: MenuCommand::SetDiffMode(DiffMode::SideBySide),
+                    },
+                    MenuRow::Separator,
+                    MenuRow::Item {
+                        label: "Line numbers".to_string(),
+                        marker: Marker::Check(self.show_line_numbers),
+                        hint: Some("n"),
+                        command: MenuCommand::SetLineNumbers(!self.show_line_numbers),
+                    },
+                    MenuRow::Separator,
+                    MenuRow::Item {
+                        label: home_label.to_string(),
+                        marker: Marker::Radio(self.view == home),
+                        hint: Some("1"),
+                        command: MenuCommand::GoHome,
+                    },
+                    MenuRow::Item {
+                        label: "History".to_string(),
+                        marker: Marker::Radio(self.view == ViewMode::History),
+                        hint: Some("2"),
+                        command: MenuCommand::EnterHistory,
+                    },
+                ]
+            }
+            MenuId::Theme => Theme::available(self.config_dir.as_deref())
+                .into_iter()
+                .map(|name| MenuRow::Item {
+                    marker: Marker::Radio(name == self.theme_name),
+                    label: name.clone(),
+                    hint: None,
+                    command: MenuCommand::SetTheme(name),
+                })
+                .collect(),
+        }
+    }
+
+    /// The full-list index of `menu`'s first activatable row — a menu's opening
+    /// highlight. Menus always have ≥1 item, so the `0` fallback is defensive.
+    fn menu_first_selectable(&self, menu: MenuId) -> usize {
+        self.menu_items(menu)
+            .iter()
+            .position(|row| matches!(row, MenuRow::Item { .. }))
+            .unwrap_or(0)
+    }
+
+    /// Open `menu` with its first activatable row highlighted — the shared
+    /// "reveal this dropdown" step behind a title click, a hover-slide, and a
+    /// keyboard menu switch.
+    fn open_menu_first(&mut self, menu: MenuId) {
+        let item = self.menu_first_selectable(menu);
+        self.open_menu = Some(OpenMenu { menu, item });
+    }
+
+    /// The full-list index one step from `item` in `menu`, skipping separators
+    /// and wrapping. Clamped against a freshly built list so a shrunk menu can't
+    /// index past the end.
+    fn menu_step(&self, menu: MenuId, item: usize, down: bool) -> usize {
+        let rows = self.menu_items(menu);
+        let n = rows.len();
+        if n == 0 {
+            return 0;
+        }
+        let mut idx = item.min(n - 1);
+        for _ in 0..n {
+            idx = if down {
+                (idx + 1) % n
+            } else {
+                (idx + n - 1) % n
+            };
+            if matches!(rows[idx], MenuRow::Item { .. }) {
+                break;
+            }
+        }
+        idx
+    }
+
+    /// Route a key while a dropdown is open (plan §3.0), run before the keymap.
+    /// Left/Right/Tab switch menus, Up/Down move (skipping separators, wrapping),
+    /// Enter/Space activate then close. Esc, a `ToggleMenuBar` chord, and every
+    /// other key all just close the dropdown (consumed, never re-dispatched) — so
+    /// no keymap-action lookup is needed to honour a remapped toggle chord.
+    fn on_key_menu(&mut self, key: KeyEvent) {
+        let Some(open) = self.open_menu else {
+            return;
+        };
+        match key.code {
+            KeyCode::Left | KeyCode::BackTab => self.open_menu_sibling(false),
+            KeyCode::Right | KeyCode::Tab => self.open_menu_sibling(true),
+            KeyCode::Up | KeyCode::Down => {
+                let item = self.menu_step(open.menu, open.item, key.code == KeyCode::Down);
+                self.open_menu = Some(OpenMenu {
+                    menu: open.menu,
+                    item,
+                });
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                self.activate_menu_item(open.menu, open.item);
+                self.open_menu = None;
+            }
+            _ => self.open_menu = None,
+        }
+    }
+
+    /// Switch the open dropdown to the previous/next top-level menu, highlighting
+    /// its first activatable row (Left/Right/Tab while open, and hover-slide).
+    fn open_menu_sibling(&mut self, next: bool) {
+        let Some(open) = self.open_menu else {
+            return;
+        };
+        let menus = crate::ui::menu::MENUS;
+        let n = menus.len();
+        let Some(pos) = menus.iter().position(|&m| m == open.menu) else {
+            return;
+        };
+        let target = if next {
+            (pos + 1) % n
+        } else {
+            (pos + n - 1) % n
+        };
+        self.open_menu_first(menus[target]);
+    }
+
+    /// Activate the row at full-list index `item` in `menu` (a no-op on a
+    /// separator or an out-of-range index — clamped against a fresh list).
+    fn activate_menu_item(&mut self, menu: MenuId, item: usize) {
+        let command = match self.menu_items(menu).into_iter().nth(item) {
+            Some(MenuRow::Item { command, .. }) => command,
+            _ => return,
+        };
+        self.activate_command(command);
+    }
+
+    /// Apply a menu command, reusing the shipped mutate+persist pairs. Settings
+    /// persist (theme / diff-mode / line-numbers); view changes don't, matching
+    /// the keyboard actions. A setting already at the chosen value is a no-op.
+    fn activate_command(&mut self, command: MenuCommand) {
+        match command {
+            MenuCommand::SetDiffMode(mode) => {
+                if self.diff_mode != mode {
+                    self.toggle_diff_mode();
+                    self.persist_setting(Setting::DiffMode(self.diff_mode));
+                }
+            }
+            MenuCommand::SetLineNumbers(on) => {
+                if self.show_line_numbers != on {
+                    self.toggle_line_numbers();
+                    self.persist_setting(Setting::LineNumbers(self.show_line_numbers));
+                }
+            }
+            MenuCommand::SetTheme(name) => {
+                // No-op when already active (matching the diff-mode / line-numbers
+                // guards): re-installing would needlessly persist, and re-resolving
+                // a since-deleted custom theme would silently fall back + persist
+                // the fallback over the user's choice.
+                if name != self.theme_name {
+                    self.set_theme_by_name(&name);
+                    self.persist_setting(Setting::Theme(self.theme_name.clone()));
+                }
+            }
+            MenuCommand::GoHome => self.go_home(),
+            MenuCommand::EnterHistory => {
+                if self.view != ViewMode::History {
+                    self.enter_history();
+                }
+            }
+        }
+    }
+
+    /// The top-level menu whose recorded title rect contains `pos`, if any.
+    fn menu_title_at(&self, pos: Position) -> Option<MenuId> {
+        self.menu_title_rects
+            .borrow()
+            .iter()
+            .find(|(_, rect)| rect.contains(pos))
+            .map(|(id, _)| *id)
+    }
+
+    /// Handle a left-click against the menu bar. Returns `true` when the click
+    /// was fully consumed (no further routing): a title toggle, or a click inside
+    /// the open dropdown. Returns `false` to fall through to normal routing —
+    /// either no menu was involved, or a click-away that closed an open dropdown
+    /// (which still routes to its target, mirroring the editor's click-outside).
+    fn menu_click(&mut self, pos: Position) -> bool {
+        // A hidden bar records no title rects (cleared on hide), but guard here
+        // too so a rect stale between the hide and the next redraw can't match.
+        if !self.show_menu_bar {
+            return false;
+        }
+        // A click on a top-level title toggles its dropdown.
+        if let Some(menu) = self.menu_title_at(pos) {
+            match self.open_menu {
+                Some(open) if open.menu == menu => self.open_menu = None,
+                _ => self.open_menu_first(menu),
+            }
+            return true;
+        }
+        // Consult the last-drawn dropdown — what is actually on screen. A click
+        // inside its bounds is consumed even if a queued hover/Esc already changed
+        // `open_menu` before this frame was redrawn (input drains before redraw),
+        // so it can't fall through to the body under the visible overlay. A row is
+        // activated only when the recorded box still matches the open menu (a fresh
+        // frame); a stale box just consumes and closes. `fresh` distinguishes them;
+        // the inner `Option` is the clicked row's command (`None` = separator/border).
+        let inside = {
+            let hit = self.menu_dropdown.borrow();
+            hit.as_ref().and_then(|d| {
+                d.bounds.contains(pos).then(|| {
+                    let fresh = self.open_menu.map(|open| open.menu) == Some(d.menu);
+                    let cmd = d
+                        .rows
+                        .iter()
+                        .find(|(_, rect)| rect.contains(pos))
+                        .and_then(|(cmd, _)| cmd.clone());
+                    (fresh, cmd)
+                })
+            })
+        };
+        match inside {
+            Some((true, Some(command))) => {
+                // Fresh box, activatable row: act then close.
+                self.activate_command(command);
+                self.open_menu = None;
+                true
+            }
+            // Fresh box, separator/border: a no-op that stays open, still consumed.
+            Some((true, None)) => true,
+            // Stale box still on screen: consume + close, but don't act on rows we
+            // can no longer trust.
+            Some((false, _)) => {
+                self.open_menu = None;
+                true
+            }
+            None => {
+                // Not inside any drawn box: close an open menu, then route the click.
+                self.open_menu = None;
+                false
+            }
+        }
+    }
+
+    /// Slide an already-open dropdown to follow the mouse (plan §3.0): over
+    /// another title it switches the open menu; over an activatable row it moves
+    /// the highlight. A no-op (and no open) when no menu is open — hover never
+    /// opens a dropdown. Returns `true` when the open menu changed.
+    fn menu_hover(&mut self, pos: Position) -> bool {
+        let Some(open) = self.open_menu else {
+            return false;
+        };
+        if let Some(menu) = self.menu_title_at(pos) {
+            if menu != open.menu {
+                self.open_menu_first(menu);
+                return true;
+            }
+            return false;
+        }
+        let new_item = {
+            let hit = self.menu_dropdown.borrow();
+            hit.as_ref().and_then(|d| {
+                if d.menu != open.menu || !d.bounds.contains(pos) {
+                    return None;
+                }
+                // Only activatable rows take the highlight (skip separators), and
+                // map the visible position back to its full-list index.
+                d.rows.iter().enumerate().find_map(|(vis, (cmd, rect))| {
+                    (cmd.is_some() && rect.contains(pos)).then_some(d.window_start + vis)
+                })
+            })
+        };
+        if let Some(item) = new_item {
+            if item != open.item {
+                self.open_menu = Some(OpenMenu {
+                    menu: open.menu,
+                    item,
+                });
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Record the top-level title rects for this frame (called from the header
+    /// renderer). Cleared to empty when the bar is hidden.
+    pub(crate) fn set_menu_title_rects(&self, rects: Vec<(MenuId, Rect)>) {
+        *self.menu_title_rects.borrow_mut() = rects;
+    }
+
+    /// The recorded title rect of `menu`, for anchoring its dropdown.
+    pub(crate) fn menu_title_rect(&self, menu: MenuId) -> Option<Rect> {
+        self.menu_title_rects
+            .borrow()
+            .iter()
+            .find(|(id, _)| *id == menu)
+            .map(|(_, rect)| *rect)
+    }
+
+    /// Record the open dropdown's hit-map for this frame (called from the overlay
+    /// renderer), or clear it when no menu is open.
+    pub(crate) fn set_menu_dropdown(&self, hit: Option<DropdownHit>) {
+        *self.menu_dropdown.borrow_mut() = hit;
     }
 
     /// Write `setting` to `config.toml` when a config dir was injected
