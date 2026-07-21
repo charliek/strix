@@ -40,6 +40,8 @@ intentionally doesn't do.
 - Light, dark, and popular preset themes (Catppuccin, Tokyo Night, Gruvbox),
   cyclable at runtime with `t` and persisted
 - Toggleable line numbers (`n`)
+- **Menu bar** in the header (`m` to toggle): mouse-first `View`/`Theme`
+  dropdowns over the same settings, keyboard-navigable once open
 - Mouse support: click to select, click to stage, scroll diffs, double-click
   to comment
 - Customizable keybindings

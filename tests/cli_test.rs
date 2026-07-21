@@ -33,7 +33,7 @@ fn diff_with_range() {
     let cli = parse(&["strix", "diff", "main"]);
     match &cli.command {
         Some(CliCommand::Diff { range, path }) => {
-            assert_eq!(range, "main");
+            assert_eq!(range, &Some("main".to_string()));
             assert_eq!(path, &None);
         }
         other => panic!("expected diff subcommand, got {other:?}"),
@@ -80,15 +80,33 @@ fn width_without_dump_frame_errors() {
 }
 
 #[test]
-fn missing_range_errors() {
-    assert!(Cli::try_parse(&["strix", "diff"]).is_err());
+fn bare_diff_parses_with_no_range() {
+    // RANGE is optional: bare `strix diff` parses fine and carries no range, so
+    // `target()` routes it to Status rather than a review.
+    let cli = Cli::try_parse(&["strix", "diff"]).expect("bare `diff` should parse");
+    match &cli.command {
+        Some(CliCommand::Diff { range, path }) => {
+            assert_eq!(range, &None);
+            assert_eq!(path, &None);
+        }
+        other => panic!("expected diff subcommand, got {other:?}"),
+    }
+    assert_eq!(cli.target(), (None, None));
 }
 
 #[test]
 fn diff_shadows_a_bare_path_positional() {
     // The compatibility break: `strix diff` is the subcommand, not a directory
-    // named `diff`. It therefore requires a RANGE.
-    assert!(Cli::try_parse(&["strix", "diff"]).is_err());
+    // named `diff` — it opens Status (no RANGE), never a bare-path open of a
+    // directory literally named `diff`.
+    let cli = parse(&["strix", "diff"]);
+    match &cli.command {
+        Some(CliCommand::Diff { range, path }) => {
+            assert_eq!(range, &None);
+            assert_eq!(path, &None);
+        }
+        other => panic!("expected diff subcommand, got {other:?}"),
+    }
     // `strix ./diff` is the documented escape to open such a directory.
     let cli = parse(&["strix", "./diff"]);
     assert_eq!(cli.path, Some(PathBuf::from("./diff")));
@@ -146,5 +164,47 @@ fn good_range_dump_frame_succeeds() {
     assert!(
         stdout.contains("feature.txt"),
         "the review list shows a changed file: {stdout}"
+    );
+}
+
+// `run_bin` always appends `dir` as a trailing positional, which — now that
+// RANGE is optional — would bind to RANGE and exercise range resolution, not
+// Status. These two tests build the process directly with no trailing
+// positional, conveying the repo path via the process working directory.
+
+#[test]
+fn bare_diff_dump_frame_opens_status() {
+    let repo = common::init_repo();
+    let out = Command::new(env!("CARGO_BIN_EXE_strix"))
+        .args(["diff", "--dump-frame"])
+        .current_dir(repo.path())
+        .output()
+        .expect("spawn strix");
+    assert!(
+        out.status.success(),
+        "bare `diff` (no RANGE) should render a frame: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The Status empty-state hint is unique to the staging view (Review's is
+    // "No differences in range"); it, not the presence/absence of a generic
+    // truncation ellipsis, is the reliable Status oracle.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("working tree clean"),
+        "a clean repo's Status frame shows the clean-working-tree hint: {stdout}"
+    );
+}
+
+#[test]
+fn empty_string_range_exits_nonzero() {
+    let repo = common::init_repo();
+    let out = Command::new(env!("CARGO_BIN_EXE_strix"))
+        .args(["diff", "", "--dump-frame"])
+        .current_dir(repo.path())
+        .output()
+        .expect("spawn strix");
+    assert!(
+        !out.status.success(),
+        "an explicit empty-string range (Some(\"\")) must still error, unlike bare `diff`"
     );
 }

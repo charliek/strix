@@ -161,6 +161,26 @@ fn pressing_d_n_t_with_an_injected_dir_persists_each_setting() {
 }
 
 #[test]
+fn pressing_m_persists_the_menu_bar_setting() {
+    let repo = init_repo();
+    let config_dir = tempfile::tempdir().unwrap();
+    let mut app = App::new(repo.path().to_path_buf())
+        .unwrap()
+        .with_config_dir(Some(config_dir.path().to_path_buf()));
+    assert!(app.show_menu_bar, "menu bar starts visible");
+
+    press(&mut app, 'm');
+    assert!(!app.show_menu_bar, "m hides the menu bar");
+    assert!(read_config(config_dir.path()).contains("menu_bar = false"));
+
+    press(&mut app, 'm');
+    assert!(app.show_menu_bar, "m shows it again");
+    assert!(read_config(config_dir.path()).contains("menu_bar = true"));
+
+    assert!(tmp_residue(config_dir.path()).is_empty());
+}
+
+#[test]
 fn pressing_d_and_n_with_no_config_dir_writes_nothing_and_flashes_nothing() {
     let repo = init_repo();
     let mut app = App::new(repo.path().to_path_buf()).unwrap();

@@ -19,6 +19,7 @@ fn default_bindings() {
     assert_eq!(keymap.action(key('q')), Some(Action::Quit));
     assert_eq!(keymap.action(key('d')), Some(Action::ToggleDiffMode));
     assert_eq!(keymap.action(key('b')), Some(Action::ToggleChanges));
+    assert_eq!(keymap.action(key('m')), Some(Action::ToggleMenuBar));
     assert_eq!(keymap.action(key('i')), Some(Action::ToggleHistory));
     assert_eq!(keymap.action(key('1')), Some(Action::ShowStatus));
     assert_eq!(keymap.action(key('2')), Some(Action::ShowHistory));
@@ -26,6 +27,21 @@ fn default_bindings() {
     assert_eq!(keymap.action(key('G')), Some(Action::Bottom));
     assert_eq!(keymap.action(key(' ')), Some(Action::ToggleStage));
     assert_eq!(keymap.action(key('z')), None);
+}
+
+#[test]
+fn toggle_menu_bar_action_name_parses() {
+    // The action is remappable by any of its config names.
+    for name in ["toggle-menu-bar", "menu-bar", "menu"] {
+        let mut overrides = HashMap::new();
+        overrides.insert(name.to_string(), vec!["ctrl-m".to_string()]);
+        let keymap = Keymap::from_config(Some(&overrides));
+        assert_eq!(
+            keymap.action(ctrl('m')),
+            Some(Action::ToggleMenuBar),
+            "{name:?} parses to ToggleMenuBar"
+        );
+    }
 }
 
 #[test]

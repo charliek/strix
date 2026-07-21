@@ -1,8 +1,13 @@
 //! Side-by-side word-diff emphasis (plan §3.7, C9): a modified pair's changed
 //! character spans paint with `theme.add_emph`/`del_emph` instead of the flat
-//! `add_bg`/`del_bg` wash. Colours aren't visible in `dump_frame`'s glyph-only
-//! text, so every assertion here reads the rendered `Buffer` via the shared
-//! `TestBackend` colour helpers (`render_buffer`/`row_has_bg`).
+//! `add_bg`/`del_bg` wash. Also covers the empty-column filler shading (plan
+//! §3.2, C1): the column opposite a *pure* add/del tints with
+//! `theme.add_gutter`/`del_gutter` instead of flat `theme.bg` — a separate
+//! feature reached only when one side is absent, never overlapping the
+//! emphasis path above (active only when both sides are present). Colours
+//! aren't visible in `dump_frame`'s glyph-only text, so every assertion here
+//! reads the rendered `Buffer` via the shared `TestBackend` colour helpers
+//! (`render_buffer`/`row_has_bg`/`cell_bg`).
 
 mod common;
 
@@ -137,6 +142,82 @@ fn a_pure_addition_has_no_emphasis() {
 #[test]
 fn a_pure_deletion_has_no_emphasis() {
     assert_pure_change_has_no_emphasis("context\nto_delete\n", "context\n", "to_delete", false);
+}
+
+// --- empty-column filler shading (plan §3.2, C1) ---
+//
+// Strictly separate from word-diff emphasis above: these tint the *empty*
+// column opposite a pure add/del (one side `None`), never reached by the
+// emphasis path (only active when both sides are `Some`).
+
+/// The side-by-side left/right column widths for a diff pane of `width`,
+/// mirroring `sbs_columns` (private to `src/app.rs`).
+fn sbs_columns(width: u16) -> (u16, u16) {
+    let left = (width.saturating_sub(1)) / 2;
+    let right = width.saturating_sub(left + 1);
+    (left, right)
+}
+
+#[test]
+fn sbs_empty_old_column_opposite_a_pure_addition_is_add_gutter() {
+    let repo = modified_repo("context\n", "context\nadded_only_line\n");
+    let app = sbs_app(repo.path());
+    let frame = dump(&app);
+    let buf = render_buffer(&app, W, H);
+    let theme = &app.theme;
+
+    let row = row_of(&frame, "added_only_line");
+    let area = app.diff_area();
+    assert_eq!(
+        cell_bg(&buf, area.x, row),
+        Some(theme.add_gutter),
+        "the empty old column opposite a pure addition is tinted add_gutter:\n{frame}"
+    );
+}
+
+#[test]
+fn sbs_empty_new_column_opposite_a_pure_deletion_is_del_gutter() {
+    let repo = modified_repo("context\nto_delete_line\n", "context\n");
+    let app = sbs_app(repo.path());
+    let frame = dump(&app);
+    let buf = render_buffer(&app, W, H);
+    let theme = &app.theme;
+
+    let row = row_of(&frame, "to_delete_line");
+    let area = app.diff_area();
+    let (left, _) = sbs_columns(area.width);
+    let new_col_x = area.x + left + 1; // past the left column + the `│` divider
+    assert_eq!(
+        cell_bg(&buf, new_col_x, row),
+        Some(theme.del_gutter),
+        "the empty new column opposite a pure deletion is tinted del_gutter:\n{frame}"
+    );
+}
+
+#[test]
+fn sbs_modified_pair_and_context_row_carry_no_gutter_tint() {
+    let repo = modified_repo(
+        "context line unchanged\nlet value = compute_something();\n",
+        "context line unchanged\nlet value = compute_other();\n",
+    );
+    let app = sbs_app(repo.path());
+    let frame = dump(&app);
+    let buf = render_buffer(&app, W, H);
+    let theme = &app.theme;
+
+    let modified = row_of(&frame, "compute_other");
+    assert!(
+        !row_has_bg(&buf, modified, theme.add_gutter)
+            && !row_has_bg(&buf, modified, theme.del_gutter),
+        "a modified pair (both sides present) never carries the empty-column tint:\n{frame}"
+    );
+
+    let context = row_of(&frame, "context line unchanged");
+    assert!(
+        !row_has_bg(&buf, context, theme.add_gutter)
+            && !row_has_bg(&buf, context, theme.del_gutter),
+        "a context row never carries the empty-column tint:\n{frame}"
+    );
 }
 
 #[test]

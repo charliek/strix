@@ -57,9 +57,11 @@ selection_bg = "#283457"
 add = "#9ece6a"
 add_bg = "#202c26"
 add_emph = "#2e5c3a"
+add_gutter = "#1a241f"
 del = "#f7768e"
 del_bg = "#312027"
 del_emph = "#642a3c"
+del_gutter = "#281c21"
 hunk = "#7dcfff"
 comment = "#bb9af7"
 ```
@@ -74,6 +76,16 @@ of one another), the changed span within the line is painted in `add_emph`
 — brighter and more saturated, so the edited substring reads distinctly. A
 pure addition/deletion, an unchanged context pair, or a pair too dissimilar
 to be a real edit gets no emphasis (just the base background). Both are
+optional in a custom theme file; an omitted one falls back to the `base`
+preset's value like every other colour.
+
+`add_gutter`/`del_gutter` colour the **empty column** in side-by-side mode
+when its opposite has a pure addition or deletion (no partner line, so
+nothing to zip it against): the empty half of the row opposite an Addition
+gets `add_gutter`, opposite a Deletion gets `del_gutter` — a subtle tint
+instead of the flat pane background, so the row still reads as "one side
+changed" at a glance. A context pair (unchanged on both sides) and a modified
+pair (both sides present) never get this tint, on either side. Both are
 optional in a custom theme file; an omitted one falls back to the `base`
 preset's value like every other colour.
 

@@ -20,6 +20,23 @@ Rendering is a pure function of state (`ui::draw`); it never mutates `App`. That
 separation is what lets `dump_frame` render any state to an in-memory buffer for
 assertions.
 
+**Keyboard-enhancement protocol.** `terminal.rs` probes
+`supports_keyboard_enhancement()` once at startup, while still on the normal
+screen and before mouse capture (the query can block briefly on a terminal
+that ignores it, so the round-trip happens before the alt-screen would
+otherwise sit frozen). On a capable terminal it pushes crossterm's
+`DISAMBIGUATE_ESCAPE_CODES` flag, recording success in an `AtomicBool` only
+after the push write itself succeeds — so `restore()` never pops a flag that
+was never pushed. `restore()` attempts every teardown step (pop enhancement,
+leave alt screen, disable raw mode, disable mouse capture) and surfaces the
+first error rather than short-circuiting, so one failing step can't strand a
+later one; the panic hook and setup-failure cleanup share the same restore
+path. This is what makes Shift+Enter arrive as a distinct event instead of a
+plain `Enter`, reaching
+[the in-place editor's newline chord](#diff-pane-rows-cursor-and-comments) —
+on an incapable terminal nothing is pushed, and the editor's Ctrl-J/Alt+Enter
+fallbacks still work either way.
+
 ## Modules
 
 | Module        | Responsibility                                                    |
@@ -28,6 +45,7 @@ assertions.
 | `terminal`    | Setup/teardown, event loop, panic-safe restore, `dump_frame`.     |
 | `ui`          | Rendering: layout, the panes, theme, syntax highlighting.         |
 | `ui/review.rs`| Review view rendering: the flat changed-file list beside the shared diff pane. |
+| `ui/menu.rs`  | Pure menu-bar geometry + rendering: label layout, the dropdown overlay (see [Menu bar](#menu-bar)). |
 | `git`         | Repository access: status, history, diffs, mutations.             |
 | `git/review.rs` | Branch-range review: `resolve_range` (gix `merge_base`), file listing via paired `git diff-tree` name-status/numstat runs, and lazy per-file diffs. |
 | `graph`       | Pure rail-graph lane layout for the history view.                 |
@@ -192,6 +210,15 @@ than the flat `add_bg`/`del_bg` wash — instead of the line's base background;
 selecting the row still repaints every span with `selection_bg`, so the
 cursor highlight intentionally overrides emphasis.
 
+**Side-by-side filler shading.** A pure addition or deletion has no partner
+line, so its opposite column renders empty; `cell()` paints that empty column
+`theme.add_gutter` when the row is a pure Addition or `theme.del_gutter` when
+it's a pure Deletion, instead of the flat pane background — a subtle tint
+that reads as "one side changed" without competing with the word-emphasis
+colours above. A context pair and a modified pair never carry a gutter tint
+on either side; an empty cell opposite anything else (there is no such case
+today, but the fallback exists) stays `theme.bg`.
+
 ## Diff pane: rows, cursor, and comments
 
 The diff pane is shared by Status, Review, and History, but only Status and
@@ -281,6 +308,13 @@ is read-only for staging — those actions are a no-op — and the file watcher
 refreshes it like the other views, guarded so a worktree-only change (no new
 commit on either side of the range) skips re-listing.
 
+Bare `strix diff` (`RANGE` omitted) never resolves a range at all — `cli.rs`
+routes a `None` range straight to `App::with_config`, the same construction
+path the root `strix` command uses, which opens `Status`. The two ordered
+`Option` positionals (`range`, `path`) mean a single trailing argument always
+binds to `range`, not `path` — there is no path-only `strix diff PATH` form
+(see [CLI](cli.md#strix-diff-range-path)).
+
 **Cursor and comments.** Review's diff-pane cursor and its comments (range
 scope) use the shared `RowTarget`/`LayoutRow`/`DiffPaneState` model described
 in [Diff pane: rows, cursor, and comments](#diff-pane-rows-cursor-and-comments)
@@ -318,15 +352,58 @@ pending (uncommitted) deletion as retained rather than swept — only an
 unambiguous worktree-local deletion under an unchanged `HEAD` sweeps
 unconditionally.
 
+## Menu bar
+
+The `View`/`Theme` labels live inside the existing one-row header, not a new
+row — `ui/menu.rs` holds the geometry/label helpers (`header_menu_layout`
+lays the two labels left-to-right from a given start column; the dropdown
+renderer draws the open box over `Clear`), shared by two consumers: the
+header draw always paints the labels when `App::show_menu_bar` is set, and,
+when a menu is open, the same layout function's rects are recorded so a
+click can be matched back to a label. Like the rest of the UI, the render
+pass is a pure function of `App`'s *logical* state and records only mouse
+hit-rects back onto `App` through interior-mutability setters (`Cell`/
+`RefCell`) — the same recorded-rect pattern the staging area, the split
+divider, and the comment-box `[x]` cells already use. `App::open_menu: Option<OpenMenu>`
+(`MenuId` — `View` or `Theme` — plus a highlighted-item index) is the only
+open/closed state; `App::menu_items(MenuId)` builds each dropdown's rows
+fresh on every call (radio/check markers reflecting current state, e.g. the
+`View` menu's Status/History rows check whichever is active) rather than
+caching them, so there's no stale-marker state to invalidate.
+
+**Hit-testing.** Two recorded-rect maps back mouse input to menu structure:
+`menu_title_rects` (one `Rect` per top-level label, cleared when the bar is
+hidden) and a dropdown hit-map (the open box's bounds plus a
+`(Option<MenuCommand>, Rect)` per row, cleared when the menu closes) —
+both populated during render, not computed on click, so hit-testing never
+duplicates the layout math. `on_key_menu` intercepts keys before the regular
+keymap whenever a menu is open (Left/Right/Tab switch top-level menus,
+Up/Down move the highlight and skip separators, Enter/Space activate then
+close, anything else including `Esc` and the `ToggleMenuBar` chord closes
+without acting); mouse routing checks a title rect first (open/switch), then
+the open dropdown's hit-map (activate on an item, consume on a separator or
+dead space, hover-slide to follow the pointer), then falls through to the
+regular click handling only when nothing in the bar or dropdown was hit.
+Opening a dropdown is mouse-only — there's no keyboard chord to open one,
+since every setting a menu exposes already has its own direct key. A
+`reload()` (config or watcher-triggered) clears `open_menu` unconditionally,
+so a live re-render mid-navigation never leaves a dropdown pointing at rows
+that no longer exist.
+
 ## Configuration write-back
 
-Three explicit in-app actions — cycling the theme (`t`), toggling diff mode
-(`d`), and toggling line numbers (`n`) — write their new value back to
-`config.toml` via `toml_edit`, which preserves comments, unrelated keys, and
-formatting elsewhere in the file. If the existing file fails to parse, the
-write is skipped entirely (the in-app change still applies for the running
-session) rather than clobbering a user's broken-but-recoverable config.
-Reads stay on `toml`/serde; only the write path uses `toml_edit`.
+Four explicit in-app actions — cycling the theme (`t`), toggling diff mode
+(`d`), toggling line numbers (`n`), and toggling the menu bar (`m`) — write
+their new value back to `config.toml` via `toml_edit`, which preserves
+comments, unrelated keys, and formatting elsewhere in the file. Picking a
+theme, diff mode, or line-numbers setting from the `View`/`Theme` dropdowns
+persists the same way, through the same `persist_setting` call the key
+dispatch uses — the menu is a second input surface over the same actions, not
+a separate write path; the menu bar's own visibility has no menu item, only
+the `m` chord. If the existing file fails to parse, the write is skipped
+entirely (the in-app change still applies for the running session) rather
+than clobbering a user's broken-but-recoverable config. Reads stay on
+`toml`/serde; only the write path uses `toml_edit`.
 
 ## Performance
 
