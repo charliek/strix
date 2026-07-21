@@ -26,6 +26,10 @@ pub struct Config {
     /// Whether the diff pane shows line-number gutters. On by default; set
     /// `false` to start with them hidden (toggle at runtime with `n`).
     pub line_numbers: Option<bool>,
+    /// Whether the top menu bar (the `View`/`Theme` labels in the header) is
+    /// shown. On by default; set `false` to start with it hidden (toggle at
+    /// runtime with `m`).
+    pub menu_bar: Option<bool>,
 }
 
 impl Config {
@@ -42,6 +46,10 @@ impl Config {
 
     pub fn line_numbers(&self) -> bool {
         self.line_numbers.unwrap_or(true)
+    }
+
+    pub fn menu_bar(&self) -> bool {
+        self.menu_bar.unwrap_or(true)
     }
 }
 
@@ -71,11 +79,12 @@ pub fn load() -> Config {
 }
 
 /// A single scalar written back to `config.toml` by an explicit in-app action
-/// (`t`/`d`/`n`). See [`persist`].
+/// (`t`/`d`/`n`/`m`). See [`persist`].
 pub enum Setting {
     Theme(String),
     DiffMode(DiffMode),
     LineNumbers(bool),
+    MenuBar(bool),
 }
 
 /// Persist one setting into `config_dir/config.toml`, preserving everything
@@ -110,6 +119,7 @@ pub fn persist(config_dir: &Path, setting: Setting) -> anyhow::Result<()> {
             doc["diff_mode"] = toml_edit::value(value);
         }
         Setting::LineNumbers(enabled) => doc["line_numbers"] = toml_edit::value(enabled),
+        Setting::MenuBar(v) => doc["menu_bar"] = toml_edit::value(v),
     }
 
     write_atomic(config_dir, &path, &doc.to_string())

@@ -1,5 +1,6 @@
 pub mod diff_view;
 pub mod history;
+pub mod menu;
 pub mod modal;
 pub mod review;
 pub mod staging;
@@ -91,28 +92,28 @@ pub(crate) fn highlight_divider(frame: &mut Frame, body: Rect, divider_x: u16, t
     }
 }
 
-fn render_header(frame: &mut Frame, area: Rect, app: &App) {
-    let theme = &app.theme;
-    // Fill the bar, then draw left + right text on top (transparent spans), so
-    // the right-aligned branch never clobbers the left title.
-    frame.render_widget(Block::new().style(Style::new().bg(theme.header_bg)), area);
+/// The brand text, shared by both header layouts.
+const BRAND: &str = " strix ";
 
-    let mut left_spans = vec![
-        Span::styled(
-            " strix ",
-            Style::new()
-                .fg(theme.header_fg)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(app.repo_name(), Style::new().fg(theme.dim)),
-    ];
+/// The brand's bold style, shared by both header layouts.
+fn brand_style(theme: &Theme) -> Style {
+    Style::new()
+        .fg(theme.header_fg)
+        .add_modifier(Modifier::BOLD)
+}
+
+/// The header's context spans: the repo name (dim) plus a per-view label (the
+/// accent title) — `" · history"` in History, `" · <range>"` in Review. Shared
+/// by both header layouts; the brand is prepended separately.
+fn context_spans(app: &App, theme: &Theme) -> Vec<Span<'static>> {
+    let mut spans = vec![Span::styled(app.repo_name(), Style::new().fg(theme.dim))];
     match app.view {
         ViewMode::History => {
-            left_spans.push(Span::styled(" · history", Style::new().fg(theme.title)));
+            spans.push(Span::styled(" · history", Style::new().fg(theme.title)));
         }
         ViewMode::Review => {
             if let Some(display) = app.review_display() {
-                left_spans.push(Span::styled(
+                spans.push(Span::styled(
                     format!(" · {display}"),
                     Style::new().fg(theme.title),
                 ));
@@ -120,20 +121,184 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         }
         ViewMode::Status => {}
     }
+    spans
+}
+
+/// The right-aligned branch / ahead-behind label, suppressed in a review session
+/// (its range label already identifies HEAD, so a status branch would mislead —
+/// e.g. for an `A...B` range). `None` when there is nothing to show.
+fn branch_text(app: &App) -> Option<String> {
+    if app.view == ViewMode::Review {
+        return None;
+    }
+    app.status.head_label().map(|branch| format!("{branch} "))
+}
+
+/// Draw the right-aligned branch label into `rect`. The shared leaf of both
+/// header paths — the plain path passes the full area, the menu path a sub-rect
+/// sized to the branch.
+fn render_branch(frame: &mut Frame, rect: Rect, branch: String, theme: &Theme) {
+    let line = Line::from(Span::styled(branch, Style::new().fg(theme.title)));
+    frame.render_widget(Paragraph::new(line).alignment(Alignment::Right), rect);
+}
+
+fn render_header(frame: &mut Frame, area: Rect, app: &App) {
+    let theme = &app.theme;
+    frame.render_widget(Block::new().style(Style::new().bg(theme.header_bg)), area);
+    if app.show_menu_bar {
+        render_header_with_menu(frame, area, app);
+    } else {
+        render_header_plain(frame, area, app);
+    }
+}
+
+/// Today's header (no menu bar): the brand + context drawn as one left-aligned
+/// paragraph over the full area, with the branch a separate right-aligned
+/// paragraph on top. Kept byte-for-byte identical to the pre-menu-bar output so
+/// `menu_bar = false` changes nothing.
+fn render_header_plain(frame: &mut Frame, area: Rect, app: &App) {
+    let theme = &app.theme;
+    let mut left_spans = vec![Span::styled(BRAND, brand_style(theme))];
+    left_spans.extend(context_spans(app, theme));
     frame.render_widget(Paragraph::new(Line::from(left_spans)), area);
 
-    // A review session's range label already identifies HEAD; the status branch /
-    // ahead-behind label would be misleading (e.g. for an `A...B` range), so it is
-    // suppressed there.
-    if app.view != ViewMode::Review {
-        if let Some(branch) = app.status.head_label() {
-            let right = Line::from(Span::styled(
-                format!("{branch} "),
-                Style::new().fg(theme.title),
-            ));
-            frame.render_widget(Paragraph::new(right).alignment(Alignment::Right), area);
+    if let Some(branch) = branch_text(app) {
+        render_branch(frame, area, branch, theme);
+    }
+}
+
+/// The menu-bar header: brand → `View`/`Theme` labels → context → branch, each
+/// in its own non-overlapping sub-rect laid out in display columns. The labels
+/// sit at fixed columns right after the brand (stable, hit-testable); context
+/// yields first under width pressure (truncated with `…`, then emptied) so the
+/// branch keeps its natural width, and the branch is suppressed only when
+/// nothing is left for it.
+fn render_header_with_menu(frame: &mut Frame, area: Rect, app: &App) {
+    let theme = &app.theme;
+
+    // Brand — always at the left edge.
+    let brand_w = text_width(BRAND) as u16;
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(BRAND, brand_style(theme)))),
+        sub_rect(area, area.x, brand_w),
+    );
+
+    // Menu labels — fixed columns right after the brand. On a pathologically
+    // narrow terminal the trailing cells clip to nothing (drawn via the
+    // intersection with `area`), and context + branch are dropped.
+    let label_start = area.x.saturating_add(brand_w);
+    let labels_w = menu::menus_width();
+    let label_style = Style::new().fg(theme.title);
+    for (id, rect) in menu::header_menu_layout(label_start, area.y) {
+        let cell = rect.intersection(area);
+        if cell.width == 0 {
+            continue;
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(menu::menu_cell(id), label_style))),
+            cell,
+        );
+    }
+
+    let labels_end = label_start.saturating_add(labels_w);
+    if labels_end >= area.right() {
+        // Labels fill (or overflow) the row: nothing left for context/branch.
+        return;
+    }
+
+    // Split the remainder into a left context rect and a right branch rect.
+    // Reserve the branch at its natural width; context takes the rest (with a
+    // 1-column gap) and yields first when the row is tight.
+    let right_of_labels = area.right().saturating_sub(labels_end);
+    let branch = branch_text(app);
+    // Saturate the display-width→u16 cast: a pathologically long branch name
+    // must clamp, never wrap (a wrap would mislay/suppress the branch).
+    let branch_w = branch
+        .as_deref()
+        .map(|t| text_width(t).min(u16::MAX as usize) as u16)
+        .unwrap_or(0);
+    const MIN_BRANCH_W: u16 = 6;
+    let (context_w, branch_w) = if branch_w == 0 {
+        (right_of_labels, 0)
+    } else if right_of_labels > branch_w.saturating_add(1) {
+        (
+            right_of_labels.saturating_sub(branch_w).saturating_sub(1),
+            branch_w,
+        )
+    } else if right_of_labels >= MIN_BRANCH_W {
+        // No room for both: keep the branch (truncated), drop context.
+        (0, right_of_labels)
+    } else {
+        // Too little even for a minimal branch: give it all to context.
+        (right_of_labels, 0)
+    };
+
+    if context_w > 0 {
+        let spans = fit_spans(context_spans(app, theme), context_w as usize);
+        if !spans.is_empty() {
+            frame.render_widget(
+                Paragraph::new(Line::from(spans)),
+                Rect::new(labels_end, area.y, context_w, area.height),
+            );
         }
     }
+    if branch_w > 0 {
+        if let Some(branch) = branch {
+            let rect = Rect::new(
+                area.right().saturating_sub(branch_w),
+                area.y,
+                branch_w,
+                area.height,
+            );
+            render_branch(frame, rect, branch, theme);
+        }
+    }
+}
+
+/// A single-row sub-rect of `area` starting at display column `x`, `width`
+/// columns wide, clamped to `area`'s right edge.
+fn sub_rect(area: Rect, x: u16, width: u16) -> Rect {
+    let start = x.min(area.right());
+    let end = x.saturating_add(width).min(area.right());
+    Rect::new(start, area.y, end - start, area.height)
+}
+
+/// Fit a styled context line into `max` display columns, preserving each span's
+/// colour. If the whole line fits it is returned unchanged; otherwise it is
+/// truncated across span boundaries with a **single** trailing `…`, one column
+/// reserved globally — so a span that exactly fills the width can't silently
+/// drop the spans after it (e.g. a repo name eating the ` · history` label).
+fn fit_spans(spans: Vec<Span<'static>>, max: usize) -> Vec<Span<'static>> {
+    let total: usize = spans.iter().map(|s| text_width(&s.content)).sum();
+    if total <= max {
+        return spans;
+    }
+    if max == 0 {
+        return Vec::new();
+    }
+    let budget = max - 1; // reserve one column for the single trailing ellipsis
+    let mut out = Vec::with_capacity(spans.len() + 1);
+    let mut used = 0;
+    for span in spans {
+        if used >= budget {
+            break;
+        }
+        let mut text = String::new();
+        for ch in span.content.chars() {
+            let w = char_width(ch);
+            if used + w > budget {
+                break;
+            }
+            text.push(ch);
+            used += w;
+        }
+        if !text.is_empty() {
+            out.push(Span::styled(text, span.style));
+        }
+    }
+    let style = out.last().map(|s| s.style).unwrap_or_default();
+    out.push(Span::styled("…", style));
+    out
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
@@ -358,4 +523,37 @@ pub fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
 /// helper every widget that lays text out column-by-column reads from.
 pub(crate) fn char_width(ch: char) -> usize {
     UnicodeWidthChar::width(ch).unwrap_or(0)
+}
+
+/// The terminal-cell width of `s` (the sum of its chars' display widths). The
+/// menu bar lays labels out in display columns, so `·`/non-ASCII repo names
+/// can't be measured by byte or char count.
+pub(crate) fn text_width(s: &str) -> usize {
+    s.chars().map(char_width).sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn joined(spans: &[Span<'static>]) -> String {
+        spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn fit_spans_keeps_a_line_that_fits() {
+        let out = fit_spans(vec![Span::raw("abc"), Span::raw(" de")], 10);
+        assert_eq!(joined(&out), "abc de");
+    }
+
+    #[test]
+    fn fit_spans_ellipsizes_once_when_a_span_exactly_fills_the_width() {
+        // The repo name exactly fills `max`; the trailing ` · history` label must
+        // not be dropped silently — a single ellipsis marks the truncation.
+        let out = fit_spans(vec![Span::raw("abcdefghij"), Span::raw(" · history")], 10);
+        let text = joined(&out);
+        assert!(text.ends_with('…'), "want a trailing ellipsis, got {text:?}");
+        assert_eq!(text.chars().filter(|&c| c == '…').count(), 1, "one ellipsis");
+        assert!(text_width(&text) <= 10, "width {} > 10", text_width(&text));
+    }
 }

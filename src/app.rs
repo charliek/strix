@@ -97,6 +97,15 @@ pub enum ViewMode {
     Review,
 }
 
+/// A top-level menu in the header menu bar. Enumerated by the header renderer
+/// (`ui::menu`) to draw the `View` / `Theme` labels; C4's dropdown open-state
+/// reuses it as the menu identifier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MenuId {
+    View,
+    Theme,
+}
+
 /// Which sub-pane of the review view receives keyboard input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReviewFocus {
@@ -661,6 +670,9 @@ pub struct App {
     /// number gutter, SBS's per-column 5-char gutter). The sign column in
     /// unified mode is unaffected. Toggled with `n`; from `Config.line_numbers`.
     pub show_line_numbers: bool,
+    /// Whether the top menu bar (the `View`/`Theme` labels in the header) is
+    /// shown. On by default; from `Config.menu_bar`, toggled with `m`.
+    pub show_menu_bar: bool,
     /// The diff pane's scroll offset, in physical layout rows (a `usize` since a
     /// few long comment boxes can push a diff past `u16::MAX` rows).
     pub diff_scroll: usize,
@@ -832,6 +844,7 @@ impl App {
             diff_dirty: false,
             diff_mode: config.diff_mode(),
             show_line_numbers: config.line_numbers(),
+            show_menu_bar: config.menu_bar(),
             diff_scroll: 0,
             diff_viewport: Cell::new(0),
             diff_content_rows: Cell::new(0),
@@ -1025,6 +1038,11 @@ impl App {
                 self.persist_setting(Setting::Theme(self.theme_name.clone()));
                 return;
             }
+            Action::ToggleMenuBar => {
+                self.show_menu_bar = !self.show_menu_bar;
+                self.persist_setting(Setting::MenuBar(self.show_menu_bar));
+                return;
+            }
             Action::Refresh => {
                 self.refresh_active();
                 return;
@@ -1145,6 +1163,7 @@ impl App {
             | Action::ToggleDiffMode
             | Action::ToggleLineNumbers
             | Action::CycleTheme
+            | Action::ToggleMenuBar
             | Action::ToggleHistory
             | Action::ShowStatus
             | Action::ShowHistory => {}
@@ -1195,6 +1214,7 @@ impl App {
             | Action::ToggleDiffMode
             | Action::ToggleLineNumbers
             | Action::CycleTheme
+            | Action::ToggleMenuBar
             | Action::ToggleHistory
             | Action::ShowStatus
             | Action::ShowHistory => {}
@@ -1249,6 +1269,7 @@ impl App {
             | Action::ToggleDiffMode
             | Action::ToggleLineNumbers
             | Action::CycleTheme
+            | Action::ToggleMenuBar
             | Action::ToggleHistory
             | Action::ShowStatus
             | Action::ShowHistory => {}

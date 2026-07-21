@@ -617,7 +617,7 @@ fn editor_body_spans(
 
 /// Fit `s` into `max` display columns (unicode-width aware), returning the
 /// fitted string and its exact width, appending `…` when it doesn't fit.
-fn fit_display(s: &str, max: usize) -> (String, usize) {
+pub(crate) fn fit_display(s: &str, max: usize) -> (String, usize) {
     let total: usize = s.chars().map(char_width).sum();
     if total <= max {
         return (s.to_string(), total);
