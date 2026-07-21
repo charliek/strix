@@ -13,15 +13,46 @@ These are the defaults. Every binding is remappable — see
 | `Tab`          | Switch focus between panes              |
 | `n`            | Toggle line numbers in the diff gutter (persists) |
 | `t`            | Cycle the theme (presets, then your custom themes; persists) |
+| `m`            | Show / hide the menu bar (persists)     |
 | `b`            | Show / hide the left panel              |
 | `i`            | Toggle the History view                 |
 | `1`, `2`       | Switch to the Status / History view (or the review session / History, in a `strix diff` session) |
 | `Esc`          | Close an overlay; leave History view    |
 
-`n` and `t` work in every view (Status, History, and the review view). While
-the discard-confirmation modal is open, `n` is consumed as "no" (dismiss the
-modal) rather than toggling line numbers; the global binding resumes once the
-modal closes.
+`n`, `t`, and `m` work in every view (Status, History, and the review view).
+While the discard-confirmation modal is open, `n` is consumed as "no"
+(dismiss the modal) rather than toggling line numbers; the global binding
+resumes once the modal closes.
+
+## Menu bar
+
+The header shows two dropdown menus, `View` and `Theme`, whenever the menu
+bar is visible (`m` toggles it, on by default — see
+[Configuration](../guides/configuration.md)). `View` holds diff mode
+(unified / side-by-side), line numbers, and a Status/History switcher; the
+current view's item is checked so the row that would just switch to itself
+still shows state, not a dead control. `Theme` lists the built-in presets and
+any custom `themes/*.toml` files, with the active one marked.
+
+**Opening a menu is mouse-first**: click a title (`View` or `Theme`) to open
+its dropdown. There's no keyboard chord to *open* one — every setting a menu
+exposes already has its own direct key (`d`, `n`, `t`, `1`, `2`). Once a menu
+is open, it's fully keyboard-navigable:
+
+| Key                | Action                                            |
+|--------------------|----------------------------------------------------|
+| `←`/`→`, `Tab`/`Shift+Tab` | Switch to the other top-level menu             |
+| `↑`/`↓`            | Move the highlight (skips separators, wraps at the ends) |
+| `Enter`, `Space`   | Activate the highlighted item and close the menu  |
+| `Esc`, `m`         | Close the menu without changing anything          |
+
+Clicking an item activates it the same way; clicking a separator or anywhere
+in the dropdown that isn't an item is consumed but does nothing; clicking
+another title switches menus; clicking outside the dropdown closes it and
+still routes the click to whatever's underneath. While a menu is open, moving
+the mouse (no click needed) over another title slides the dropdown to follow
+it, and moving over an item in the open dropdown moves the highlight — the
+same effect as arrowing to it.
 
 ## Changes pane
 
@@ -147,6 +178,7 @@ remapping one never affects the other.
 
 | Gesture                       | Action                                          |
 |-------------------------------|-------------------------------------------------|
+| Click a menu title (`View`/`Theme`) | Open its dropdown, or switch to it if another is already open (see [Menu bar](#menu-bar)) |
 | Click a file                  | Select it (and show its diff)                   |
 | Click a file's status marker  | Toggle stage / unstage (staging view only; a no-op in the read-only Review view) |
 | Click a pane                  | Focus that pane                                 |

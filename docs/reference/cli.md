@@ -2,20 +2,21 @@
 
 ```
 strix [OPTIONS] [PATH]
-strix diff <RANGE> [PATH]
+strix diff [RANGE] [PATH]
 strix comment [PATH] <list|add|rm|clear|gc>
 strix skill path [--json]
 ```
 
 The root form opens the staging view. `strix diff <RANGE>` opens a read-only
 review session comparing two commits instead — see
-[Reviewing a branch](../getting-started/usage.md#reviewing-a-branch).
-`strix comment` reads and edits the checked-out branch's comments inbox
-without opening the TUI at all — the agent-facing surface for the notes a
-human leaves either on uncommitted work in bare `strix` or in a review
-session — see [`strix comment`](#strix-comment) below. `strix skill` manages
-the bundled agent skill that teaches that workflow — see
-[`strix skill`](#strix-skill).
+[Reviewing a branch](../getting-started/usage.md#reviewing-a-branch). Bare
+`strix diff` (no `RANGE`) is an alias for the root form: it opens the same
+working-tree Status surface. `strix comment` reads and edits the checked-out
+branch's comments inbox without opening the TUI at all — the agent-facing
+surface for the notes a human leaves either on uncommitted work in bare
+`strix` or in a review session — see [`strix comment`](#strix-comment)
+below. `strix skill` manages the bundled agent skill that teaches that
+workflow — see [`strix skill`](#strix-skill).
 
 ## Root: `strix [PATH]`
 
@@ -23,12 +24,17 @@ the bundled agent skill that teaches that workflow — see
 |----------|----------------------------------------------------------|
 | `PATH`   | Repository to open. Defaults to the current directory.   |
 
-## `strix diff <RANGE> [PATH]`
+## `strix diff [RANGE] [PATH]`
 
 | Argument | Description                                              |
 |----------|----------------------------------------------------------|
-| `RANGE`  | Required. The range to review — see grammar below.       |
+| `RANGE`  | The range to review — see grammar below. Omit it to open the working-tree Status surface instead of a review. |
 | `PATH`   | Repository to open. Defaults to the current directory.   |
+
+A lone positional after `diff` is always taken as `RANGE`, never as `PATH` —
+there is no path-only `strix diff PATH` form (`strix diff some/repo` reviews
+the range `some/repo`, it does not open Status for that directory). To open
+Status for a specific repository, use the bare root form: `strix some/repo`.
 
 ### RANGE grammar
 
@@ -67,7 +73,9 @@ To open such a directory, prefix it with a path segment: `strix ./diff`,
 An unresolvable `RANGE` (unknown revision, a non-commit operand, or no merge
 base between the two sides) fails before the TUI opens: strix exits non-zero
 and prints a message to stderr naming the offending operand and the kind of
-failure. A missing `RANGE` on `strix diff` is a clap usage error.
+failure. A missing `RANGE` on `strix diff` opens Status instead of erroring
+(see above); an explicitly empty one (`strix diff ""`) still fails the same
+way as any other unresolvable range.
 
 ## `strix comment`
 

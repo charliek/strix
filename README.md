@@ -19,9 +19,12 @@ or mouse-unfriendly.
 ```
 
 Two panes, mouse + keyboard, syntax-highlighted diffs, themeable (cycle at
-runtime with `t`), toggleable line numbers (`n`) — plus a read-only
-**branch review** mode (`strix diff main`) for reviewing a branch against its
-base, GitHub-PR style. **Inline comments** — on uncommitted work in bare
+runtime with `t`, or pick one from the header's `Theme` menu), toggleable
+line numbers (`n`) — plus a read-only **branch review** mode
+(`strix diff main`) for reviewing a branch against its base, GitHub-PR style.
+A toggleable **menu bar** (`m`) puts the common view/theme settings behind a
+mouse-friendly `View`/`Theme` dropdown, keyboard-navigable once open.
+**Inline comments** — on uncommitted work in bare
 `strix` or in a review session — render as multi-line boxes you add or edit
 with `c` or a double-click, delete with `X` or a click on `[x]`; an agent
 reads them via `strix comment list --json` and clears each one via

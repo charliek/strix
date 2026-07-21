@@ -17,6 +17,10 @@ auto_refresh = true
 
 # Show line numbers in the diff gutter. On by default; toggle at runtime with `n`.
 line_numbers = true
+
+# Show the top menu bar (the `View`/`Theme` labels in the header). On by
+# default; set false to start with it hidden, or toggle at runtime with `m`.
+menu_bar = true
 ```
 
 ## Keybindings
@@ -33,6 +37,7 @@ switch_pane      = ["tab"]
 toggle_diff_mode = ["d"]
 toggle_line_numbers = ["n"]
 cycle_theme      = ["t"]
+toggle_menu_bar  = ["m"]
 toggle_changes   = ["b"]
 toggle_history   = ["i"]
 status_view      = ["1"]
@@ -68,7 +73,8 @@ Chord syntax: a key name (`a`, `enter`, `space`, `tab`, `esc`, `up`, `left`,
 `pageup`, …) optionally prefixed with `ctrl-`, `alt-`, or `shift-`
 (e.g. `ctrl-d`). `toggle_line_numbers` also accepts the config-file names
 `toggle-line-numbers` / `line-numbers`; `cycle_theme` also accepts
-`cycle-theme` / `theme`.
+`cycle-theme` / `theme`; `toggle_menu_bar` also accepts `toggle-menu-bar` /
+`menu-bar` / `menu`.
 
 The in-app help overlay (`?`) and the footer hints list the **default** keys,
 not any you've remapped here.
@@ -80,10 +86,14 @@ assignment in the table wins.
 
 ## Runtime changes persist
 
-Pressing `t` (cycle theme), `d` (toggle diff mode), or `n` (toggle line
-numbers) writes the new value into `config.toml` immediately, so the choice
-survives the next launch. Only these three explicit actions write anything —
-`[keys]` and `auto_refresh` are never touched by strix itself.
+Pressing `t` (cycle theme), `d` (toggle diff mode), `n` (toggle line
+numbers), or `m` (toggle menu bar) writes the new value into `config.toml`
+immediately, so the choice survives the next launch. Only these four explicit
+actions write anything — `[keys]` and `auto_refresh` are never touched by
+strix itself. Picking diff mode, line numbers, or a theme from the `View`/
+`Theme` menu bar dropdowns persists the same way as pressing its equivalent
+key, since it's the same action under the hood; picking Status/History from
+the `View` menu switches the view but doesn't persist, matching `1`/`2`/`i`.
 
 The write preserves everything else in the file: comments, unrelated keys and
 tables, and their formatting. Only the one changed value's own formatting may
