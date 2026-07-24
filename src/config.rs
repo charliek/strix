@@ -34,6 +34,11 @@ pub struct Config {
     /// default (long lines are truncated); set `true` to start with wrapping on
     /// (toggle at runtime with `w`).
     pub wrap_lines: Option<bool>,
+    /// Whether a wheel/keyboard scroll past the end of one file's diff crosses
+    /// into the next (or previous) file's diff. Off by default (scrolling clamps
+    /// at each file's edge); set `true` to start with it on (toggle at runtime
+    /// with `f`).
+    pub cross_file_scroll: Option<bool>,
 }
 
 impl Config {
@@ -58,6 +63,10 @@ impl Config {
 
     pub fn wrap_lines(&self) -> bool {
         self.wrap_lines.unwrap_or(false)
+    }
+
+    pub fn cross_file_scroll(&self) -> bool {
+        self.cross_file_scroll.unwrap_or(false)
     }
 }
 
@@ -87,13 +96,14 @@ pub fn load() -> Config {
 }
 
 /// A single scalar written back to `config.toml` by an explicit in-app action
-/// (`t`/`d`/`n`/`m`/`w`). See [`persist`].
+/// (`t`/`d`/`n`/`m`/`w`/`f`). See [`persist`].
 pub enum Setting {
     Theme(String),
     DiffMode(DiffMode),
     LineNumbers(bool),
     MenuBar(bool),
     WrapLines(bool),
+    CrossFileScroll(bool),
 }
 
 /// Persist one setting into `config_dir/config.toml`, preserving everything
@@ -130,6 +140,7 @@ pub fn persist(config_dir: &Path, setting: Setting) -> anyhow::Result<()> {
         Setting::LineNumbers(enabled) => doc["line_numbers"] = toml_edit::value(enabled),
         Setting::MenuBar(v) => doc["menu_bar"] = toml_edit::value(v),
         Setting::WrapLines(v) => doc["wrap_lines"] = toml_edit::value(v),
+        Setting::CrossFileScroll(v) => doc["cross_file_scroll"] = toml_edit::value(v),
     }
 
     write_atomic(config_dir, &path, &doc.to_string())

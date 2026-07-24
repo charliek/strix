@@ -20,6 +20,9 @@ pub enum Action {
     ToggleLineNumbers,
     /// Toggle hard line wrapping in the diff pane (`w`).
     ToggleWrap,
+    /// Toggle cross-file scroll: scrolling past a diff's edge crosses into the
+    /// next / previous file's diff (`f`).
+    ToggleCrossFileScroll,
     CycleTheme,
     /// Show or hide the top menu bar (the `View`/`Theme` labels in the header).
     ToggleMenuBar,
@@ -142,6 +145,7 @@ const DEFAULTS: &[(&str, Action)] = &[
     ("d", Action::ToggleDiffMode),
     ("n", Action::ToggleLineNumbers),
     ("w", Action::ToggleWrap),
+    ("f", Action::ToggleCrossFileScroll),
     ("t", Action::CycleTheme),
     ("m", Action::ToggleMenuBar),
     ("b", Action::ToggleChanges),
@@ -182,6 +186,7 @@ fn parse_action(name: &str) -> Option<Action> {
         "toggle-diff-mode" | "diff-mode" | "split" => Action::ToggleDiffMode,
         "toggle-line-numbers" | "line-numbers" => Action::ToggleLineNumbers,
         "toggle-wrap" | "wrap" => Action::ToggleWrap,
+        "toggle-cross-file-scroll" | "cross-file-scroll" => Action::ToggleCrossFileScroll,
         "cycle-theme" | "theme" => Action::CycleTheme,
         "toggle-menu-bar" | "menu-bar" | "menu" => Action::ToggleMenuBar,
         "toggle-changes" => Action::ToggleChanges,

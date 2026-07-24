@@ -25,6 +25,7 @@ fn with_config_applies_theme_and_diff_mode() {
         line_numbers: None,
         menu_bar: None,
         wrap_lines: None,
+        cross_file_scroll: None,
     };
     let app = App::with_config(repo.path().to_path_buf(), &config).unwrap();
     assert_eq!(app.theme.syntax_theme, "base16-eighties.dark");
