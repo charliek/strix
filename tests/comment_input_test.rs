@@ -1019,12 +1019,12 @@ fn c_on_an_offscreen_cursor_reveals_without_opening() {
     for _ in 0..12 {
         app.on_mouse(mouse(diff.x + 2, diff.y + 1, MouseEventKind::ScrollDown));
     }
-    assert!(app.diff_scroll > cursor, "the cursor is offscreen");
+    assert!(app.diff_scroll.get() > cursor, "the cursor is offscreen");
 
     app.on_key(key('c'));
     assert!(!app.editor_open(), "the first c only reveals — no editor");
     assert!(
-        app.diff_scroll <= cursor,
+        app.diff_scroll.get() <= cursor,
         "the cursor's row was scrolled back into view"
     );
 

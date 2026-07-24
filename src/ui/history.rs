@@ -178,6 +178,7 @@ fn render_details(frame: &mut Frame, area: Rect, app: &App) {
     // clamping the (now `usize`) offset can't lose anything real.
     let offset = app
         .diff_scroll
+        .get()
         .min(app.diff_max_scroll())
         .min(u16::MAX as usize) as u16;
     frame.render_widget(Paragraph::new(lines).scroll((offset, 0)), inner);

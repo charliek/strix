@@ -466,7 +466,7 @@ fn a_box_taller_than_the_viewport_reveals_its_top() {
         "a box taller than the viewport can't show its whole self:\n{frame}"
     );
     // The reveal top-aligns the box (its first row == the scroll offset).
-    assert_eq!(app.diff_scroll, app.review_cursor());
+    assert_eq!(app.diff_scroll.get(), app.review_cursor());
 }
 
 // --- Stale notes render dim ---

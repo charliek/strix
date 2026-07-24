@@ -30,6 +30,10 @@ pub struct Config {
     /// shown. On by default; set `false` to start with it hidden (toggle at
     /// runtime with `m`).
     pub menu_bar: Option<bool>,
+    /// Whether the diff pane hard-wraps long lines at the pane width. Off by
+    /// default (long lines are truncated); set `true` to start with wrapping on
+    /// (toggle at runtime with `w`).
+    pub wrap_lines: Option<bool>,
 }
 
 impl Config {
@@ -50,6 +54,10 @@ impl Config {
 
     pub fn menu_bar(&self) -> bool {
         self.menu_bar.unwrap_or(true)
+    }
+
+    pub fn wrap_lines(&self) -> bool {
+        self.wrap_lines.unwrap_or(false)
     }
 }
 
@@ -79,12 +87,13 @@ pub fn load() -> Config {
 }
 
 /// A single scalar written back to `config.toml` by an explicit in-app action
-/// (`t`/`d`/`n`/`m`). See [`persist`].
+/// (`t`/`d`/`n`/`m`/`w`). See [`persist`].
 pub enum Setting {
     Theme(String),
     DiffMode(DiffMode),
     LineNumbers(bool),
     MenuBar(bool),
+    WrapLines(bool),
 }
 
 /// Persist one setting into `config_dir/config.toml`, preserving everything
@@ -120,6 +129,7 @@ pub fn persist(config_dir: &Path, setting: Setting) -> anyhow::Result<()> {
         }
         Setting::LineNumbers(enabled) => doc["line_numbers"] = toml_edit::value(enabled),
         Setting::MenuBar(v) => doc["menu_bar"] = toml_edit::value(v),
+        Setting::WrapLines(v) => doc["wrap_lines"] = toml_edit::value(v),
     }
 
     write_atomic(config_dir, &path, &doc.to_string())

@@ -88,7 +88,7 @@ fn reload_keeps_the_scroll_position_for_the_same_file() {
     // The diff pane is cursor-driven: jump the cursor to the last row (`G`), whose
     // act-and-reveal scrolls the viewport down past the top.
     app.on_key(KeyEvent::from(KeyCode::Char('G')));
-    let scrolled = app.diff_scroll;
+    let scrolled = app.diff_scroll.get();
     assert!(scrolled > 0, "scrolled down into the diff");
 
     // An external in-place edit (as the watcher would trigger) reloads the same
@@ -100,7 +100,8 @@ fn reload_keeps_the_scroll_position_for_the_same_file() {
     app.reload();
 
     assert_eq!(
-        app.diff_scroll, scrolled,
+        app.diff_scroll.get(),
+        scrolled,
         "reloading the open file keeps the scroll position"
     );
 }

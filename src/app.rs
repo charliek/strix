@@ -145,6 +145,7 @@ pub(crate) enum Marker {
 pub(crate) enum MenuCommand {
     SetDiffMode(DiffMode),
     SetLineNumbers(bool),
+    SetWrap(bool),
     GoHome,
     EnterHistory,
     SetTheme(String),
@@ -264,12 +265,38 @@ struct HitTarget {
     region: ClickRegion,
 }
 
+/// A half-open char window `[start_char, end_char)` into a line's **sanitized**
+/// text (the same coordinate space as word-diff emphasis ranges, so a segment
+/// never needs its ranges remapped). One wrapped display row renders exactly one
+/// `Seg`; with wrap off a line is a single full-width `Seg`. `end_char` is stored
+/// (not re-derived) so the render primitive needs no second width pass (plan
+/// §3.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Seg {
+    pub start_char: usize,
+    pub end_char: usize,
+}
+
+impl Seg {
+    /// The whole line as one segment `[0, char_count)` — the wrap-off degenerate
+    /// case shared by the layout builder and the side-by-side renderer.
+    pub(crate) fn full(char_count: usize) -> Self {
+        Seg {
+            start_char: 0,
+            end_char: char_count,
+        }
+    }
+}
+
 /// What a physical [`LayoutRow`] draws. Code rows carry diff-line indices (a
 /// unified line, a side-by-side hunk header, or a side-by-side pair); a comment
 /// box expands to several `Box` rows sharing one [`RowTarget`].
 pub enum RowContent {
-    /// A unified diff line (index into the file's `Vec<DiffLine>`).
-    Line(usize),
+    /// One display row of a unified diff line: the line index into the file's
+    /// `Vec<DiffLine>` plus the char window this row renders. With wrap off the
+    /// window is the whole line; with wrap on a long line emits several `Line`
+    /// rows, one per [`Seg`], sharing a `RowTarget::Code` (plan §3.3).
+    Line { line: usize, seg: Seg },
     /// A side-by-side hunk header (index into `Vec<DiffLine>`), spanning both columns.
     Hunk(usize),
     /// A side-by-side pair of diff lines (either side may be blank).
@@ -331,17 +358,22 @@ pub enum BoxPart {
 /// preserving the logical targets.
 pub struct LayoutRow {
     pub target: RowTarget,
-    pub subrow: u16,
+    pub subrow: usize,
     pub side: Option<Side>,
     pub hit: HitRegion,
     pub content: RowContent,
 }
 
-/// The cached physical layout plus the `(width, mode)` it was built for, so a
-/// resize or a diff-mode toggle rebuilds it (the logical `RowTarget`s survive).
+/// The cached physical layout plus the inputs it was built for. A resize
+/// (`width`), a diff-mode toggle (`mode`), a wrap toggle (`wrap`), or a
+/// line-number toggle (`line_numbers`, which changes the gutter width and hence
+/// the wrap content width) each rebuild it; the logical `RowTarget`s survive
+/// (plan §3.3).
 struct CachedLayout {
     width: u16,
     mode: DiffMode,
+    wrap: bool,
+    line_numbers: bool,
     rows: Vec<LayoutRow>,
 }
 
@@ -736,6 +768,10 @@ pub struct App {
     /// Whether the top menu bar (the `View`/`Theme` labels in the header) is
     /// shown. On by default; from `Config.menu_bar`, toggled with `m`.
     pub show_menu_bar: bool,
+    /// Whether the diff pane hard-wraps long lines at the pane width. Off by
+    /// default; from `Config.wrap_lines`, toggled with `w`. A wrap input to the
+    /// physical layout, so a change rebuilds it (see [`App::diff_layout`]).
+    pub wrap_lines: bool,
     /// The open dropdown, or `None` when no menu is open. Opening is mouse-first
     /// (click a title); keyboard nav drives an already-open menu. Mutually
     /// exclusive with editing (see [`OpenMenu`]).
@@ -749,7 +785,10 @@ pub struct App {
     menu_dropdown: RefCell<Option<DropdownHit>>,
     /// The diff pane's scroll offset, in physical layout rows (a `usize` since a
     /// few long comment boxes can push a diff past `u16::MAX` rows).
-    pub diff_scroll: usize,
+    /// Interior-mutable: a structural relayout (resize, wrap/line-number toggle)
+    /// re-anchors it from the render path's `&self` to keep the top visible
+    /// logical line put (plan §3.3, `diff_layout`).
+    pub diff_scroll: Cell<usize>,
     /// Inner height (terminal rows, `u16`) and total physical content rows
     /// (`usize`) of the diff pane from the last render, so scrolling can clamp to
     /// the content in either mode. Interior-mutable because rendering takes `&App`.
@@ -919,10 +958,11 @@ impl App {
             diff_mode: config.diff_mode(),
             show_line_numbers: config.line_numbers(),
             show_menu_bar: config.menu_bar(),
+            wrap_lines: config.wrap_lines(),
             open_menu: None,
             menu_title_rects: RefCell::new(Vec::new()),
             menu_dropdown: RefCell::new(None),
-            diff_scroll: 0,
+            diff_scroll: Cell::new(0),
             diff_viewport: Cell::new(0),
             diff_content_rows: Cell::new(0),
             highlight_cache: RefCell::new(HashMap::new()),
@@ -1117,6 +1157,11 @@ impl App {
                 self.persist_setting(Setting::LineNumbers(self.show_line_numbers));
                 return;
             }
+            Action::ToggleWrap => {
+                self.toggle_wrap();
+                self.persist_setting(Setting::WrapLines(self.wrap_lines));
+                return;
+            }
             Action::CycleTheme => {
                 self.cycle_theme();
                 self.persist_setting(Setting::Theme(self.theme_name.clone()));
@@ -1264,6 +1309,7 @@ impl App {
             | Action::Refresh
             | Action::ToggleDiffMode
             | Action::ToggleLineNumbers
+            | Action::ToggleWrap
             | Action::CycleTheme
             | Action::ToggleMenuBar
             | Action::ToggleHistory
@@ -1315,6 +1361,7 @@ impl App {
             | Action::Refresh
             | Action::ToggleDiffMode
             | Action::ToggleLineNumbers
+            | Action::ToggleWrap
             | Action::CycleTheme
             | Action::ToggleMenuBar
             | Action::ToggleHistory
@@ -1370,6 +1417,7 @@ impl App {
             | Action::Refresh
             | Action::ToggleDiffMode
             | Action::ToggleLineNumbers
+            | Action::ToggleWrap
             | Action::CycleTheme
             | Action::ToggleMenuBar
             | Action::ToggleHistory
@@ -1521,7 +1569,7 @@ impl App {
         };
         let (start, end) = (span.start, span.end);
         let count = self.review_row_count();
-        let top = self.diff_scroll;
+        let top = self.diff_scroll.get();
         let new_top = if start < top || end.saturating_sub(start) >= viewport {
             // Above the viewport, or taller than it: top-align the box's first row.
             start
@@ -1533,7 +1581,7 @@ impl App {
         };
         // Never scroll past the last full page of content.
         let max_top = count.saturating_sub(viewport);
-        self.diff_scroll = new_top.min(max_top);
+        self.diff_scroll.set(new_top.min(max_top));
     }
 
     /// Whether the diff cursor target's first row lies within the visible
@@ -1548,7 +1596,7 @@ impl App {
         if viewport == 0 {
             return false;
         }
-        let top = self.diff_scroll.min(self.diff_max_scroll());
+        let top = self.diff_scroll.get().min(self.diff_max_scroll());
         cursor >= top && cursor < top + viewport
     }
 
@@ -2124,7 +2172,7 @@ impl App {
             return;
         }
         let count = self.review_row_count();
-        let top = self.diff_scroll.min(self.diff_max_scroll());
+        let top = self.diff_scroll.get().min(self.diff_max_scroll());
         let new_top = if caret < top {
             caret
         } else if caret >= top + viewport {
@@ -2133,7 +2181,7 @@ impl App {
             top
         };
         let max_top = count.saturating_sub(viewport);
-        self.diff_scroll = new_top.min(max_top);
+        self.diff_scroll.set(new_top.min(max_top));
     }
 
     /// The physical layout row the editor caret sits on — the editor body row whose
@@ -2440,7 +2488,7 @@ impl App {
         };
         self.selected_commit = 0;
         self.committed_row = 0;
-        self.diff_scroll = 0;
+        self.diff_scroll.set(0);
         self.load_commit_files();
         self.sync_history_diff();
     }
@@ -2585,7 +2633,8 @@ impl App {
                 self.committed_row = if bottom { self.commit_files.len() } else { 0 };
             }
             HistoryFocus::Diff => {
-                self.diff_scroll = if bottom { self.diff_max_scroll() } else { 0 };
+                self.diff_scroll
+                    .set(if bottom { self.diff_max_scroll() } else { 0 });
             }
         }
     }
@@ -2756,7 +2805,15 @@ impl App {
         if !diff.contains(pos) {
             return None;
         }
-        let offset = self.diff_scroll.min(self.diff_max_scroll());
+        // Build the layout FIRST: a queued relayout earlier in this event batch
+        // (a `w`/`n`/resize before the click, drained before any redraw) rebuilds
+        // it here and re-anchors `diff_scroll`. Reading the offset only after that
+        // — and clamping against the just-built row count, not the stale render-
+        // time metric — keeps the layout, offset, and lookup one consistent
+        // snapshot, so the click resolves against the rows the next frame paints.
+        let rows = self.diff_layout(self.diff_pane_width()).len();
+        let max = rows.saturating_sub(diff.height as usize);
+        let offset = self.diff_scroll.get().min(max);
         Some(offset + (pos.y - diff.y) as usize)
     }
 
@@ -2995,7 +3052,7 @@ impl App {
             // Hit-test against the same clamped offset the renderer paints with
             // (diff_view.rs clamps to diff_max_scroll); a raw diff_scroll would
             // desync clicks after content shrank at max scroll (finding 5).
-            let offset = self.diff_scroll.min(self.diff_max_scroll());
+            let offset = self.diff_scroll.get().min(self.diff_max_scroll());
             let row = offset + (pos.y - diff.y) as usize;
             let count = self.review_row_count();
             if row < count {
@@ -3118,12 +3175,12 @@ impl App {
         // a small terminal-row count (`u16`); the offset it moves is a `usize`.
         let step = step as usize;
         let max = self.diff_max_scroll();
-        let current = self.diff_scroll.min(max);
-        self.diff_scroll = if down {
+        let current = self.diff_scroll.get().min(max);
+        self.diff_scroll.set(if down {
             (current + step).min(max)
         } else {
             current.saturating_sub(step)
-        };
+        });
     }
 
     /// The selection index of the file at a screen position in the staging pane,
@@ -3292,7 +3349,7 @@ impl App {
         if file_changed {
             // Only a different file starts at the top; refreshing the open file
             // in place must not yank the view back up while the user scrolls.
-            self.diff_scroll = 0;
+            self.diff_scroll.set(0);
             // The new file's layout doesn't exist yet; reset the diff cursor to its
             // top (`None`), resolved to row 0 by the next render.
             self.status_pane.cursor = None;
@@ -3721,7 +3778,7 @@ impl App {
     /// Reset the diff pane to the top and drop the per-file render caches, which
     /// describe the diff being replaced.
     fn reset_diff_view(&mut self) {
-        self.diff_scroll = 0;
+        self.diff_scroll.set(0);
         self.highlight_cache.borrow_mut().clear();
         *self.layout.borrow_mut() = None;
     }
@@ -3755,21 +3812,58 @@ impl App {
     /// This is the single backing store read by both the cursor seam and the
     /// renderer.
     pub fn diff_layout(&self, width: u16) -> Ref<'_, Vec<LayoutRow>> {
-        let stale = self
+        // Wrap and the line-number gutter are both wrap inputs (the gutter sets
+        // the content width a line wraps at), so a change in either invalidates
+        // the cache alongside width and mode (plan §3.3).
+        let current = (
+            width,
+            self.diff_mode,
+            self.wrap_lines,
+            self.show_line_numbers,
+        );
+        let previous = self
             .layout
             .borrow()
             .as_ref()
-            .is_none_or(|cached| cached.width != width || cached.mode != self.diff_mode);
+            .map(|c| (c.width, c.mode, c.wrap, c.line_numbers));
+        let stale = previous != Some(current);
         if stale {
+            // Anchor the top visible logical line across a *structural* relayout —
+            // a resize, a wrap toggle, or a line-number toggle — so the row the
+            // user was reading stays at the top (plan §3.3). Skip it when the mode
+            // changed (`toggle_diff_mode` resets scroll+cursor itself) and when
+            // there was no prior layout (first build, or a comment mutation dropped
+            // the cache to `None` — those preserve `diff_scroll` verbatim).
+            let anchor = match &previous {
+                Some((_, prev_mode, _, _)) if *prev_mode == self.diff_mode => {
+                    let top = self.diff_scroll.get().min(self.diff_max_scroll());
+                    self.layout
+                        .borrow()
+                        .as_ref()
+                        .and_then(|c| c.rows.get(top))
+                        .map(|row| row.target)
+                }
+                _ => None,
+            };
             let rows = self.build_layout(width);
             // Every actual rebuild bumps the layout generation, the double-click
             // `HitTarget`'s `generation` field (plan §3.6): a resize, mode toggle,
             // or comment mutation (via `invalidate_comment_rows` → `layout = None`)
             // all funnel through here, so a relayout between two clicks is caught.
             self.layout_generation.set(self.layout_generation.get() + 1);
+            // Put the anchored target's first row back at the viewport top (0 if it
+            // is gone). It may exceed the fresh content's max scroll (metrics update
+            // after this call); every reader clamps `diff_scroll.min(max)`, so an
+            // over-large value normalises on first use.
+            if let Some(target) = anchor {
+                let row = rows.iter().position(|r| r.target == target).unwrap_or(0);
+                self.diff_scroll.set(row);
+            }
             *self.layout.borrow_mut() = Some(CachedLayout {
                 width,
                 mode: self.diff_mode,
+                wrap: self.wrap_lines,
+                line_numbers: self.show_line_numbers,
                 rows,
             });
         }
@@ -3843,18 +3937,36 @@ impl App {
         editor_line: Option<usize>,
     ) -> Vec<LayoutRow> {
         let place = BoxPlacement::Unified(width as usize);
+        // Wrap at the same content width the renderer draws into — derived from
+        // this diff's line-number column width, so a 5+-digit number can't clip a
+        // wrapped segment (they must agree; both call `line_number_width(lines)`).
+        let number_width = crate::ui::diff_view::line_number_width(lines);
+        let content_w = crate::ui::diff_view::unified_content_width(
+            width as usize,
+            self.show_line_numbers,
+            number_width,
+        );
         let mut rows = Vec::with_capacity(lines.len() + orphans.len());
         for &id in orphans {
             self.push_comment_box(&mut rows, id, true, place);
         }
-        for index in 0..lines.len() {
-            rows.push(LayoutRow {
-                target: RowTarget::Code(index),
-                subrow: 0,
-                side: None,
-                hit: HitRegion::Code,
-                content: RowContent::Line(index),
-            });
+        for (index, line) in lines.iter().enumerate() {
+            // One display row per wrapped segment, all sharing `Code(index)` with
+            // an incrementing subrow — so the cursor span, single-step `j`, whole-
+            // unit highlight and hit-testing treat a wrapped line as one unit. With
+            // wrap off (or a hunk header, which never wraps) this is a single
+            // full-width segment — the same code path (plan §3.3).
+            for (subrow, seg) in self.unified_line_segments(line, content_w) {
+                rows.push(LayoutRow {
+                    target: RowTarget::Code(index),
+                    subrow,
+                    side: None,
+                    hit: HitRegion::Code,
+                    content: RowContent::Line { line: index, seg },
+                });
+            }
+            // Comment boxes and the editor insert after the anchored line's *last*
+            // subrow (they are appended after the whole segment run above).
             for &id in comments_after(placements, index) {
                 self.push_comment_box(&mut rows, id, false, place);
             }
@@ -3863,6 +3975,21 @@ impl App {
             }
         }
         rows
+    }
+
+    /// The wrapped segments of one unified diff line, paired with their subrow
+    /// index. With wrap off, or for a hunk header (which never wraps), this is a
+    /// single full-width segment `[0, char_count)`; with wrap on it is the display-
+    /// column hard wrap of the *sanitized* text at `content_w` (plan §3.3).
+    fn unified_line_segments(&self, line: &DiffLine, content_w: usize) -> Vec<(usize, Seg)> {
+        let clean = crate::ui::diff_view::sanitize(&line.text);
+        let count = clean.chars().count();
+        let segs = if self.wrap_lines && line.kind != LineKind::Hunk {
+            crate::ui::diff_view::wrap_segments(&clean, content_w)
+        } else {
+            vec![Seg::full(count)]
+        };
+        segs.into_iter().enumerate().collect()
     }
 
     /// The side-by-side physical layout: the orphan block, then paired code rows,
@@ -3984,7 +4111,7 @@ impl App {
         for (subrow, part) in parts.into_iter().enumerate() {
             rows.push(LayoutRow {
                 target,
-                subrow: subrow as u16,
+                subrow,
                 side,
                 hit: HitRegion::Body(id),
                 content: RowContent::Box(BoxRow {
@@ -4015,7 +4142,7 @@ impl App {
         for (subrow, part) in parts.into_iter().enumerate() {
             rows.push(LayoutRow {
                 target: RowTarget::Editor,
-                subrow: subrow as u16,
+                subrow,
                 side,
                 hit: HitRegion::Code,
                 content: RowContent::Editor(part),
@@ -4415,7 +4542,7 @@ impl App {
             DiffMode::Unified => DiffMode::SideBySide,
             DiffMode::SideBySide => DiffMode::Unified,
         };
-        self.diff_scroll = 0;
+        self.diff_scroll.set(0);
         // A mode change relayouts the whole diff; drop any half-formed double-click
         // so a click before it can't pair with one after (plan §3.6).
         self.last_click = None;
@@ -4425,14 +4552,23 @@ impl App {
         self.set_review_cursor(None);
     }
 
-    /// Flip the line-number gutter on/off. The gutter width is computed fresh
-    /// each render from `show_line_numbers` (see `ui::diff_view`); the row
-    /// `layout` is keyed by pane width and mode, not the gutter (a comment box
-    /// spans the full pane / column regardless), and the `highlight_cache`'s spans
-    /// cover the full line and are trimmed to width after lookup — so no cache
-    /// needs invalidating here.
+    /// Flip the line-number gutter on/off. The gutter width feeds the content
+    /// width a line wraps at, so the `layout` cache tracks `show_line_numbers`
+    /// and rebuilds here (see [`App::diff_layout`]); that rebuild re-anchors the
+    /// top visible logical line, so the view doesn't jump on `n` while wrap is on.
+    /// The `highlight_cache`'s spans cover the full line and are windowed at
+    /// render time, so it never needs invalidating.
     fn toggle_line_numbers(&mut self) {
         self.show_line_numbers = !self.show_line_numbers;
+    }
+
+    /// Flip hard line wrapping on/off. Wrap is a physical-layout input, so the
+    /// next `diff_layout` rebuilds the row list and re-anchors the top visible
+    /// logical line (plan §3.3). The cursor addresses a logical target and so
+    /// survives untouched (unlike `toggle_diff_mode`, whose row indices change
+    /// meaning).
+    fn toggle_wrap(&mut self) {
+        self.wrap_lines = !self.wrap_lines;
     }
 
     /// Advance to the next theme in `Theme::available` (presets then user themes),
@@ -4499,6 +4635,12 @@ impl App {
                         marker: Marker::Check(self.show_line_numbers),
                         hint: Some("n"),
                         command: MenuCommand::SetLineNumbers(!self.show_line_numbers),
+                    },
+                    MenuRow::Item {
+                        label: "Wrap lines".to_string(),
+                        marker: Marker::Check(self.wrap_lines),
+                        hint: Some("w"),
+                        command: MenuCommand::SetWrap(!self.wrap_lines),
                     },
                     MenuRow::Separator,
                     MenuRow::Item {
@@ -4645,6 +4787,12 @@ impl App {
                 if self.show_line_numbers != on {
                     self.toggle_line_numbers();
                     self.persist_setting(Setting::LineNumbers(self.show_line_numbers));
+                }
+            }
+            MenuCommand::SetWrap(on) => {
+                if self.wrap_lines != on {
+                    self.toggle_wrap();
+                    self.persist_setting(Setting::WrapLines(self.wrap_lines));
                 }
             }
             MenuCommand::SetTheme(name) => {

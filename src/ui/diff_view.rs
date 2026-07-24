@@ -9,7 +9,7 @@ use ratatui::Frame;
 use syntect::parsing::SyntaxReference;
 
 use crate::app::{
-    sbs_columns, App, BoxPart, BoxRow, EditorPart, LayoutRow, PairEmphasis, RowContent,
+    sbs_columns, App, BoxPart, BoxRow, EditorPart, LayoutRow, PairEmphasis, RowContent, Seg,
 };
 use crate::comments::Side;
 use crate::git::{DiffLine, FileDiff, LineKind};
@@ -17,20 +17,39 @@ use crate::ui::syntax::syntax_for;
 use crate::ui::theme::Theme;
 use crate::ui::{centered_hint, char_width, panel_block};
 
-/// Unified gutter: `oldd nnnn ` → 4 + 1 + 4 + 1.
-const GUTTER_WIDTH: usize = 10;
+/// The minimum width of one line-number column (`nnnn`), so a ≤9999-line file
+/// renders the classic 4-digit gutter unchanged; wider files widen it per-diff.
+const NUM_MIN_WIDTH: usize = 4;
 /// Unified change-sign column: `+ ` / `- ` / `  `.
 const SIGN_WIDTH: usize = 2;
 /// Side-by-side per-column gutter: `nnnn ` → 4 + 1.
 const SBS_GUTTER: usize = 5;
 
-/// The unified gutter's width for the current `show_line_numbers` setting —
-/// `GUTTER_WIDTH` when shown, `0` when hidden (the sign column is unaffected
-/// and always renders). The single source of truth for both emitting the
-/// gutter and sizing the remaining content width, so they can't drift.
-fn unified_gutter_width(show_line_numbers: bool) -> usize {
+/// The decimal-digit width the line-number columns need for this diff: at least
+/// [`NUM_MIN_WIDTH`] (so ≤9999-line files render exactly as before), widened to
+/// fit the largest old/new line number. A fixed 4-wide column silently clips a
+/// 5+-digit number, and under wrap that clip shortens the gutter and pushes every
+/// wrapped segment out of alignment (losing content); sizing the gutter to the
+/// actual numbers keeps the reserved and drawn widths equal. The single source of
+/// truth read by both the layout's wrap width and the renderer's widths.
+pub(crate) fn line_number_width(lines: &[DiffLine]) -> usize {
+    let widest = lines
+        .iter()
+        .flat_map(|l| [l.old_no, l.new_no])
+        .flatten()
+        .max()
+        .map_or(1, |n| n.checked_ilog10().unwrap_or(0) as usize + 1);
+    widest.max(NUM_MIN_WIDTH)
+}
+
+/// The unified gutter's width for the current `show_line_numbers` setting and
+/// per-diff `number_width`: two number columns plus their two trailing spaces
+/// (`nnnn nnnn `) when shown, `0` when hidden (the sign column is unaffected and
+/// always renders). The single source of truth for both emitting the gutter and
+/// sizing the remaining content width, so they can't drift.
+fn unified_gutter_width(show_line_numbers: bool, number_width: usize) -> usize {
     if show_line_numbers {
-        GUTTER_WIDTH
+        2 * number_width + 2
     } else {
         0
     }
@@ -44,6 +63,22 @@ fn sbs_gutter_width(show_line_numbers: bool) -> usize {
     } else {
         0
     }
+}
+
+/// The display-column width available for a unified line's *content* at pane
+/// width `pane_width`: the pane minus the (toggleable) line-number gutter minus
+/// the always-present change-sign column. `number_width` is this diff's per-diff
+/// line-number column width ([`line_number_width`]). The single source of truth
+/// for both the layout's wrap width and the renderer's content width, so a wrapped
+/// segment always fits exactly where it is drawn (plan §3.3).
+pub(crate) fn unified_content_width(
+    pane_width: usize,
+    show_line_numbers: bool,
+    number_width: usize,
+) -> usize {
+    pane_width
+        .saturating_sub(unified_gutter_width(show_line_numbers, number_width))
+        .saturating_sub(SIGN_WIDTH)
 }
 
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
@@ -95,9 +130,12 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
 
     let syntax = syntax_for(path.as_deref().unwrap_or(""));
     let (left_w, right_w) = sbs_columns(inner.width);
-    let body_width =
-        (inner.width as usize).saturating_sub(unified_gutter_width(app.show_line_numbers));
-    let offset = app.diff_scroll.min(app.diff_max_scroll());
+    // Per-diff number-column width — matches what the layout builder wrapped at
+    // (both derive it from the same lines), so gutter and content never drift.
+    let number_width = line_number_width(lines);
+    let content_width =
+        unified_content_width(inner.width as usize, app.show_line_numbers, number_width);
+    let offset = app.diff_scroll.get().min(app.diff_max_scroll());
 
     let mut out: Vec<Line> = Vec::new();
     let mut x_rects: HashMap<u64, Rect> = HashMap::new();
@@ -109,7 +147,16 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     {
         let screen_y = inner.y + (i - offset) as u16;
         let line = match &row.content {
-            RowContent::Line(li) => unified_line(app, &lines[*li], theme, syntax, body_width),
+            RowContent::Line { line: li, seg } => unified_line(
+                app,
+                &lines[*li],
+                theme,
+                syntax,
+                content_width,
+                number_width,
+                *seg,
+                row.subrow == 0,
+            ),
             RowContent::Hunk(h) => hunk_line(&lines[*h], theme),
             RowContent::Pair {
                 left,
@@ -181,12 +228,22 @@ fn mark_cursor_row(line: Line<'static>, is_cursor: bool, theme: &Theme) -> Line<
     Line::from(spans)
 }
 
+/// One unified display row: the gutter + sign + the segment of the line's
+/// content this row covers. `seg` is the char window (the whole line with wrap
+/// off, one wrapped slice with it on); `first` is true only for a line's top
+/// subrow. On continuation rows the gutter and sign columns render as equal-width
+/// blanks styled like a row-zero gutter — gutter styling, never the line's
+/// add/del background (plan §3.3) — while the content keeps the line background.
+#[allow(clippy::too_many_arguments)]
 fn unified_line(
     app: &App,
     line: &DiffLine,
     theme: &Theme,
     syntax: &SyntaxReference,
-    body_width: usize,
+    content_width: usize,
+    number_width: usize,
+    seg: Seg,
+    first: bool,
 ) -> Line<'static> {
     if line.kind == LineKind::Hunk {
         return hunk_line(line, theme);
@@ -198,18 +255,35 @@ fn unified_line(
         _ => ("  ", theme.fg, theme.bg),
     };
 
+    let gutter_style = Style::new().fg(theme.line_no);
     let mut spans = Vec::new();
-    if app.show_line_numbers {
-        let gutter = format!("{} {} ", gutter_num(line.old_no), gutter_num(line.new_no));
-        spans.push(Span::styled(gutter, Style::new().fg(theme.line_no)));
+    if first {
+        if app.show_line_numbers {
+            let gutter = format!(
+                "{} {} ",
+                gutter_num(line.old_no, number_width),
+                gutter_num(line.new_no, number_width)
+            );
+            spans.push(Span::styled(gutter, gutter_style));
+        }
+        spans.push(Span::styled(sign, Style::new().fg(sign_fg).bg(bg)));
+    } else {
+        // Continuation row: blank gutter + blank sign, gutter-styled (no line bg).
+        // The gutter blank must match the row-zero gutter's dynamic width exactly,
+        // or wrapped content shifts on continuation rows.
+        if app.show_line_numbers {
+            let width = unified_gutter_width(true, number_width);
+            spans.push(Span::styled(" ".repeat(width), gutter_style));
+        }
+        spans.push(Span::styled(" ".repeat(SIGN_WIDTH), gutter_style));
     }
-    spans.push(Span::styled(sign, Style::new().fg(sign_fg).bg(bg)));
-    spans.extend(highlighted_content(
-        app,
-        syntax,
-        &theme.syntax_theme,
-        &line.text,
-        body_width.saturating_sub(SIGN_WIDTH),
+    let highlighted = app.highlight(syntax, &theme.syntax_theme, &sanitize(&line.text));
+    spans.extend(slice_spans(
+        &highlighted,
+        seg,
+        // Horizontal scroll is C6; wire the parameter, pass 0 for now.
+        0,
+        content_width,
         bg,
         // Word-diff emphasis is a side-by-side feature only (plan §3.7).
         None,
@@ -302,7 +376,9 @@ fn cell(
     let gutter_w = sbs_gutter_width(app.show_line_numbers);
     let mut spans = Vec::new();
     if app.show_line_numbers {
-        let gutter = format!("{} ", gutter_num(number));
+        // Side-by-side keeps its fixed 4-wide number column for C3 (its wrap +
+        // dynamic gutter are C4's scope); `SBS_GUTTER` reserves exactly that.
+        let gutter = format!("{} ", gutter_num(number, NUM_MIN_WIDTH));
         spans.push(Span::styled(gutter, Style::new().fg(theme.line_no)));
     }
     spans.extend(highlighted_content(
@@ -665,27 +741,146 @@ fn highlighted_content(
     emphasis: Option<(&[Range<usize>], Color)>,
 ) -> Vec<Span<'static>> {
     let clean = sanitize(text);
+    let highlighted = app.highlight(syntax, theme_name, &clean);
+    // The whole line as one segment: identical to windowing `[0, char_count)`
+    // with no horizontal skip, so side-by-side cells (which never wrap in C3)
+    // render exactly as before.
+    let full = Seg::full(clean.chars().count());
+    slice_spans(&highlighted, full, 0, width, bg, emphasis)
+}
+
+/// Split sanitized `text` into display-column-hard-wrapped segments, each a
+/// `[start_char, end_char)` window into the same text, at content width `width`
+/// (plan §3.2). Guarantees:
+/// - **Progress**: `width` is floored to 1, and every segment holds ≥1 char, so
+///   a pathological width can't loop or emit unbounded rows.
+/// - **Wide chars stay whole**: a double-width char that would overflow the
+///   current segment moves wholly to the next one (never split across a boundary).
+/// - **Combining marks stay glued**: a zero-width char never *starts* a segment —
+///   it is folded onto the preceding base char's segment, matching how the
+///   renderer glues it (a boundary landing on a bare mark would strand it).
+///
+/// An empty line yields one empty segment `[0, 0)` so it still renders a blank row.
+pub(crate) fn wrap_segments(text: &str, width: usize) -> Vec<Seg> {
+    let width = width.max(1);
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    if n == 0 {
+        return vec![Seg::full(0)];
+    }
+    let mut segs = Vec::new();
+    let mut start = 0;
+    let mut col = 0;
+    let mut i = 0;
+    while i < n {
+        let w = char_width(chars[i]);
+        // Would this char overflow the current segment? Close it first — but only
+        // if the segment already holds a char, so a lone char wider than `width`
+        // still makes progress (the ≥1-char floor).
+        if col + w > width && i > start {
+            segs.push(Seg {
+                start_char: start,
+                end_char: i,
+            });
+            start = i;
+            col = 0;
+        }
+        col += w;
+        i += 1;
+        // Fold any trailing zero-width chars (combining marks/ZWJ) into this
+        // segment so a boundary never lands on a bare mark.
+        while i < n && char_width(chars[i]) == 0 {
+            i += 1;
+        }
+    }
+    segs.push(Seg {
+        start_char: start,
+        end_char: n,
+    });
+    segs
+}
+
+/// Emit the spans for one display row: the highlighted spans of a full line
+/// windowed to the char range `seg`, after skipping `col_skip` further display
+/// columns (horizontal scroll — C6; pass 0 to disable), fitted to `width`
+/// display columns and padded so the background fills the row (plan §3.2).
+///
+/// `highlighted`'s chunks concatenate to the line's sanitized text, so `char_idx`
+/// counts absolute sanitized chars — the same coordinate as `seg` and `emphasis`,
+/// which is why emphasis ranges are never remapped. Pinned guarantees:
+/// - A zero-width char glues onto the current chunk (never its own span), so a
+///   combining mark renders in the same cell as its base.
+/// - A wide char that would overflow `width` at the trailing edge is dropped and
+///   the row padded to `width` (matching the pre-wrap truncation policy); a wide
+///   char straddling the `col_skip` leading edge emits background pad for its
+///   visible overhang, so a horizontal offset lands deterministically.
+/// - Passing the caller's clean+highlight, the whole-line segment and `col_skip`
+///   0 reproduces the old truncating renderer exactly.
+fn slice_spans(
+    highlighted: &[(Color, String)],
+    seg: Seg,
+    col_skip: usize,
+    width: usize,
+    bg: Color,
+    emphasis: Option<(&[Range<usize>], Color)>,
+) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
-    let mut used = 0; // display columns consumed, for width truncation/padding
-    let mut char_idx = 0; // char offset into `clean`, aligned with `emphasis`'s ranges
-    'tokens: for (color, piece) in app.highlight(syntax, theme_name, &clean).iter() {
+    let mut used = 0; // display columns emitted into the visible window
+    let mut skipped = 0; // display columns consumed by the `col_skip` lead-in
+    let mut char_idx = 0; // absolute sanitized-char offset, aligned with `emphasis`
+    'tokens: for (color, piece) in highlighted.iter() {
         if used >= width {
             break;
         }
         let mut chunk = String::new();
         let mut chunk_bg = bg;
         for ch in piece.chars() {
-            let ch_width = char_width(ch);
-            if used + ch_width > width {
+            // Before the segment window: swallow chars without emitting.
+            if char_idx < seg.start_char {
+                char_idx += 1;
+                continue;
+            }
+            // Past the segment window: stop the whole line so a later, differently-
+            // highlighted token can't render beyond the segment (and desync
+            // `char_idx` from `emphasis`).
+            if char_idx >= seg.end_char {
                 if !chunk.is_empty() {
                     spans.push(Span::styled(chunk, Style::new().fg(*color).bg(chunk_bg)));
                 }
                 break 'tokens;
             }
+            let ch_width = char_width(ch);
+            // A zero-width char is glued onto the current chunk regardless of its
+            // own background, keeping the cluster in one cell.
             if ch_width == 0 && !chunk.is_empty() {
                 chunk.push(ch);
                 char_idx += 1;
                 continue;
+            }
+            // Horizontal lead-in: skip whole display columns before the visible
+            // start. A wide char straddling the boundary emits background pad for
+            // the columns that peek past it.
+            if skipped < col_skip {
+                let remaining = col_skip - skipped;
+                char_idx += 1;
+                if ch_width <= remaining {
+                    skipped += ch_width;
+                    continue;
+                }
+                skipped = col_skip;
+                let overhang = (ch_width - remaining).min(width - used);
+                if overhang > 0 {
+                    spans.push(Span::styled(" ".repeat(overhang), Style::new().bg(bg)));
+                    used += overhang;
+                }
+                continue;
+            }
+            // A wide char that no longer fits ends the line (padded below).
+            if used + ch_width > width {
+                if !chunk.is_empty() {
+                    spans.push(Span::styled(chunk, Style::new().fg(*color).bg(chunk_bg)));
+                }
+                break 'tokens;
             }
             let ch_bg = char_bg(char_idx, emphasis, bg);
             if !chunk.is_empty() && ch_bg != chunk_bg {
@@ -737,9 +932,183 @@ pub(crate) fn sanitize(text: &str) -> String {
     out
 }
 
-fn gutter_num(no: Option<usize>) -> String {
+/// One line-number column, right-aligned to this diff's `width`
+/// ([`line_number_width`]) so a present number and a blank sibling occupy the
+/// same span — the reserved gutter width and the drawn glyphs stay equal.
+fn gutter_num(no: Option<usize>, width: usize) -> String {
     match no {
-        Some(n) => format!("{n:>4}"),
-        None => "    ".to_string(),
+        Some(n) => format!("{n:>width$}"),
+        None => " ".repeat(width),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The visible glyphs a run of spans emits, with the trailing background pad
+    /// stripped, plus the run's total display width (pad included).
+    fn rendered(spans: &[Span<'static>]) -> (String, usize) {
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        let width: usize = text.chars().map(char_width).sum();
+        (text.trim_end().to_string(), width)
+    }
+
+    fn one_span(text: &str) -> Vec<(Color, String)> {
+        vec![(Color::Reset, text.to_string())]
+    }
+
+    fn seg(start: usize, end: usize) -> Seg {
+        Seg {
+            start_char: start,
+            end_char: end,
+        }
+    }
+
+    fn ctx(old_no: Option<usize>, new_no: Option<usize>) -> DiffLine {
+        DiffLine {
+            kind: LineKind::Context,
+            old_no,
+            new_no,
+            text: String::new(),
+        }
+    }
+
+    #[test]
+    fn number_width_floors_at_four_and_widens_for_five_plus_digits() {
+        // ≤9999-line files keep the classic 4-wide column (gutter stays 10).
+        let small = [ctx(Some(1), Some(1)), ctx(Some(42), Some(9999))];
+        assert_eq!(line_number_width(&small), 4);
+        assert_eq!(unified_gutter_width(true, line_number_width(&small)), 10);
+
+        // A 5-digit number widens the column to 5 (gutter 12), so the drawn gutter
+        // matches the reserved one and wrapped content can't be clipped.
+        let big = [ctx(Some(9998), Some(10000)), ctx(None, Some(10005))];
+        assert_eq!(line_number_width(&big), 5);
+        assert_eq!(unified_gutter_width(true, line_number_width(&big)), 12);
+
+        // Empty / no-number lines fall back to the floor.
+        assert_eq!(line_number_width(&[ctx(None, None)]), 4);
+        assert_eq!(line_number_width(&[]), 4);
+    }
+
+    #[test]
+    fn gutter_num_pads_to_the_dynamic_width() {
+        assert_eq!(gutter_num(Some(7), 4), "   7");
+        assert_eq!(gutter_num(Some(10005), 5), "10005");
+        assert_eq!(gutter_num(None, 5), "     ");
+    }
+
+    #[test]
+    fn wrap_splits_on_display_columns() {
+        // "abcdef" at width 2 -> [0,2) [2,4) [4,6).
+        let segs = wrap_segments("abcdef", 2);
+        assert_eq!(segs, vec![seg(0, 2), seg(2, 4), seg(4, 6)]);
+    }
+
+    #[test]
+    fn wrap_empty_line_is_one_empty_segment() {
+        assert_eq!(wrap_segments("", 8), vec![seg(0, 0)]);
+    }
+
+    #[test]
+    fn wrap_wide_char_moves_wholly_to_next_segment() {
+        // "a世b" — '世' is 2 cols. Width 2: 'a'(1) fits; '世'(2) would overflow the
+        // remaining 1 col, so it starts the next segment whole; then 'b'.
+        let segs = wrap_segments("a世b", 2);
+        assert_eq!(segs, vec![seg(0, 1), seg(1, 2), seg(2, 3)]);
+        // Width 1: '世' alone is wider than the content — the ≥1-char floor still
+        // makes progress rather than looping.
+        let segs = wrap_segments("世世", 1);
+        assert_eq!(segs, vec![seg(0, 1), seg(1, 2)]);
+    }
+
+    #[test]
+    fn wrap_never_starts_a_segment_on_a_combining_mark() {
+        // "e\u{301}" (e + combining acute) is one cell. A boundary must not fall
+        // between the base and its mark, so both stay in the same segment.
+        let text = "ae\u{301}b"; // a, e, ́, b  (chars 0..4, cols a=1 e=1 mark=0 b=1)
+        let segs = wrap_segments(text, 2);
+        // width 2: 'a'(1)+'e'(1) fill the row; the mark (col 0) folds onto 'e';
+        // 'b' starts the next segment. So [0,3) then [3,4).
+        assert_eq!(segs, vec![seg(0, 3), seg(3, 4)]);
+        for s in &segs {
+            let first = text.chars().nth(s.start_char).unwrap();
+            assert_ne!(char_width(first), 0, "a segment never starts on a mark");
+        }
+    }
+
+    #[test]
+    fn wrap_tabs_are_expanded_before_wrapping() {
+        // A tab sanitizes to four spaces; wrapping then sees eight display columns.
+        let clean = sanitize("\ta");
+        assert_eq!(clean, "    a");
+        let segs = wrap_segments(&clean, 4);
+        assert_eq!(segs, vec![seg(0, 4), seg(4, 5)]);
+    }
+
+    #[test]
+    fn wrap_width_zero_still_progresses() {
+        let segs = wrap_segments("abc", 0);
+        assert_eq!(segs, vec![seg(0, 1), seg(1, 2), seg(2, 3)]);
+    }
+
+    #[test]
+    fn slice_windows_the_segment_and_pads_to_width() {
+        let hl = one_span("abcdef");
+        // The middle segment [2,4) rendered into a width-4 row: "cd" + pad.
+        let spans = slice_spans(&hl, seg(2, 4), 0, 4, Color::Reset, None);
+        let (text, width) = rendered(&spans);
+        assert_eq!(text, "cd");
+        assert_eq!(width, 4, "row padded to the content width");
+    }
+
+    #[test]
+    fn slice_wide_char_at_trailing_edge_is_dropped_and_padded() {
+        // "a世" into width 2: 'a'(1) fits, '世'(2) overflows the last col, so it is
+        // dropped and the row padded — the pre-wrap truncation policy.
+        let hl = one_span("a世");
+        let spans = slice_spans(&hl, seg(0, 2), 0, 2, Color::Reset, None);
+        let (text, width) = rendered(&spans);
+        assert_eq!(text, "a");
+        assert_eq!(width, 2);
+    }
+
+    #[test]
+    fn slice_glues_a_combining_mark_to_its_base() {
+        let hl = one_span("e\u{301}x");
+        let spans = slice_spans(&hl, seg(0, 3), 0, 8, Color::Reset, None);
+        // The base and mark must share one span (one cell), never split apart.
+        let combined = spans.iter().any(|s| s.content.contains("e\u{301}"));
+        assert!(combined, "combining mark stays in the base's span");
+    }
+
+    #[test]
+    fn slice_leading_wide_char_straddle_pads_its_overhang() {
+        // col_skip=1 into "世ab": the first col of '世' is skipped, its second col
+        // peeks past the boundary as one bg pad cell, then "ab".
+        let hl = one_span("世ab");
+        let spans = slice_spans(&hl, seg(0, 3), 1, 4, Color::Reset, None);
+        let (text, width) = rendered(&spans);
+        // The glyph itself is never re-emitted; its overhang shows as one leading
+        // background pad cell, then "ab".
+        assert!(
+            !text.contains('世'),
+            "the wide char's glyph is not re-emitted: {text:?}"
+        );
+        assert_eq!(text, " ab", "leading overhang pad + ab");
+        assert_eq!(width, 4, "one overhang pad + ab + trailing pad");
+    }
+
+    #[test]
+    fn slice_full_segment_reproduces_truncation() {
+        // A whole-line segment with no skip and a tight width truncates exactly as
+        // the old renderer: "abcdef" at width 3 -> "abc" padded to 3.
+        let hl = one_span("abcdef");
+        let full = seg(0, 6);
+        let spans = slice_spans(&hl, full, 0, 3, Color::Reset, None);
+        let (text, width) = rendered(&spans);
+        assert_eq!(text, "abc");
+        assert_eq!(width, 3);
     }
 }

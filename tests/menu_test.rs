@@ -207,8 +207,8 @@ fn narrow_width_keeps_labels_and_drops_the_branch() {
 // anchors under its title column (x=7) with a 1-column border, so its content
 // starts at x=8; a marker's filled dot sits at x=9 (` ● …`). Content rows begin
 // at y=2 (y=1 is the box's top border). The full View row list is:
-//   0 Unified · 1 Side by side · 2 sep · 3 Line numbers · 4 sep ·
-//   5 Changes panel · 6 sep · 7 Home · 8 History
+//   0 Unified · 1 Side by side · 2 sep · 3 Line numbers · 4 Wrap lines · 5 sep ·
+//   6 Changes panel · 7 sep · 8 Home · 9 History
 
 #[test]
 fn open_view_menu_renders_rows_with_state_markers() {
@@ -221,6 +221,7 @@ fn open_view_menu_renders_rows_with_state_markers() {
         "Unified",
         "Side by side",
         "Line numbers",
+        "Wrap lines",
         "Changes panel",
         "History",
     ] {
@@ -229,14 +230,20 @@ fn open_view_menu_renders_rows_with_state_markers() {
 
     // Each row reads " <3-col marker> <label>", so the marker field is columns
     // [inner_x+1, inner_x+4) = [9, 12): the radio dot is centred at x=10, and the
-    // checkbox brackets span 9..12. Default: Unified active, line numbers on,
-    // changes panel shown.
+    // checkbox brackets span 9..12. Default: Unified active, line numbers on, wrap
+    // off, changes panel shown. Line numbers is row 3 (y=5), Wrap lines row 4 (y=6),
+    // Changes panel row 6 (y=8).
     let buf = render_buffer(&app, W, H);
     assert_eq!(cell_symbol(&buf, 10, 2), "●", "Unified radio filled");
     assert_eq!(cell_symbol(&buf, 9, 5), "[", "checkbox opens");
     assert_eq!(cell_symbol(&buf, 10, 5), "x", "line numbers checked");
-    assert_eq!(cell_symbol(&buf, 9, 7), "[", "changes panel checkbox opens");
-    assert_eq!(cell_symbol(&buf, 10, 7), "x", "changes panel checked");
+    assert_eq!(
+        cell_symbol(&buf, 10, 6),
+        " ",
+        "wrap lines unchecked by default"
+    );
+    assert_eq!(cell_symbol(&buf, 9, 8), "[", "changes panel checkbox opens");
+    assert_eq!(cell_symbol(&buf, 10, 8), "x", "changes panel checked");
 }
 
 #[test]
@@ -287,19 +294,21 @@ fn keyboard_up_down_skips_separators_and_wraps() {
         "skips separator 2 to Line numbers"
     );
     key(&mut app, KeyCode::Down);
+    assert_eq!(app.open_menu.unwrap().item, 4, "Wrap lines");
+    key(&mut app, KeyCode::Down);
     assert_eq!(
         app.open_menu.unwrap().item,
-        5,
-        "skips separator 4 to Changes panel"
+        6,
+        "skips separator 5 to Changes panel"
     );
     key(&mut app, KeyCode::Down);
-    assert_eq!(app.open_menu.unwrap().item, 7, "skips separator 6 to Home");
+    assert_eq!(app.open_menu.unwrap().item, 8, "skips separator 7 to Home");
     key(&mut app, KeyCode::Down);
-    assert_eq!(app.open_menu.unwrap().item, 8, "History");
+    assert_eq!(app.open_menu.unwrap().item, 9, "History");
     key(&mut app, KeyCode::Down);
     assert_eq!(app.open_menu.unwrap().item, 0, "wraps to the top");
     key(&mut app, KeyCode::Up);
-    assert_eq!(app.open_menu.unwrap().item, 8, "wraps back to the bottom");
+    assert_eq!(app.open_menu.unwrap().item, 9, "wraps back to the bottom");
 }
 
 #[test]
@@ -423,8 +432,8 @@ fn clicking_inside_the_box_off_any_row_is_consumed() {
     let (_repo, mut app) = app_with_change();
     let before = app.selected;
     open_menu(&mut app, VIEW_LABEL_X);
-    // The box's bottom border (y=11) is inside its bounds but on no content row.
-    click(&mut app, 15, 11);
+    // The box's bottom border (y=12) is inside its bounds but on no content row.
+    click(&mut app, 15, 12);
     assert!(
         app.open_menu.is_some(),
         "an in-box click is consumed (a fall-through would have closed the menu)"
@@ -537,11 +546,11 @@ fn review_session_view_menu_home_row_reads_review_and_is_checked() {
         out.contains("Review"),
         "the home row reads 'Review':\n{out}"
     );
-    // The Home row is full-index 7 → y=9; in a review session it is checked
+    // The Home row is full-index 8 → y=10; in a review session it is checked
     // (view == home == Review), so its radio is filled.
     let buf = render_buffer(&app, W, H);
     assert_eq!(
-        cell_symbol(&buf, 10, 9),
+        cell_symbol(&buf, 10, 10),
         "●",
         "the Review home row is checked"
     );
@@ -608,15 +617,15 @@ fn changes_panel_marker_tracks_show_changes() {
     assert!(app.show_changes, "shown by default");
     open_menu(&mut app, VIEW_LABEL_X);
     let buf = render_buffer(&app, W, H);
-    assert_eq!(cell_symbol(&buf, 9, 7), "[", "changes panel checkbox opens");
-    assert_eq!(cell_symbol(&buf, 10, 7), "x", "checked while shown");
+    assert_eq!(cell_symbol(&buf, 9, 8), "[", "changes panel checkbox opens");
+    assert_eq!(cell_symbol(&buf, 10, 8), "x", "checked while shown");
     key(&mut app, KeyCode::Esc);
 
     press(&mut app, 'b'); // hide the panel
     assert!(!app.show_changes);
     open_menu(&mut app, VIEW_LABEL_X);
     let buf = render_buffer(&app, W, H);
-    assert_eq!(cell_symbol(&buf, 10, 7), " ", "unchecked while hidden");
+    assert_eq!(cell_symbol(&buf, 10, 8), " ", "unchecked while hidden");
 }
 
 #[test]
@@ -627,8 +636,9 @@ fn activating_changes_panel_row_flips_show_changes_in_status_view() {
     open_menu(&mut app, VIEW_LABEL_X);
     key(&mut app, KeyCode::Down); // Side by side
     key(&mut app, KeyCode::Down); // skips separator -> Line numbers
+    key(&mut app, KeyCode::Down); // Wrap lines
     key(&mut app, KeyCode::Down); // skips separator -> Changes panel
-    assert_eq!(app.open_menu.unwrap().item, 5, "landed on Changes panel");
+    assert_eq!(app.open_menu.unwrap().item, 6, "landed on Changes panel");
     key(&mut app, KeyCode::Enter);
 
     assert!(app.open_menu.is_none(), "activating closes the menu");
@@ -646,7 +656,8 @@ fn activating_changes_panel_row_flips_show_changes_in_history_view() {
     key(&mut app, KeyCode::Down);
     key(&mut app, KeyCode::Down);
     key(&mut app, KeyCode::Down);
-    assert_eq!(app.open_menu.unwrap().item, 5, "landed on Changes panel");
+    key(&mut app, KeyCode::Down);
+    assert_eq!(app.open_menu.unwrap().item, 6, "landed on Changes panel");
     key(&mut app, KeyCode::Enter);
 
     assert!(app.open_menu.is_none(), "activating closes the menu");
@@ -662,6 +673,7 @@ fn activating_changes_panel_row_does_not_persist_config() {
     let (_repo, mut app) = app_with_dir(dir.path());
 
     open_menu(&mut app, VIEW_LABEL_X);
+    key(&mut app, KeyCode::Down);
     key(&mut app, KeyCode::Down);
     key(&mut app, KeyCode::Down);
     key(&mut app, KeyCode::Down);

@@ -18,6 +18,8 @@ pub enum Action {
     SwitchPane,
     ToggleDiffMode,
     ToggleLineNumbers,
+    /// Toggle hard line wrapping in the diff pane (`w`).
+    ToggleWrap,
     CycleTheme,
     /// Show or hide the top menu bar (the `View`/`Theme` labels in the header).
     ToggleMenuBar,
@@ -139,6 +141,7 @@ const DEFAULTS: &[(&str, Action)] = &[
     ("backtab", Action::SwitchPane),
     ("d", Action::ToggleDiffMode),
     ("n", Action::ToggleLineNumbers),
+    ("w", Action::ToggleWrap),
     ("t", Action::CycleTheme),
     ("m", Action::ToggleMenuBar),
     ("b", Action::ToggleChanges),
@@ -178,6 +181,7 @@ fn parse_action(name: &str) -> Option<Action> {
         "switch-pane" => Action::SwitchPane,
         "toggle-diff-mode" | "diff-mode" | "split" => Action::ToggleDiffMode,
         "toggle-line-numbers" | "line-numbers" => Action::ToggleLineNumbers,
+        "toggle-wrap" | "wrap" => Action::ToggleWrap,
         "cycle-theme" | "theme" => Action::CycleTheme,
         "toggle-menu-bar" | "menu-bar" | "menu" => Action::ToggleMenuBar,
         "toggle-changes" => Action::ToggleChanges,
