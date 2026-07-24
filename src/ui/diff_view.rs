@@ -232,16 +232,6 @@ fn sbs_pair_line(
     right_w: usize,
     emphasis: Option<&PairEmphasis>,
 ) -> Line<'static> {
-    let old_empty_bg = if right.map(|i| lines[i].kind) == Some(LineKind::Addition) {
-        theme.add_gutter
-    } else {
-        theme.bg
-    };
-    let new_empty_bg = if left.map(|i| lines[i].kind) == Some(LineKind::Deletion) {
-        theme.del_gutter
-    } else {
-        theme.bg
-    };
     let mut spans = cell(
         app,
         left.map(|i| &lines[i]),
@@ -250,7 +240,6 @@ fn sbs_pair_line(
         syntax,
         left_w,
         emphasis.map(|e| e.old_ranges.as_slice()),
-        old_empty_bg,
     );
     spans.push(Span::styled("│", Style::new().fg(theme.border)));
     spans.extend(cell(
@@ -261,7 +250,6 @@ fn sbs_pair_line(
         syntax,
         right_w,
         emphasis.map(|e| e.new_ranges.as_slice()),
-        new_empty_bg,
     ));
     Line::from(spans)
 }
@@ -273,7 +261,6 @@ enum Col {
     New,
 }
 
-#[allow(clippy::too_many_arguments)]
 fn cell(
     app: &App,
     line: Option<&DiffLine>,
@@ -282,10 +269,12 @@ fn cell(
     syntax: &SyntaxReference,
     width: usize,
     emph_ranges: Option<&[Range<usize>]>,
-    empty_bg: Color,
 ) -> Vec<Span<'static>> {
     let Some(line) = line else {
-        return vec![Span::styled(" ".repeat(width), Style::new().bg(empty_bg))];
+        return vec![Span::styled(
+            " ".repeat(width),
+            Style::new().bg(theme.filler_bg),
+        )];
     };
     let (number, active_kind, active_bg, emph_bg) = match side {
         Col::Old => (
