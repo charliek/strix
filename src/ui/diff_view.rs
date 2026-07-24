@@ -147,6 +147,9 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let number_width = line_number_width(lines);
     let content_width =
         unified_content_width(inner.width as usize, app.show_line_numbers, number_width);
+    // Horizontal offset for code content only, clamped to the longest code line at
+    // read time and always 0 while wrap is on (plan §3.5).
+    let hskip = app.effective_hscroll();
     let offset = app.diff_scroll.get().min(app.diff_max_scroll());
 
     let mut out: Vec<Line> = Vec::new();
@@ -168,6 +171,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
                 number_width,
                 *seg,
                 row.subrow == 0,
+                hskip,
             ),
             RowContent::Hunk(h) => hunk_line(&lines[*h], theme),
             RowContent::Pair {
@@ -185,6 +189,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
                 right_w,
                 number_width,
                 row.subrow == 0,
+                hskip,
                 emphasis.as_deref(),
             ),
             RowContent::Box(boxed) => box_row_line(
@@ -258,6 +263,7 @@ fn unified_line(
     number_width: usize,
     seg: Seg,
     first: bool,
+    hskip: usize,
 ) -> Line<'static> {
     if line.kind == LineKind::Hunk {
         return hunk_line(line, theme);
@@ -295,8 +301,9 @@ fn unified_line(
     spans.extend(slice_spans(
         &highlighted,
         seg,
-        // Horizontal scroll is C6; wire the parameter, pass 0 for now.
-        0,
+        // Horizontal scroll shifts the code content only (plan §3.5); the gutter
+        // and sign above are emitted unshifted.
+        hskip,
         content_width,
         bg,
         // Word-diff emphasis is a side-by-side feature only (plan §3.7).
@@ -323,8 +330,11 @@ fn sbs_pair_line(
     right_w: usize,
     number_width: usize,
     first: bool,
+    hskip: usize,
     emphasis: Option<&PairEmphasis>,
 ) -> Line<'static> {
+    // Both cells shift by the same horizontal offset; the centre divider between
+    // them never moves (plan §3.5).
     let mut spans = cell(
         app,
         left,
@@ -335,6 +345,7 @@ fn sbs_pair_line(
         left_w,
         number_width,
         first,
+        hskip,
         emphasis.map(|e| e.old_ranges.as_slice()),
     );
     spans.push(Span::styled("│", Style::new().fg(theme.border)));
@@ -348,6 +359,7 @@ fn sbs_pair_line(
         right_w,
         number_width,
         first,
+        hskip,
         emphasis.map(|e| e.new_ranges.as_slice()),
     ));
     Line::from(spans)
@@ -371,6 +383,7 @@ fn cell(
     width: usize,
     number_width: usize,
     first: bool,
+    hskip: usize,
     emph_ranges: Option<&[Range<usize>]>,
 ) -> Vec<Span<'static>> {
     // No line on this side at all: the whole column is neutral filler.
@@ -424,7 +437,14 @@ fn cell(
                 .filter(|_| active)
                 .map(|ranges| (ranges, emph_bg));
             let highlighted = app.highlight(syntax, &theme.syntax_theme, &sanitize(&line.text));
-            spans.extend(slice_spans(&highlighted, seg, 0, content_w, bg, emphasis));
+            spans.extend(slice_spans(
+                &highlighted,
+                seg,
+                hskip,
+                content_w,
+                bg,
+                emphasis,
+            ));
         }
         // The line ran out of segments before the taller side did: blank content
         // in *this line's* own background (the two-blank distinction, plan §3.3).
@@ -847,10 +867,16 @@ fn slice_spans(
                 break 'tokens;
             }
             let ch_width = char_width(ch);
-            // A zero-width char is glued onto the current chunk regardless of its
-            // own background, keeping the cluster in one cell.
-            if ch_width == 0 && !chunk.is_empty() {
-                chunk.push(ch);
+            // A zero-width char (combining mark / ZWJ) only renders glued to a base
+            // in the same chunk. With a non-empty chunk it glues on, keeping the
+            // cluster in one cell. With an *empty* chunk its base is off-window —
+            // skipped by `col_skip`, or before the segment, or a truncated tail — so
+            // it is dropped rather than stranded at the leading edge or on the gutter
+            // (FIX 2). `char_idx` still advances so emphasis stays aligned.
+            if ch_width == 0 {
+                if !chunk.is_empty() {
+                    chunk.push(ch);
+                }
                 char_idx += 1;
                 continue;
             }
@@ -859,17 +885,22 @@ fn slice_spans(
             // the columns that peek past it.
             if skipped < col_skip {
                 let remaining = col_skip - skipped;
-                char_idx += 1;
                 if ch_width <= remaining {
                     skipped += ch_width;
+                    char_idx += 1;
                     continue;
                 }
                 skipped = col_skip;
                 let overhang = (ch_width - remaining).min(width - used);
                 if overhang > 0 {
-                    spans.push(Span::styled(" ".repeat(overhang), Style::new().bg(bg)));
+                    // If the cut char is emphasized, its overhang pad carries the
+                    // emphasis background so a changed wide char keeps its highlight
+                    // at the window edge (FIX 3).
+                    let pad_bg = char_bg(char_idx, emphasis, bg);
+                    spans.push(Span::styled(" ".repeat(overhang), Style::new().bg(pad_bg)));
                     used += overhang;
                 }
+                char_idx += 1;
                 continue;
             }
             // A wide char that no longer fits ends the line (padded below).
@@ -1107,5 +1138,62 @@ mod tests {
         let (text, width) = rendered(&spans);
         assert_eq!(text, "abc");
         assert_eq!(width, 3);
+    }
+
+    #[test]
+    fn slice_drops_a_combining_mark_stranded_by_the_skip() {
+        // "ae\u{301}b": a(0), e(1), combining acute(2, w0), b(3). Skip 2 columns
+        // (over 'a' and 'e'): the mark's base 'e' is gone, so the mark must be
+        // dropped — not stranded at the leading edge — and 'b' is the first glyph.
+        let hl = one_span("ae\u{301}b");
+        let spans = slice_spans(&hl, seg(0, 4), 2, 8, Color::Reset, None);
+        let (text, _) = rendered(&spans);
+        assert!(
+            !text.contains('\u{301}'),
+            "stranded mark is dropped: {text:?}"
+        );
+        assert!(text.starts_with('b'), "content resumes at 'b': {text:?}");
+    }
+
+    #[test]
+    fn slice_keeps_emphasis_aligned_after_dropping_a_stranded_mark() {
+        // The dropped mark still advances `char_idx`, so an emphasis range on the
+        // following char lands correctly.
+        let hl = one_span("ae\u{301}b");
+        let emph = Color::Red;
+        // A one-element slice of ranges is exactly the emphasis shape here.
+        #[allow(clippy::single_range_in_vec_init)]
+        let ranges = [3..4]; // the 'b'
+        let spans = slice_spans(&hl, seg(0, 4), 2, 8, Color::Reset, Some((&ranges, emph)));
+        let b_span = spans
+            .iter()
+            .find(|s| s.content.contains('b'))
+            .expect("a 'b' span");
+        assert_eq!(b_span.style.bg, Some(emph), "emphasis aligned to 'b'");
+    }
+
+    #[test]
+    fn slice_cut_wide_char_keeps_its_emphasis_on_the_overhang_pad() {
+        // A skip landing mid-wide-char: its visible overhang pad carries the
+        // emphasis background when the cut char is emphasized (FIX 3).
+        let hl = one_span("世x");
+        let emph = Color::Red;
+        #[allow(clippy::single_range_in_vec_init)]
+        let ranges = [0..1]; // the wide char is the changed char
+        let spans = slice_spans(&hl, seg(0, 2), 1, 8, Color::Reset, Some((&ranges, emph)));
+        let first = &spans[0];
+        assert_eq!(
+            first.content.as_ref(),
+            " ",
+            "the overhang is a background pad"
+        );
+        assert_eq!(first.style.bg, Some(emph), "the overhang pad is emphasized");
+        // A non-emphasized cut wide char pads with the plain background.
+        let plain = slice_spans(&hl, seg(0, 2), 1, 8, Color::Reset, None);
+        assert_eq!(
+            plain[0].style.bg,
+            Some(Color::Reset),
+            "no emphasis -> plain bg"
+        );
     }
 }

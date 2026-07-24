@@ -57,6 +57,8 @@ fn startup_comment_gc(repo: &Repo) -> anyhow::Result<()> {
 const MARKER_ZONE: u16 = 4;
 /// Lines scrolled per mouse-wheel notch in the diff pane.
 const SCROLL_STEP: u16 = 3;
+/// Display columns shifted per trackpad horizontal-scroll notch (plan §3.5).
+const HSCROLL_STEP: usize = 4;
 /// How close in time two identical left-clicks must fall to count as a
 /// double-click (plan §3.6). Semantic (same [`HitTarget`]), not pixel-based.
 const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
@@ -840,6 +842,22 @@ pub struct App {
     /// diff syncs — applied when the selection still matches, dropped otherwise
     /// (plan §3.4).
     pending_diff_placement: Option<(SelectionId, Placement)>,
+    /// Horizontal scroll offset for code content, in display columns (plan §3.5).
+    /// Applies only when wrap is off; shifts unified content and both side-by-side
+    /// cells by the same amount, never the gutters / sign / hunk headers / comment
+    /// boxes / editor. Clamped at read time to the longest code line, so a divider
+    /// drag or `n` toggle needs no reset. Reset on file change, mode toggle, and
+    /// wrap enable; preserved on a same-file refresh. Session-only: no key, no
+    /// config, no menu, no persistence.
+    pub diff_hscroll: usize,
+    /// Bumped whenever the active diff *object* is (re)computed, so the lazily
+    /// cached longest-code-line width invalidates exactly then (plan §3.5).
+    diff_generation: Cell<u64>,
+    /// Memoized longest sanitized *code*-line display width for the active diff
+    /// (hunk headers excluded), keyed by `(diff_generation, view)` so it survives
+    /// resizes / mode toggles but not a diff or view change. Computed lazily, only
+    /// while horizontally scrolled; the h-scroll clamp reads it (`max_hscroll`).
+    max_line_width: Cell<Option<((u64, ViewMode), usize)>>,
     /// Count of per-file diff computations, bumped in `sync_diff` /
     /// `sync_review_diff`'s actual compute branches. A test-only observable
     /// proving a cross-file hop computes exactly the destination file's diff
@@ -1035,6 +1053,9 @@ impl App {
             cross_file_scroll: config.cross_file_scroll(),
             wheel_edge: None,
             pending_diff_placement: None,
+            diff_hscroll: 0,
+            diff_generation: Cell::new(0),
+            max_line_width: Cell::new(None),
             diff_compute_count: Cell::new(0),
             open_menu: None,
             menu_title_rects: RefCell::new(Vec::new()),
@@ -2868,10 +2889,130 @@ impl App {
                 self.last_click = None;
                 self.on_scroll(pos, false, prev_edge);
             }
+            // Trackpad horizontal scroll shifts code content only, view-agnostic
+            // (Status / Review / History), and — like vertical — clears the
+            // double-click tracker. `wheel_edge` was already dropped by the
+            // take-and-clear above, so a horizontal tick also disarms any pending
+            // cross-file hop (plan §3.5). No re-arm, so nothing to thread.
+            MouseEventKind::ScrollRight => {
+                self.last_click = None;
+                self.horizontal_scroll(pos, true);
+            }
+            MouseEventKind::ScrollLeft => {
+                self.last_click = None;
+                self.horizontal_scroll(pos, false);
+            }
             _ => {}
         }
         self.sync_active();
         true
+    }
+
+    /// Shift the diff pane's code content horizontally by [`HSCROLL_STEP`] display
+    /// columns (plan §3.5). A no-op unless the tick is over the diff pane and wrap
+    /// is off (wrap and h-scroll are mutually exclusive). Clamped to the longest
+    /// code line at write time to bound growth; the render re-clamps, so a divider
+    /// drag or `n` toggle between events can't leave a stale over-scroll.
+    fn horizontal_scroll(&mut self, pos: Position, right: bool) {
+        // An open dropdown captures input over the pane beneath it (like keys and
+        // clicks); a horizontal tick must not shift the diff under it (FIX 1). Wrap
+        // and h-scroll are mutually exclusive, and the tick must be over the diff.
+        if self.open_menu.is_some() || self.wrap_lines || !self.diff_area.get().contains(pos) {
+            return;
+        }
+        let max = self.max_hscroll();
+        let current = self.diff_hscroll.min(max);
+        self.diff_hscroll = if right {
+            (current + HSCROLL_STEP).min(max)
+        } else {
+            current.saturating_sub(HSCROLL_STEP)
+        };
+    }
+
+    /// The horizontal-scroll offset the renderer actually shifts code by: the
+    /// stored `diff_hscroll` clamped to the longest code line at *read* time
+    /// (plan §3.5), and always 0 while wrap is on (the two are mutually exclusive).
+    pub fn effective_hscroll(&self) -> usize {
+        if self.wrap_lines {
+            return 0;
+        }
+        self.diff_hscroll.min(self.max_hscroll())
+    }
+
+    /// The largest h-scroll offset that still leaves content on screen: the
+    /// longest code line minus the visible content width (unified: pane − gutter −
+    /// sign; SBS: the narrower column's content width). Computed from current
+    /// geometry, so a divider drag or `n` toggle is reflected immediately (plan
+    /// §3.5). Read by both the scroll event and the render clamp.
+    fn max_hscroll(&self) -> usize {
+        self.active_max_line_width()
+            .saturating_sub(self.hscroll_content_width())
+    }
+
+    /// The visible content width h-scroll clamps against for the active mode.
+    fn hscroll_content_width(&self) -> usize {
+        let pane = self.diff_pane_width();
+        let lines: &[DiffLine] = match self.active_diff() {
+            Some(FileDiff::Text(lines)) => lines,
+            _ => &[],
+        };
+        let number_width = crate::ui::diff_view::line_number_width(lines);
+        match self.diff_mode {
+            DiffMode::Unified => crate::ui::diff_view::unified_content_width(
+                pane as usize,
+                self.show_line_numbers,
+                number_width,
+            ),
+            DiffMode::SideBySide => {
+                let (left_w, right_w) = sbs_columns(pane);
+                let left = crate::ui::diff_view::sbs_content_width(
+                    left_w,
+                    self.show_line_numbers,
+                    number_width,
+                );
+                let right = crate::ui::diff_view::sbs_content_width(
+                    right_w,
+                    self.show_line_numbers,
+                    number_width,
+                );
+                left.min(right)
+            }
+        }
+    }
+
+    /// The longest sanitized *code*-line display width in the active diff (hunk
+    /// headers excluded — a wide hunk header must not extend the clamp, plan §3.5),
+    /// memoized per `(diff_generation, view)` so it is recomputed exactly when the
+    /// active diff object or the view changes, not on resize / mode / wrap.
+    fn active_max_line_width(&self) -> usize {
+        let key = (self.diff_generation.get(), self.view);
+        if let Some((cached_key, width)) = self.max_line_width.get() {
+            if cached_key == key {
+                return width;
+            }
+        }
+        let width = match self.active_diff() {
+            Some(FileDiff::Text(lines)) => lines
+                .iter()
+                .filter(|line| line.kind != LineKind::Hunk)
+                .map(|line| {
+                    crate::ui::diff_view::sanitize(&line.text)
+                        .chars()
+                        .map(crate::ui::char_width)
+                        .sum::<usize>()
+                })
+                .max()
+                .unwrap_or(0),
+            _ => 0,
+        };
+        self.max_line_width.set(Some((key, width)));
+        width
+    }
+
+    /// Note that the active diff *object* changed, invalidating the memoized
+    /// longest-code-line width (plan §3.5). Called at every diff (re)assignment.
+    fn bump_diff_generation(&self) {
+        self.diff_generation.set(self.diff_generation.get() + 1);
     }
 
     /// Handle a left-button press with double-click detection (plan §3.6). The
@@ -3603,10 +3744,15 @@ impl App {
         }
         self.current_diff = diff;
         self.diff_key = key;
+        // The diff object changed: invalidate the memoized longest-line width.
+        self.bump_diff_generation();
         if file_changed {
             // Only a different file starts at the top; refreshing the open file in
             // place must not yank the view back up while scrolling.
             self.diff_scroll.set(0);
+            // A new file starts unshifted; a same-file refresh keeps the h-scroll
+            // (the read-time clamp handles a shrunken longest line — plan §3.5).
+            self.diff_hscroll = 0;
             // The new file's layout doesn't exist yet; reset the diff cursor to its
             // top (`None`), resolved to row 0 by the render.
             self.status_pane.cursor = None;
@@ -4043,6 +4189,7 @@ impl App {
                     review.diff = None;
                     review.diff_key = None;
                 }
+                self.bump_diff_generation();
                 self.reset_diff_view();
             }
             return;
@@ -4067,6 +4214,7 @@ impl App {
             review.diff = Some(diff);
             review.diff_key = Some(key);
         }
+        self.bump_diff_generation();
         self.reset_diff_view();
     }
 
@@ -4078,8 +4226,11 @@ impl App {
             return;
         }
         let Some(commit) = self.commits.get(self.selected_commit) else {
-            self.history_diff = None;
-            self.history_diff_key = None;
+            if self.history_diff.is_some() {
+                self.history_diff = None;
+                self.history_diff_key = None;
+                self.bump_diff_generation();
+            }
             return;
         };
         // Row 0 is the commit itself: the right pane shows details, no file diff.
@@ -4087,6 +4238,7 @@ impl App {
             if self.history_diff_key.is_some() {
                 self.history_diff = None;
                 self.history_diff_key = None;
+                self.bump_diff_generation();
                 self.reset_diff_view();
             }
             return;
@@ -4100,13 +4252,17 @@ impl App {
         }
         self.history_diff = Some(self.repo.commit_file_diff(commit, file));
         self.history_diff_key = key;
+        self.bump_diff_generation();
         self.reset_diff_view();
     }
 
     /// Reset the diff pane to the top and drop the per-file render caches, which
-    /// describe the diff being replaced.
+    /// describe the diff being replaced. A different diff also starts unshifted
+    /// (Review/History file changes route through here; Status resets h-scroll in
+    /// `recompute_status_diff`'s file-changed branch — plan §3.5).
     fn reset_diff_view(&mut self) {
         self.diff_scroll.set(0);
+        self.diff_hscroll = 0;
         self.highlight_cache.borrow_mut().clear();
         *self.layout.borrow_mut() = None;
     }
@@ -4938,6 +5094,9 @@ impl App {
             DiffMode::SideBySide => DiffMode::Unified,
         };
         self.diff_scroll.set(0);
+        // A mode change re-lays out both columns from scratch; start unshifted
+        // (the two modes have different content widths — plan §3.5).
+        self.diff_hscroll = 0;
         // A mode change relayouts the whole diff; drop any half-formed double-click
         // so a click before it can't pair with one after (plan §3.6).
         self.last_click = None;
@@ -4964,6 +5123,11 @@ impl App {
     /// meaning).
     fn toggle_wrap(&mut self) {
         self.wrap_lines = !self.wrap_lines;
+        // Enabling wrap resets the horizontal offset — the two are mutually
+        // exclusive, and h-scroll is ignored while wrap is on (plan §3.5).
+        if self.wrap_lines {
+            self.diff_hscroll = 0;
+        }
     }
 
     /// Advance to the next theme in `Theme::available` (presets then user themes),

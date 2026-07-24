@@ -197,6 +197,13 @@ remapping one never affects the other.
 | Drag the vertical split bar   | Resize the left column vs the diff              |
 | Drag the horizontal split bar | Resize Committed Changes vs Graph (History view)|
 | Scroll wheel                  | Scroll the pane under the cursor; in the diff pane this moves the viewport only — the cursor stays put |
+| Trackpad horizontal scroll    | Shift the diff's code content sideways to read long lines (gutters, sign column, hunk headers, and comment boxes stay put); works in every view's diff pane, and only when line wrap is off |
+
+Horizontal scrolling is a trackpad gesture only — there is no keybinding and
+nothing is persisted. It relies on the terminal emitting horizontal scroll
+events; some terminals (including macOS Terminal.app) never do, so the gesture
+does nothing there. It is inert while line wrap (`w`) is on, since wrapped lines
+have nothing to scroll to.
 
 Double-click detection is semantic, not pixel-based: two clicks resolving to
 the same target (same file, same code line or comment box) within 500 ms
