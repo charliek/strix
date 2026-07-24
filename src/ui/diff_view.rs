@@ -9,7 +9,8 @@ use ratatui::Frame;
 use syntect::parsing::SyntaxReference;
 
 use crate::app::{
-    sbs_columns, App, BoxPart, BoxRow, EditorPart, LayoutRow, PairEmphasis, RowContent, Seg,
+    sbs_columns, App, BoxPart, BoxRow, EditorPart, LayoutRow, PairCell, PairEmphasis, RowContent,
+    Seg,
 };
 use crate::comments::Side;
 use crate::git::{DiffLine, FileDiff, LineKind};
@@ -22,8 +23,6 @@ use crate::ui::{centered_hint, char_width, panel_block};
 const NUM_MIN_WIDTH: usize = 4;
 /// Unified change-sign column: `+ ` / `- ` / `  `.
 const SIGN_WIDTH: usize = 2;
-/// Side-by-side per-column gutter: `nnnn ` → 4 + 1.
-const SBS_GUTTER: usize = 5;
 
 /// The decimal-digit width the line-number columns need for this diff: at least
 /// [`NUM_MIN_WIDTH`] (so ≤9999-line files render exactly as before), widened to
@@ -55,14 +54,27 @@ fn unified_gutter_width(show_line_numbers: bool, number_width: usize) -> usize {
     }
 }
 
-/// The side-by-side per-column gutter's width for the current
-/// `show_line_numbers` setting — mirrors `unified_gutter_width`.
-fn sbs_gutter_width(show_line_numbers: bool) -> usize {
+/// The side-by-side per-column gutter's width for the current `show_line_numbers`
+/// setting and per-diff `number_width` (`nnnn ` → `number_width + 1`) — mirrors
+/// `unified_gutter_width`, and carries the same 5-digit fix so both columns
+/// reserve exactly what `gutter_num` draws.
+fn sbs_gutter_width(show_line_numbers: bool, number_width: usize) -> usize {
     if show_line_numbers {
-        SBS_GUTTER
+        number_width + 1
     } else {
         0
     }
+}
+
+/// The display-column width available for one side-by-side column's *content*:
+/// the column minus its (toggleable) per-column line-number gutter. The single
+/// source of truth for both a column's wrap width and its render width (plan §3.3).
+pub(crate) fn sbs_content_width(
+    column_width: usize,
+    show_line_numbers: bool,
+    number_width: usize,
+) -> usize {
+    column_width.saturating_sub(sbs_gutter_width(show_line_numbers, number_width))
 }
 
 /// The display-column width available for a unified line's *content* at pane
@@ -164,14 +176,16 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
                 emphasis,
             } => sbs_pair_line(
                 app,
-                *left,
-                *right,
+                left.as_ref(),
+                right.as_ref(),
                 lines,
                 theme,
                 syntax,
                 left_w,
                 right_w,
-                emphasis.as_ref(),
+                number_width,
+                row.subrow == 0,
+                emphasis.as_deref(),
             ),
             RowContent::Box(boxed) => box_row_line(
                 row,
@@ -291,38 +305,49 @@ fn unified_line(
     Line::from(spans)
 }
 
-/// One side-by-side code row: the old cell, the centre divider, the new cell.
+/// One side-by-side display row: the old cell, the centre divider, the new cell.
+/// Each side is a [`PairCell`] (or `None` for an absent side → `filler_bg`);
+/// `first` is true only on the pair's top subrow, gating the gutter numbers.
 /// `emphasis` carries the pair's word-diff changed-char ranges (plan §3.7),
-/// `None` unless this is a genuinely modified pair.
+/// absolute over each side's sanitized text, so every subrow's [`Seg`] windows
+/// them correctly.
 #[allow(clippy::too_many_arguments)]
 fn sbs_pair_line(
     app: &App,
-    left: Option<usize>,
-    right: Option<usize>,
+    left: Option<&PairCell>,
+    right: Option<&PairCell>,
     lines: &[DiffLine],
     theme: &Theme,
     syntax: &SyntaxReference,
     left_w: usize,
     right_w: usize,
+    number_width: usize,
+    first: bool,
     emphasis: Option<&PairEmphasis>,
 ) -> Line<'static> {
     let mut spans = cell(
         app,
-        left.map(|i| &lines[i]),
+        left,
+        lines,
         Col::Old,
         theme,
         syntax,
         left_w,
+        number_width,
+        first,
         emphasis.map(|e| e.old_ranges.as_slice()),
     );
     spans.push(Span::styled("│", Style::new().fg(theme.border)));
     spans.extend(cell(
         app,
-        right.map(|i| &lines[i]),
+        right,
+        lines,
         Col::New,
         theme,
         syntax,
         right_w,
+        number_width,
+        first,
         emphasis.map(|e| e.new_ranges.as_slice()),
     ));
     Line::from(spans)
@@ -335,21 +360,27 @@ enum Col {
     New,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cell(
     app: &App,
-    line: Option<&DiffLine>,
+    cell: Option<&PairCell>,
+    lines: &[DiffLine],
     side: Col,
     theme: &Theme,
     syntax: &SyntaxReference,
     width: usize,
+    number_width: usize,
+    first: bool,
     emph_ranges: Option<&[Range<usize>]>,
 ) -> Vec<Span<'static>> {
-    let Some(line) = line else {
+    // No line on this side at all: the whole column is neutral filler.
+    let Some(cell) = cell else {
         return vec![Span::styled(
             " ".repeat(width),
             Style::new().bg(theme.filler_bg),
         )];
     };
+    let line = &lines[cell.line];
     let (number, active_kind, active_bg, emph_bg) = match side {
         Col::Old => (
             line.old_no,
@@ -366,30 +397,39 @@ fn cell(
     };
     let active = line.kind == active_kind;
     let bg = if active { active_bg } else { theme.bg };
-    // Emphasis only ever applies to this side's changed line (the other side of
-    // a modified pair never carries this side's ranges); guard on `active`
-    // defensively even though `App::pair_emphasis` only ever sets ranges for a
-    // real deletion/addition pairing.
-    let emphasis = emph_ranges
-        .filter(|_| active)
-        .map(|ranges| (ranges, emph_bg));
-    let gutter_w = sbs_gutter_width(app.show_line_numbers);
+    let gutter_w = sbs_gutter_width(app.show_line_numbers, number_width);
+    let content_w = width.saturating_sub(gutter_w);
+    let gutter_style = Style::new().fg(theme.line_no);
     let mut spans = Vec::new();
     if app.show_line_numbers {
-        // Side-by-side keeps its fixed 4-wide number column for C3 (its wrap +
-        // dynamic gutter are C4's scope); `SBS_GUTTER` reserves exactly that.
-        let gutter = format!("{} ", gutter_num(number, NUM_MIN_WIDTH));
-        spans.push(Span::styled(gutter, Style::new().fg(theme.line_no)));
+        // The number shows on the top subrow only; continuation subrows draw a
+        // blank gutter, gutter-styled — never the line's add/del background. In a
+        // pane so narrow the gutter is wider than the cell, clip it to the cell
+        // (gutter_w + content_w always sums to `width`), so a partially-visible
+        // gutter can't overrun and push the centre divider off `left_w`.
+        let emit = gutter_w.min(width);
+        let text = if first {
+            format!("{} ", gutter_num(number, number_width))
+        } else {
+            " ".repeat(gutter_w)
+        };
+        let clipped: String = text.chars().take(emit).collect();
+        spans.push(Span::styled(clipped, gutter_style));
     }
-    spans.extend(highlighted_content(
-        app,
-        syntax,
-        &theme.syntax_theme,
-        &line.text,
-        width.saturating_sub(gutter_w),
-        bg,
-        emphasis,
-    ));
+    match cell.seg {
+        // A subrow this line reaches: its char window, syntax-highlighted with
+        // any word-diff emphasis (only ever on this side's changed line).
+        Some(seg) => {
+            let emphasis = emph_ranges
+                .filter(|_| active)
+                .map(|ranges| (ranges, emph_bg));
+            let highlighted = app.highlight(syntax, &theme.syntax_theme, &sanitize(&line.text));
+            spans.extend(slice_spans(&highlighted, seg, 0, content_w, bg, emphasis));
+        }
+        // The line ran out of segments before the taller side did: blank content
+        // in *this line's* own background (the two-blank distinction, plan §3.3).
+        None => spans.push(Span::styled(" ".repeat(content_w), Style::new().bg(bg))),
+    }
     spans
 }
 
@@ -704,49 +744,6 @@ pub(crate) fn fit_display(s: &str, max: usize) -> (String, usize) {
     out.push('…');
     used += 1;
     (out, used)
-}
-
-/// Syntax-highlight `text` into spans (each token's colour over the line's
-/// background), expanding tabs, dropping control chars, and padding to `width`
-/// so the background fills the row. `emphasis`, when given, is a side-by-side
-/// modified pair's changed-char ranges over this same sanitized text plus the
-/// emphasis background to use for them (plan §3.7): each char's background is
-/// decided against the ranges (`char_bg`), intersecting the word-diff with the
-/// syntax-token spans below without touching foreground colour.
-///
-/// Two non-obvious invariants:
-/// - **Truncation stops the whole line, not just the current token.** The first
-///   char that doesn't fit exits the outer token loop too (a labeled break), so
-///   a later, differently-highlighted token can't render past the cut — which
-///   would otherwise also desync `char_idx` from `emphasis`'s ranges (nothing
-///   advances it over the skipped remainder), corrupting every emphasis lookup
-///   for the rest of the line.
-/// - **A zero-width char (a combining mark/ZWJ) never forces a span break.** A
-///   terminal only combines it with the preceding base character when both are
-///   written in the same span/string; splitting it into its own span stranded
-///   it in a zero-width cell that got overwritten by the trailing padding,
-///   silently dropping the change it renders (e.g. an accent in a modified
-///   pair). It's glued onto the current chunk regardless of its own `char_bg`
-///   — the chunk keeps the base character's background rather than switching
-///   for just the mark — so a word-diff range landing only on the mark itself
-///   is not visually distinguished; this is the documented fallback over
-///   splitting the cluster.
-fn highlighted_content(
-    app: &App,
-    syntax: &SyntaxReference,
-    theme_name: &str,
-    text: &str,
-    width: usize,
-    bg: Color,
-    emphasis: Option<(&[Range<usize>], Color)>,
-) -> Vec<Span<'static>> {
-    let clean = sanitize(text);
-    let highlighted = app.highlight(syntax, theme_name, &clean);
-    // The whole line as one segment: identical to windowing `[0, char_count)`
-    // with no horizontal skip, so side-by-side cells (which never wrap in C3)
-    // render exactly as before.
-    let full = Seg::full(clean.chars().count());
-    slice_spans(&highlighted, full, 0, width, bg, emphasis)
 }
 
 /// Split sanitized `text` into display-column-hard-wrapped segments, each a

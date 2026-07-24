@@ -128,6 +128,33 @@ fn wrapped_review(repo: &Path) -> App {
 }
 
 #[test]
+fn unified_zero_content_width_is_one_row_per_line_not_one_per_char() {
+    // The unified analog of the sbs zero-content-width case: a pane so narrow the
+    // gutter (10) + sign (2) eat it all makes the content width 0. Every line —
+    // even a non-empty one — must be exactly ONE row, not one blank row per char
+    // (the shared `line_segments` policy). Reachable at any tiny pane width.
+    let repo = init_repo();
+    let p = repo.path();
+    write(p, "code.txt", "ctx\n");
+    git(p, &["add", "code.txt"]);
+    git(p, &["commit", "-qm", "add"]);
+    write(p, "code.txt", "ctx\nabcd\n"); // an uncommitted 4-char addition
+    let mut app = App::new(p.to_path_buf()).unwrap();
+    app.on_key(key('b')); // hide the changes panel so the diff spans the pane
+    app.on_key(key('w')); // enable wrap
+    let _ = strix::terminal::dump_frame(&app, 12, H).unwrap(); // inner ~10 < 12
+    let area = app.diff_area();
+    assert!(
+        (area.width as usize) < 12,
+        "the pane must be narrower than gutter+sign to force a 0 content width"
+    );
+    // With content width 0, no line wraps: each code line is exactly one row.
+    for (_, subrows) in code_runs(&app) {
+        assert_eq!(subrows, vec![0], "content width 0 -> one row per line");
+    }
+}
+
+#[test]
 fn long_line_wraps_into_rows_sharing_target_with_incrementing_subrows() {
     let repo = long_line_repo();
     let app = wrapped_review(repo.path());

@@ -288,6 +288,19 @@ impl Seg {
     }
 }
 
+/// One side of a side-by-side [`RowContent::Pair`] subrow: the diff line this
+/// column draws (`line`, an index into the file's `Vec<DiffLine>`) and the char
+/// window for this subrow. `seg` is `Some` for a subrow the line actually
+/// reaches, `None` once the line is exhausted while the *other* side still has
+/// segments — an exhausted `None` renders blank in the line's own add/del/context
+/// background, distinct from an absent side (a `None` `PairCell`) which renders
+/// `filler_bg` (plan §3.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PairCell {
+    pub line: usize,
+    pub seg: Option<Seg>,
+}
+
 /// What a physical [`LayoutRow`] draws. Code rows carry diff-line indices (a
 /// unified line, a side-by-side hunk header, or a side-by-side pair); a comment
 /// box expands to several `Box` rows sharing one [`RowTarget`].
@@ -299,16 +312,24 @@ pub enum RowContent {
     Line { line: usize, seg: Seg },
     /// A side-by-side hunk header (index into `Vec<DiffLine>`), spanning both columns.
     Hunk(usize),
-    /// A side-by-side pair of diff lines (either side may be blank).
+    /// One display row of a side-by-side pair. Each side is either absent (no line
+    /// there at all → the column renders `filler_bg`) or a [`PairCell`] naming the
+    /// diff line and the char window this subrow draws; a `PairCell` whose `seg`
+    /// is `None` is a side whose line ran out of segments before the taller side
+    /// did — it renders blank in *that line's own* background, not `filler_bg`
+    /// (the two-blank distinction, plan §3.3). With wrap off a pair is one row
+    /// with full-line segments; with wrap on it is `max(left_rows, right_rows)`
+    /// rows sharing the pair's `RowTarget::Code` with incrementing `subrow`.
     Pair {
-        left: Option<usize>,
-        right: Option<usize>,
+        left: Option<PairCell>,
+        right: Option<PairCell>,
         /// Word-diff emphasis for a genuinely modified pair (plan §3.7):
         /// `None` for an unchanged context pair, a pure addition/deletion, or a
         /// zipped pair whose two sides are too dissimilar to be a real edit of
         /// one another. Computed once when the layout is built (`pair_emphasis`),
-        /// not per render.
-        emphasis: Option<PairEmphasis>,
+        /// shared across the pair's subrows by `Rc` (its per-side ranges are
+        /// absolute char offsets, so each subrow's [`Seg`] windows them directly).
+        emphasis: Option<Rc<PairEmphasis>>,
     },
     /// One physical row of a comment box.
     Box(BoxRow),
@@ -3982,14 +4003,35 @@ impl App {
     /// single full-width segment `[0, char_count)`; with wrap on it is the display-
     /// column hard wrap of the *sanitized* text at `content_w` (plan §3.3).
     fn unified_line_segments(&self, line: &DiffLine, content_w: usize) -> Vec<(usize, Seg)> {
-        let clean = crate::ui::diff_view::sanitize(&line.text);
-        let count = clean.chars().count();
-        let segs = if self.wrap_lines && line.kind != LineKind::Hunk {
-            crate::ui::diff_view::wrap_segments(&clean, content_w)
-        } else {
+        // Hunk headers never wrap; every other line wraps (or a single full-width
+        // segment with wrap off) through the shared `line_segments`.
+        let segs = if line.kind == LineKind::Hunk {
+            let count = crate::ui::diff_view::sanitize(&line.text).chars().count();
             vec![Seg::full(count)]
+        } else {
+            self.line_segments(&line.text, content_w)
         };
         segs.into_iter().enumerate().collect()
+    }
+
+    /// The wrapped segments of one line's sanitized text at content width
+    /// `content_w`: a display-column hard wrap with wrap on, a single full-width
+    /// segment `[0, char_count)` with it off — one code path for both modes
+    /// (plan §3.3). Shared by the unified and side-by-side layout builders.
+    ///
+    /// A `content_w` of 0 (a pane so narrow the gutter/sign eats the whole cell)
+    /// collapses to exactly one degenerate segment: `wrap_segments` guarantees ≥1
+    /// char per segment, which would otherwise explode a non-empty line into one
+    /// blank row per char while the renderer draws no content. Pinning one subrow
+    /// keeps the layout's row count equal to what the renderer draws (the width
+    /// the layout wraps at is the width the renderer draws at — even at 0).
+    fn line_segments(&self, text: &str, content_w: usize) -> Vec<Seg> {
+        let clean = crate::ui::diff_view::sanitize(text);
+        if self.wrap_lines && content_w > 0 {
+            crate::ui::diff_view::wrap_segments(&clean, content_w)
+        } else {
+            vec![Seg::full(clean.chars().count())]
+        }
     }
 
     /// The side-by-side physical layout: the orphan block, then paired code rows,
@@ -4006,6 +4048,14 @@ impl App {
     ) -> Vec<LayoutRow> {
         let (left_w, right_w) = sbs_columns(width);
         let place = BoxPlacement::Sbs { left_w, right_w };
+        // Per-diff number-column width feeds each column's content width, so a
+        // wrapped segment fits exactly where it is drawn (matches the renderer,
+        // which derives the same width from the same lines).
+        let number_width = crate::ui::diff_view::line_number_width(lines);
+        let left_content =
+            crate::ui::diff_view::sbs_content_width(left_w, self.show_line_numbers, number_width);
+        let right_content =
+            crate::ui::diff_view::sbs_content_width(right_w, self.show_line_numbers, number_width);
         let mut rows = Vec::new();
         for &id in orphans {
             // Orphan boxes have no live anchor side; keep them full-width at top.
@@ -4031,21 +4081,43 @@ impl App {
                     // both sides (`left == right`) and never gets word emphasis.
                     let emphasis = match (left, right) {
                         (Some(l), Some(r)) if l != r => {
-                            pair_emphasis(&lines[l].text, &lines[r].text)
+                            pair_emphasis(&lines[l].text, &lines[r].text).map(Rc::new)
                         }
                         _ => None,
                     };
-                    rows.push(LayoutRow {
-                        target,
-                        subrow: 0,
-                        side: None,
-                        hit: HitRegion::Code,
-                        content: RowContent::Pair {
-                            left,
-                            right,
-                            emphasis,
-                        },
-                    });
+                    // Wrap each side independently within its column; the pair
+                    // occupies `max(left_rows, right_rows)` subrows, all sharing
+                    // one `RowTarget` (so cursor/j/highlight/hit-testing treat the
+                    // whole pair as one unit). A side with no line contributes no
+                    // segments; a side whose segments run out before the taller
+                    // side draws blank in its own line background (plan §3.3).
+                    let left_segs = left.map(|i| self.line_segments(&lines[i].text, left_content));
+                    let right_segs =
+                        right.map(|i| self.line_segments(&lines[i].text, right_content));
+                    let height = left_segs
+                        .as_ref()
+                        .map_or(0, |s| s.len())
+                        .max(right_segs.as_ref().map_or(0, |s| s.len()))
+                        .max(1);
+                    for subrow in 0..height {
+                        let cell = |idx: Option<usize>, segs: &Option<Vec<Seg>>| {
+                            idx.map(|line| PairCell {
+                                line,
+                                seg: segs.as_ref().and_then(|s| s.get(subrow).copied()),
+                            })
+                        };
+                        rows.push(LayoutRow {
+                            target,
+                            subrow,
+                            side: None,
+                            hit: HitRegion::Code,
+                            content: RowContent::Pair {
+                                left: cell(left, &left_segs),
+                                right: cell(right, &right_segs),
+                                emphasis: emphasis.clone(),
+                            },
+                        });
+                    }
                     // Old-side comments (on the left index) emit before new-side
                     // (on the right), matching `ordered_comment_ids`. A context
                     // Pair is one diff line on both sides (left == right), so emit
@@ -5579,8 +5651,8 @@ fn flush_pairs(rows: &mut Vec<SbsCode>, deletions: &mut Vec<usize>, additions: &
 
 /// Per-side changed character ranges for a side-by-side modified pair's
 /// word-diff emphasis (plan §3.7): offsets into each side's *sanitized* text
-/// (the same sanitization `highlighted_content` applies at render time, so
-/// these ranges line up with the rendered tokens). Computed once when the
+/// (the same sanitization the renderer applies before slicing, so these ranges
+/// line up with the rendered tokens on every subrow). Computed once when the
 /// layout is built (see `pair_emphasis`) and read by the renderer every
 /// frame — the char diff itself is never recomputed per render, only on a
 /// layout rebuild (width/mode/diff/comments change).
@@ -5602,7 +5674,7 @@ const PAIR_SIMILARITY_THRESHOLD: f32 = 0.6;
 
 /// The word-diff emphasis for a side-by-side pair's two lines (plan §3.7), or
 /// `None` when the pair isn't a genuine edit of the same line. Sanitizes both
-/// sides exactly as `highlighted_content` does (so char offsets align), then
+/// sides exactly as the renderer does (so char offsets align), then
 /// diffs them char-by-char with `similar`; below `PAIR_SIMILARITY_THRESHOLD`
 /// the pair is discarded (probably two unrelated lines that merely zipped
 /// together — plan §2/§3.7). A whitespace-only edit still clears the
