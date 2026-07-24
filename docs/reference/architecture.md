@@ -212,12 +212,10 @@ cursor highlight intentionally overrides emphasis.
 
 **Side-by-side filler shading.** A pure addition or deletion has no partner
 line, so its opposite column renders empty; `cell()` paints that empty column
-`theme.add_gutter` when the row is a pure Addition or `theme.del_gutter` when
-it's a pure Deletion, instead of the flat pane background — a subtle tint
-that reads as "one side changed" without competing with the word-emphasis
-colours above. A context pair and a modified pair never carry a gutter tint
-on either side; an empty cell opposite anything else (there is no such case
-today, but the fallback exists) stays `theme.bg`.
+a single neutral `theme.filler_bg`, the same colour regardless of which side
+is empty, instead of the flat pane background — a subtle tint that reads as
+"one side changed" without competing with the word-emphasis colours above. A
+context pair and a modified pair never carry the filler tint on either side.
 
 ## Diff pane: rows, cursor, and comments
 
