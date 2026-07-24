@@ -132,6 +132,21 @@ fn a_custom_theme_can_override_the_filler_colour() {
     assert_eq!(theme.filler_bg, Color::Rgb(0, 255, 0));
 }
 
+#[test]
+fn a_theme_with_the_retired_gutter_keys_still_resolves_and_inherits_filler() {
+    // `add_gutter`/`del_gutter` were collapsed into `filler_bg`; a user theme
+    // predating that must not error — the unknown keys are ignored (ColorsFile
+    // has no deny_unknown_fields) and filler_bg falls back to the base preset.
+    let dir = config_with_themes(&[(
+        "legacy",
+        "base = \"gruvbox\"\n[colors]\nadd_gutter = \"#00ff00\"\ndel_gutter = \"#ff0000\"\n",
+    )]);
+
+    let theme = Theme::resolve("legacy", Some(dir.path())).1;
+    let gruvbox = Theme::preset("gruvbox").unwrap();
+    assert_eq!(theme.filler_bg, gruvbox.filler_bg);
+}
+
 // --- resolve: canonical name reporting (§3.5) ---
 
 #[test]
