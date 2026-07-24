@@ -8,6 +8,36 @@ Each release below is headed by a `## vX.Y.Z` entry added by
 `/release-workflows:release`; `release.yml` turns that section into the GitHub
 Release notes.
 
+## v0.0.6 — 2026-07-24
+
+Milestone 10 — diff-review ergonomics: line wrapping, scrolling across files and
+across long lines, a broader syntax set, and a more complete View menu. Merged
+via #14 (plus the #13 filler follow-up).
+
+### Added
+- **Line wrapping** — long diff lines wrap instead of truncating, in both unified
+  and side-by-side views. Off by default; toggle with `w` or the **View** menu
+  (`wrap_lines`, persisted). A wrapped line stays one unit for the cursor,
+  selection, clicks, and scroll-into-view; continuation rows carry a blank gutter.
+- **Cross-file scroll** — scrolling past the bottom of one file's diff advances to
+  the next file (and past the top to the previous), keeping the changes panel in
+  sync. Off by default; toggle with `f` or the **View** menu (`cross_file_scroll`,
+  persisted). Applies in the Status and Review surfaces; per-file diffs stay lazy.
+- **Horizontal scroll** — trackpad left/right scrolls long lines sideways when
+  wrapping is off; gutters and comment boxes stay put. (Terminals that don't emit
+  horizontal wheel events simply won't trigger it.)
+- **Wider syntax highlighting** — Kotlin, TypeScript / TSX, Swift, TOML,
+  Dockerfile, Zig, Dart, Nix and more now highlight, via the `two-face` syntax
+  set. Bare filenames like `Dockerfile` and aliases (`.mjs`/`.cjs`, `.tmpl`) are
+  recognised too.
+- **Changes panel** entry in the **View** menu — the panel toggle (`b`) is now
+  also a menu row.
+
+### Changed
+- **Side-by-side empty-column filler** is neutralized (#13): the column opposite a
+  pure addition / deletion renders as plain background again, dropping the tint
+  introduced in v0.0.5.
+
 ## v0.0.5 — 2026-07-21
 
 Milestone 9 — the top menu bar (completing the hunk-inspired review track) plus a
