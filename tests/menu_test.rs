@@ -207,7 +207,8 @@ fn narrow_width_keeps_labels_and_drops_the_branch() {
 // anchors under its title column (x=7) with a 1-column border, so its content
 // starts at x=8; a marker's filled dot sits at x=9 (` ● …`). Content rows begin
 // at y=2 (y=1 is the box's top border). The full View row list is:
-//   0 Unified · 1 Side by side · 2 sep · 3 Line numbers · 4 sep · 5 Home · 6 History
+//   0 Unified · 1 Side by side · 2 sep · 3 Line numbers · 4 sep ·
+//   5 Changes panel · 6 sep · 7 Home · 8 History
 
 #[test]
 fn open_view_menu_renders_rows_with_state_markers() {
@@ -216,17 +217,26 @@ fn open_view_menu_renders_rows_with_state_markers() {
     assert_eq!(app.open_menu.map(|o| o.menu), Some(MenuId::View));
 
     let out = dump_frame(&app, W, H).unwrap();
-    for label in ["Unified", "Side by side", "Line numbers", "History"] {
+    for label in [
+        "Unified",
+        "Side by side",
+        "Line numbers",
+        "Changes panel",
+        "History",
+    ] {
         assert!(out.contains(label), "View row {label:?} missing:\n{out}");
     }
 
     // Each row reads " <3-col marker> <label>", so the marker field is columns
     // [inner_x+1, inner_x+4) = [9, 12): the radio dot is centred at x=10, and the
-    // checkbox brackets span 9..12. Default: Unified active, line numbers on.
+    // checkbox brackets span 9..12. Default: Unified active, line numbers on,
+    // changes panel shown.
     let buf = render_buffer(&app, W, H);
     assert_eq!(cell_symbol(&buf, 10, 2), "●", "Unified radio filled");
     assert_eq!(cell_symbol(&buf, 9, 5), "[", "checkbox opens");
     assert_eq!(cell_symbol(&buf, 10, 5), "x", "line numbers checked");
+    assert_eq!(cell_symbol(&buf, 9, 7), "[", "changes panel checkbox opens");
+    assert_eq!(cell_symbol(&buf, 10, 7), "x", "changes panel checked");
 }
 
 #[test]
@@ -277,13 +287,19 @@ fn keyboard_up_down_skips_separators_and_wraps() {
         "skips separator 2 to Line numbers"
     );
     key(&mut app, KeyCode::Down);
-    assert_eq!(app.open_menu.unwrap().item, 5, "skips separator 4 to Home");
+    assert_eq!(
+        app.open_menu.unwrap().item,
+        5,
+        "skips separator 4 to Changes panel"
+    );
     key(&mut app, KeyCode::Down);
-    assert_eq!(app.open_menu.unwrap().item, 6, "History");
+    assert_eq!(app.open_menu.unwrap().item, 7, "skips separator 6 to Home");
+    key(&mut app, KeyCode::Down);
+    assert_eq!(app.open_menu.unwrap().item, 8, "History");
     key(&mut app, KeyCode::Down);
     assert_eq!(app.open_menu.unwrap().item, 0, "wraps to the top");
     key(&mut app, KeyCode::Up);
-    assert_eq!(app.open_menu.unwrap().item, 6, "wraps back to the bottom");
+    assert_eq!(app.open_menu.unwrap().item, 8, "wraps back to the bottom");
 }
 
 #[test]
@@ -407,8 +423,8 @@ fn clicking_inside_the_box_off_any_row_is_consumed() {
     let (_repo, mut app) = app_with_change();
     let before = app.selected;
     open_menu(&mut app, VIEW_LABEL_X);
-    // The box's bottom border (y=9) is inside its bounds but on no content row.
-    click(&mut app, 15, 9);
+    // The box's bottom border (y=11) is inside its bounds but on no content row.
+    click(&mut app, 15, 11);
     assert!(
         app.open_menu.is_some(),
         "an in-box click is consumed (a fall-through would have closed the menu)"
@@ -521,11 +537,11 @@ fn review_session_view_menu_home_row_reads_review_and_is_checked() {
         out.contains("Review"),
         "the home row reads 'Review':\n{out}"
     );
-    // The Home row is full-index 5 → y=7; in a review session it is checked
+    // The Home row is full-index 7 → y=9; in a review session it is checked
     // (view == home == Review), so its radio is filled.
     let buf = render_buffer(&app, W, H);
     assert_eq!(
-        cell_symbol(&buf, 10, 7),
+        cell_symbol(&buf, 10, 9),
         "●",
         "the Review home row is checked"
     );
@@ -582,4 +598,78 @@ fn a_click_in_a_stale_dropdown_box_is_consumed_not_routed() {
         "no command fired against the mismatched menu/rect"
     );
     assert_eq!(app.theme_name, theme_before, "theme unchanged");
+}
+
+// --- Changes panel row (View menu) -------------------------------------------
+
+#[test]
+fn changes_panel_marker_tracks_show_changes() {
+    let (_repo, mut app) = clean_app();
+    assert!(app.show_changes, "shown by default");
+    open_menu(&mut app, VIEW_LABEL_X);
+    let buf = render_buffer(&app, W, H);
+    assert_eq!(cell_symbol(&buf, 9, 7), "[", "changes panel checkbox opens");
+    assert_eq!(cell_symbol(&buf, 10, 7), "x", "checked while shown");
+    key(&mut app, KeyCode::Esc);
+
+    press(&mut app, 'b'); // hide the panel
+    assert!(!app.show_changes);
+    open_menu(&mut app, VIEW_LABEL_X);
+    let buf = render_buffer(&app, W, H);
+    assert_eq!(cell_symbol(&buf, 10, 7), " ", "unchecked while hidden");
+}
+
+#[test]
+fn activating_changes_panel_row_flips_show_changes_in_status_view() {
+    let (_repo, mut app) = clean_app();
+    assert!(app.show_changes, "shown by default");
+
+    open_menu(&mut app, VIEW_LABEL_X);
+    key(&mut app, KeyCode::Down); // Side by side
+    key(&mut app, KeyCode::Down); // skips separator -> Line numbers
+    key(&mut app, KeyCode::Down); // skips separator -> Changes panel
+    assert_eq!(app.open_menu.unwrap().item, 5, "landed on Changes panel");
+    key(&mut app, KeyCode::Enter);
+
+    assert!(app.open_menu.is_none(), "activating closes the menu");
+    assert!(!app.show_changes, "flipped, matching the `b` key");
+}
+
+#[test]
+fn activating_changes_panel_row_flips_show_changes_in_history_view() {
+    let (_repo, mut app) = clean_app();
+    press(&mut app, 'i'); // enter history
+    assert_eq!(app.view, strix::app::ViewMode::History);
+    assert!(app.show_changes, "shown by default");
+
+    open_menu(&mut app, VIEW_LABEL_X);
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Down);
+    assert_eq!(app.open_menu.unwrap().item, 5, "landed on Changes panel");
+    key(&mut app, KeyCode::Enter);
+
+    assert!(app.open_menu.is_none(), "activating closes the menu");
+    assert!(
+        !app.show_changes,
+        "flipped via toggle_history_panel, matching the `b` key"
+    );
+}
+
+#[test]
+fn activating_changes_panel_row_does_not_persist_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_repo, mut app) = app_with_dir(dir.path());
+
+    open_menu(&mut app, VIEW_LABEL_X);
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Enter);
+
+    assert!(!app.show_changes, "the in-app change stands");
+    assert!(
+        read_config(dir.path()).is_empty(),
+        "toggling the changes panel is session-only, unlike diff-mode/line-numbers/theme"
+    );
 }

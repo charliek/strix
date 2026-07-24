@@ -148,6 +148,7 @@ pub(crate) enum MenuCommand {
     GoHome,
     EnterHistory,
     SetTheme(String),
+    ToggleChangesPanel,
 }
 
 /// The recorded hit-map for the open dropdown, mirroring the `x_rects`
@@ -1179,6 +1180,17 @@ impl App {
         }
     }
 
+    /// The view-aware behavior behind `b`/`Action::ToggleChanges` and the View
+    /// menu's "Changes panel" row: which panel toggles depends on the active
+    /// view. Shared so the key and the menu command can never diverge.
+    fn toggle_changes_panel(&mut self) {
+        match self.view {
+            ViewMode::Status => self.toggle_changes(),
+            ViewMode::History => self.toggle_history_panel(),
+            ViewMode::Review => self.toggle_review_panel(),
+        }
+    }
+
     /// Interpret a navigation/staging action in the status view: navigation keys
     /// move the file cursor in the staging pane but scroll the diff pane; staging
     /// ops act on the selected file regardless of focus.
@@ -1191,7 +1203,7 @@ impl App {
                     self.reveal_changes(); // Tab reveals a hidden panel and lands in it.
                 }
             }
-            Action::ToggleChanges => self.toggle_changes(),
+            Action::ToggleChanges => self.toggle_changes_panel(),
             // Focusing a hidden panel reveals it first.
             Action::FocusStaging => self.reveal_changes(),
             Action::FocusDiff => self.focus = Focus::Diff,
@@ -1272,7 +1284,7 @@ impl App {
                     self.reveal_history_panel(); // Tab reveals a hidden panel and lands in it.
                 }
             }
-            Action::ToggleChanges => self.toggle_history_panel(),
+            Action::ToggleChanges => self.toggle_changes_panel(),
             Action::FocusStaging => {
                 if self.show_changes {
                     self.history_focus_left();
@@ -1323,7 +1335,7 @@ impl App {
                     self.reveal_review_panel(); // Tab reveals a hidden panel and lands in it.
                 }
             }
-            Action::ToggleChanges => self.toggle_review_panel(),
+            Action::ToggleChanges => self.toggle_changes_panel(),
             Action::FocusStaging => {
                 if self.show_changes {
                     self.set_review_focus(ReviewFocus::List);
@@ -4490,6 +4502,13 @@ impl App {
                     },
                     MenuRow::Separator,
                     MenuRow::Item {
+                        label: "Changes panel".to_string(),
+                        marker: Marker::Check(self.show_changes),
+                        hint: Some("b"),
+                        command: MenuCommand::ToggleChangesPanel,
+                    },
+                    MenuRow::Separator,
+                    MenuRow::Item {
                         label: home_label.to_string(),
                         marker: Marker::Radio(self.view == home),
                         hint: Some("1"),
@@ -4644,6 +4663,8 @@ impl App {
                     self.enter_history();
                 }
             }
+            // Session-only, like the `b` key it mirrors: no persisted setting.
+            MenuCommand::ToggleChangesPanel => self.toggle_changes_panel(),
         }
     }
 
