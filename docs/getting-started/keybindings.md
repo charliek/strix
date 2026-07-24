@@ -41,7 +41,7 @@ any custom `themes/*.toml` files, with the active one marked.
 
 **Opening a menu is mouse-first**: click a title (`View` or `Theme`) to open
 its dropdown. There's no keyboard chord to *open* one — every setting a menu
-exposes already has its own direct key (`d`, `n`, `w`, `t`, `1`, `2`). Once a
+exposes already has its own direct key (`d`, `n`, `w`, `f`, `b`, `t`, `1`, `2`). Once a
 menu is open, it's fully keyboard-navigable:
 
 | Key                | Action                                            |
