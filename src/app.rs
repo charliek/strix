@@ -858,6 +858,12 @@ pub struct App {
     /// resizes / mode toggles but not a diff or view change. Computed lazily, only
     /// while horizontally scrolled; the h-scroll clamp reads it (`max_hscroll`).
     max_line_width: Cell<Option<((u64, ViewMode), usize)>>,
+    /// Count of times [`App::active_max_line_width`] actually recomputed the
+    /// memo (a cache miss), as opposed to returning the cached value. A
+    /// test-only observable proving the per-diff longest-line scan runs once
+    /// per `(diff_generation, view)`, not once per horizontal scroll or render
+    /// (plan §3.7). Not otherwise read.
+    max_line_width_compute_count: Cell<u64>,
     /// Count of per-file diff computations, bumped in `sync_diff` /
     /// `sync_review_diff`'s actual compute branches. A test-only observable
     /// proving a cross-file hop computes exactly the destination file's diff
@@ -1056,6 +1062,7 @@ impl App {
             diff_hscroll: 0,
             diff_generation: Cell::new(0),
             max_line_width: Cell::new(None),
+            max_line_width_compute_count: Cell::new(0),
             diff_compute_count: Cell::new(0),
             open_menu: None,
             menu_title_rects: RefCell::new(Vec::new()),
@@ -3006,6 +3013,8 @@ impl App {
             _ => 0,
         };
         self.max_line_width.set(Some((key, width)));
+        self.max_line_width_compute_count
+            .set(self.max_line_width_compute_count.get() + 1);
         width
     }
 
@@ -4897,6 +4906,25 @@ impl App {
     #[doc(hidden)]
     pub fn diff_compute_count(&self) -> u64 {
         self.diff_compute_count.get()
+    }
+
+    /// How many times the physical diff-pane layout has actually been
+    /// rebuilt (`App::diff_layout`'s stale branch), as opposed to reused from
+    /// cache. A test-only observable proving a repeated render at unchanged
+    /// geometry is a cache hit, and that a width / wrap / line-numbers change
+    /// bumps it by exactly one (plan §3.7).
+    #[doc(hidden)]
+    pub fn layout_generation(&self) -> u64 {
+        self.layout_generation.get()
+    }
+
+    /// How many times [`App::active_max_line_width`] recomputed the longest
+    /// code-line memo, as opposed to returning the cached value. A test-only
+    /// observable proving the per-diff scan runs once per `(diff_generation,
+    /// view)`, not once per horizontal scroll (plan §3.7).
+    #[doc(hidden)]
+    pub fn max_line_width_compute_count(&self) -> u64 {
+        self.max_line_width_compute_count.get()
     }
 
     /// The number of physical rows the active diff's layout renders (needs a
