@@ -205,7 +205,10 @@ fn far_cursor_move_reveals_the_row_act_and_reveal() {
     for _ in 0..60 {
         app.on_key(key('j'));
     }
-    assert!(app.diff_scroll > 0, "the viewport followed the cursor down");
+    assert!(
+        app.diff_scroll.get() > 0,
+        "the viewport followed the cursor down"
+    );
     assert!(
         dump(&app).contains("final note"),
         "the cursor's box body was revealed"
@@ -568,7 +571,7 @@ fn clicking_a_diff_row_focuses_the_pane_and_moves_the_cursor() {
         !app.review_list_focused(),
         "the click focuses the diff pane"
     );
-    let expected = app.diff_scroll + (screen_row - diff.y) as usize;
+    let expected = app.diff_scroll.get() + (screen_row - diff.y) as usize;
     assert_eq!(
         app.review_cursor(),
         expected,
@@ -588,7 +591,7 @@ fn wheel_scroll_moves_the_viewport_but_not_the_cursor() {
     app.on_mouse(mouse(diff.x + 2, diff.y + 1, MouseEventKind::ScrollDown));
 
     assert_eq!(app.review_cursor(), 0, "the wheel leaves the cursor alone");
-    assert!(app.diff_scroll > 0, "the wheel scrolled the viewport");
+    assert!(app.diff_scroll.get() > 0, "the wheel scrolled the viewport");
 }
 
 #[test]
@@ -608,12 +611,12 @@ fn a_click_after_content_shrinks_hits_the_visually_clicked_row() {
     let _ = dump(&app);
     app.on_key(key('l'));
     app.on_key(key('G')); // cursor onto the trailing comment row; diff_scroll == max
-    assert!(app.diff_scroll > 0);
+    assert!(app.diff_scroll.get() > 0);
 
     app.on_key(key('X')); // delete it: the row list shrinks by one
     let frame = dump(&app);
     assert!(
-        app.diff_scroll > app.diff_max_scroll(),
+        app.diff_scroll.get() > app.diff_max_scroll(),
         "diff_scroll is parked one past the shrunken row list's max"
     );
 
@@ -624,7 +627,7 @@ fn a_click_after_content_shrinks_hits_the_visually_clicked_row() {
         diff.y,
         MouseEventKind::Down(MouseButton::Left),
     ));
-    let clamped = app.diff_scroll.min(app.diff_max_scroll());
+    let clamped = app.diff_scroll.get().min(app.diff_max_scroll());
     assert_eq!(
         app.review_cursor(),
         clamped,
@@ -655,7 +658,10 @@ fn capital_x_reveals_an_offscreen_cursor_before_deleting() {
     for _ in 0..12 {
         app.on_mouse(mouse(diff.x + 2, diff.y + 1, MouseEventKind::ScrollDown));
     }
-    assert!(app.diff_scroll > cursor, "the cursor scrolled offscreen");
+    assert!(
+        app.diff_scroll.get() > cursor,
+        "the cursor scrolled offscreen"
+    );
     let before = store_text(repo.path());
 
     app.on_key(key('X'));
@@ -690,7 +696,7 @@ fn nav_onto_the_same_file_keeps_the_cursor() {
     app.on_key(key('l'));
     app.on_key(key('G')); // cursor + viewport to the bottom
     let cursor = app.review_cursor();
-    let scroll = app.diff_scroll;
+    let scroll = app.diff_scroll.get();
     assert!(cursor > 0 && scroll > 0);
 
     app.on_key(key('h')); // focus the file list
@@ -700,7 +706,7 @@ fn nav_onto_the_same_file_keeps_the_cursor() {
         cursor,
         "the cursor is not reset when the selection didn't change"
     );
-    assert_eq!(app.diff_scroll, scroll, "the viewport is unchanged");
+    assert_eq!(app.diff_scroll.get(), scroll, "the viewport is unchanged");
 }
 
 #[test]
@@ -718,7 +724,7 @@ fn half_page_moves_cursor_with_diff_focus_scrolls_with_list_focus() {
     // List focused: ctrl-d scrolls the viewport only, leaving the cursor put.
     app.on_key(key('h'));
     let cursor = app.review_cursor();
-    let scroll = app.diff_scroll;
+    let scroll = app.diff_scroll.get();
     app.on_key(ctrl('d'));
     assert_eq!(
         app.review_cursor(),
@@ -726,7 +732,7 @@ fn half_page_moves_cursor_with_diff_focus_scrolls_with_list_focus() {
         "the cursor is unmoved while the list is focused"
     );
     assert!(
-        app.diff_scroll > scroll,
+        app.diff_scroll.get() > scroll,
         "ctrl-d still scrolls the diff viewport"
     );
 }

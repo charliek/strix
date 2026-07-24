@@ -226,17 +226,59 @@ cursor addresses a **logical** `RowTarget` — `Code(diff_index)`,
 layout (`Vec<LayoutRow>`, each row carrying its `RowTarget`, a `subrow` index,
 an optional side-by-side column, a click `HitRegion`, and its render content)
 is rebuilt from that target list for the current pane width and diff/comments
-generation; a code line is exactly one `LayoutRow`, a comment box or the
-in-place editor is several (border / title / body) sharing one target.
-Consequences of the split: `j`/`k` move between *targets*, crossing a
-multi-row box in a single step; scroll offset and content-height metrics
-count physical rows; the cursor highlight spans every physical row of the
-selected target; and a resize rebuilds the layout while preserving the
-logical target the cursor was on. `DiffPaneState` (the cursor, the open
-in-place editor if any, and the comment boxes' `[x]` click rects recorded
-during render) is owned per view that *has* a cursor — Status and Review each
-get their own; the scroll offset, the height metrics, and the row-layout
-cache itself stay App-global, shared with History.
+generation; a code line is exactly one `LayoutRow` when line wrap is off, or
+one per display-wrapped segment when it's on (see **Line wrap** below), and a
+comment box or the in-place editor is several (border / title / body) sharing
+one target either way. Consequences of the split: `j`/`k` move between
+*targets*, crossing a multi-row box — or a wrapped line — in a single step;
+scroll offset and content-height metrics count physical rows; the cursor
+highlight spans every physical row of the selected target; and a resize
+rebuilds the layout while preserving the logical target the cursor was on.
+`DiffPaneState` (the cursor, the open in-place editor if any, and the comment
+boxes' `[x]` click rects recorded during render) is owned per view that *has*
+a cursor — Status and Review each get their own; the scroll offset, the
+height metrics, and the row-layout cache itself stay App-global, shared with
+History.
+
+**Line wrap.** With `wrap_lines` on (key `w`), a wrapped code line's
+`LayoutRow`s carry a `Seg` each — a `start_char`/`end_char` window into the
+same sanitized text `highlighted_content` already renders, so word-diff
+emphasis ranges need no remapping — and all of a line's subrows still share
+one `Code` target with an incrementing `subrow`, so the cursor span,
+hit-testing, and comment anchoring above cover a wrapped line for free; wrap
+off is the same code path with a single full-width segment per line. The
+line-number gutter is itself sized per diff to the widest old/new line
+number (no longer a fixed 4 digits), because its width sets the content width
+a line wraps at; `CachedLayout` is keyed on pane width, diff mode,
+`wrap_lines`, *and* `show_line_numbers` for that reason — toggling either
+rebuilds the layout. Any structural relayout (a resize, the wrap toggle, or
+the line-numbers toggle) re-anchors the scroll offset to the logical line
+that was at the top, so the reader's place survives even though the row
+count under it just changed.
+
+**Horizontal scroll.** With wrap off, a trackpad `ScrollLeft`/`ScrollRight`
+gesture shifts the diff's code content sideways (`diff_hscroll`, in display
+columns); gutters, the sign column, hunk headers, and comment boxes never
+move. The clamp is computed at read time from current geometry — pane width,
+mode, gutter width — so a divider drag or an `n` toggle between events can't
+leave a stale over-scroll; the only cached value is the diff's longest
+sanitized code-line width (hunk headers excluded), memoized per `(diff
+generation, view)` alongside the diff itself, not recomputed per frame.
+Enabling wrap resets the offset to 0 — the two are mutually exclusive — and a
+same-file refresh preserves it, matching `diff_scroll`'s convention.
+
+**Cross-file scroll.** With `cross_file_scroll` on (key `f`; Status and
+Review only — History is excluded), scrolling past a diff's edge is a
+boundary crossing, never a concatenated document: an ordinary selection
+change to the neighboring file plus a placement at its top (scrolling down)
+or bottom (scrolling up). A one-bit `wheel_edge` memory makes the wheel
+"clamp first, cross on a subsequent tick" even for a diff shorter than the
+viewport; the keyboard rule lets `j`/`k` finish scrolling a wrapped target
+taller than the viewport before hopping. The destination is recorded as
+`pending_diff_placement` — a refresh-stable `(SelectionId, Placement)`, not a
+row index a relist could renumber — and consumed unconditionally the next
+time that destination's diff syncs, so per-file diffs stay lazy: a hop
+computes exactly the file it lands on, nothing eagerly.
 
 **Comment boxes.** A comment renders as a bordered, multi-row box directly
 below its anchored line: a title row (`● you — <file> R<line>` or
@@ -423,6 +465,12 @@ How they're met:
 - The history walk decodes commit objects only (no trees or blobs) and is
   bounded to a page (500 commits); per-commit trees and blobs load lazily for
   the selected commit.
+- The diff pane's physical row layout — including line wrap's per-line
+  `Seg` split — is cached per `(width, mode, wrap, line-numbers)` and rebuilt
+  only when one of those actually changes, not on every frame; a repeated
+  render at unchanged geometry is a cache hit. The horizontal-scroll clamp's
+  longest-line width is memoized once per diff the same way, not recomputed
+  on scroll or resize.
 
 ## Non-goals
 
@@ -472,3 +520,10 @@ covering everything `git` does.
 - **Mouse tests** render a frame, then drive `on_mouse_at` with explicit
   `Instant`s so double-click timing is asserted deterministically, without
   sleeping.
+- **Perf smoke test** (`tests/perf_smoke_test.rs`) asserts the caching
+  invariants above structurally — an unchanged-state render doesn't rebuild
+  the layout, a width/wrap/line-numbers change rebuilds it exactly once, the
+  longest-line memo survives repeated horizontal scrolling — against a
+  synthetic ~2,000-line diff with several 400+-column lines, plus one
+  deliberately loose wall-clock backstop (30 frames, generous ceiling) rather
+  than a tight benchmark.

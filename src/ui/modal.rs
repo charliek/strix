@@ -71,6 +71,8 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
         section("View"),
         binding("d", "toggle side-by-side"),
         binding("n", "toggle line numbers"),
+        binding("w", "toggle line wrap"),
+        binding("f", "toggle cross-file scroll"),
         binding("t", "cycle theme"),
         binding("m", "toggle menu bar"),
         binding("b", "show / hide changes panel"),

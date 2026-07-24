@@ -12,6 +12,8 @@ These are the defaults. Every binding is remappable — see
 | `r`            | Refresh status from disk                |
 | `Tab`          | Switch focus between panes              |
 | `n`            | Toggle line numbers in the diff gutter (persists) |
+| `w`            | Toggle hard line wrapping in the diff pane (persists) |
+| `f`            | Toggle cross-file scroll — scroll past a diff's edge into the next / previous file (persists) |
 | `t`            | Cycle the theme (presets, then your custom themes; persists) |
 | `m`            | Show / hide the menu bar (persists)     |
 | `b`            | Show / hide the left panel              |
@@ -19,8 +21,10 @@ These are the defaults. Every binding is remappable — see
 | `1`, `2`       | Switch to the Status / History view (or the review session / History, in a `strix diff` session) |
 | `Esc`          | Close an overlay; leave History view    |
 
-`n`, `t`, and `m` work in every view (Status, History, and the review view).
-While the discard-confirmation modal is open, `n` is consumed as "no"
+`n`, `w`, `f`, `t`, and `m` work in every view (Status, History, and the review
+view), though cross-file scroll (`f`) only crosses boundaries in Status and
+Review — the History view is excluded. While the discard-confirmation modal is
+open, `n` is consumed as "no"
 (dismiss the modal) rather than toggling line numbers; the global binding
 resumes once the modal closes.
 
@@ -29,15 +33,16 @@ resumes once the modal closes.
 The header shows two dropdown menus, `View` and `Theme`, whenever the menu
 bar is visible (`m` toggles it, on by default — see
 [Configuration](../guides/configuration.md)). `View` holds diff mode
-(unified / side-by-side), line numbers, and a Status/History switcher; the
-current view's item is checked so the row that would just switch to itself
-still shows state, not a dead control. `Theme` lists the built-in presets and
+(unified / side-by-side), line numbers, line wrap, cross-file scroll, the
+changes panel, and a
+Status/History switcher; the current view's item is checked so the row that
+would just switch to itself still shows state, not a dead control. `Theme` lists the built-in presets and
 any custom `themes/*.toml` files, with the active one marked.
 
 **Opening a menu is mouse-first**: click a title (`View` or `Theme`) to open
 its dropdown. There's no keyboard chord to *open* one — every setting a menu
-exposes already has its own direct key (`d`, `n`, `t`, `1`, `2`). Once a menu
-is open, it's fully keyboard-navigable:
+exposes already has its own direct key (`d`, `n`, `w`, `f`, `b`, `t`, `1`, `2`). Once a
+menu is open, it's fully keyboard-navigable:
 
 | Key                | Action                                            |
 |--------------------|----------------------------------------------------|
@@ -76,6 +81,8 @@ same effect as arrowing to it.
 | `Ctrl-d`, `Ctrl-u` | Move the cursor a half page down / up          |
 | `g`, `G`        | Jump to top / bottom of the diff                  |
 | `d`             | Toggle unified / side-by-side mode                |
+| `w`             | Toggle hard line wrapping (long lines wrap instead of truncating) |
+| `f`             | Toggle cross-file scroll (scroll past a diff's edge into the next / previous file) |
 | `c`             | Add a comment on the cursor's line, or edit the comment under it |
 | `X`             | Delete the comment under the cursor (no confirmation) |
 | `]`, `[`        | Jump to the next / previous comment               |
@@ -190,6 +197,13 @@ remapping one never affects the other.
 | Drag the vertical split bar   | Resize the left column vs the diff              |
 | Drag the horizontal split bar | Resize Committed Changes vs Graph (History view)|
 | Scroll wheel                  | Scroll the pane under the cursor; in the diff pane this moves the viewport only — the cursor stays put |
+| Trackpad horizontal scroll    | Shift the diff's code content sideways to read long lines (gutters, sign column, hunk headers, and comment boxes stay put); works in every view's diff pane, and only when line wrap is off |
+
+Horizontal scrolling is a trackpad gesture only — there is no keybinding and
+nothing is persisted. It relies on the terminal emitting horizontal scroll
+events; some terminals (including macOS Terminal.app) never do, so the gesture
+does nothing there. It is inert while line wrap (`w`) is on, since wrapped lines
+have nothing to scroll to.
 
 Double-click detection is semantic, not pixel-based: two clicks resolving to
 the same target (same file, same code line or comment box) within 500 ms
