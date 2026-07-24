@@ -31,21 +31,48 @@ impl Assets {
 fn assets() -> &'static Assets {
     static ASSETS: OnceLock<Assets> = OnceLock::new();
     ASSETS.get_or_init(|| Assets {
-        syntaxes: SyntaxSet::load_defaults_newlines(),
+        syntaxes: two_face::syntax::extra_newlines(),
         themes: ThemeSet::load_defaults(),
     })
 }
 
-/// The syntax for a file path, matched by extension, falling back to plain text.
+/// Extensions two-face's set doesn't claim under their natural name, mapped to
+/// an extension it does. Discovered by running the `syntax_for` tests without
+/// this map and checking which ones fell back to plain text: two-face already
+/// recognises `kts`, `mts`, and `zon` directly, so only `mjs`/`cjs` need
+/// aliasing to `js`. `tmpl`/`tpl` preserve the HTML fallback the old default
+/// set provided for template files.
+const EXTENSION_ALIASES: &[(&str, &str)] = &[
+    ("mjs", "js"),
+    ("cjs", "js"),
+    ("tmpl", "html"),
+    ("tpl", "html"),
+];
+
+/// The syntax for a file path: matched by extension, then by full file name
+/// (syntect treats names like `Dockerfile` as extensions), then by an alias
+/// for extensions two-face's set doesn't recognise directly, falling back to
+/// plain text.
 pub fn syntax_for(path: &str) -> &'static SyntaxReference {
     let assets = assets();
-    let extension = Path::new(path)
-        .extension()
-        .and_then(|ext| ext.to_str())
+    let path = Path::new(path);
+    let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
         .unwrap_or("");
+
     assets
         .syntaxes
         .find_syntax_by_extension(extension)
+        .or_else(|| assets.syntaxes.find_syntax_by_extension(file_name))
+        .or_else(|| {
+            // Case-insensitive to match syntect's own extension lookup.
+            EXTENSION_ALIASES
+                .iter()
+                .find(|(ext, _)| ext.eq_ignore_ascii_case(extension))
+                .and_then(|(_, alias)| assets.syntaxes.find_syntax_by_extension(alias))
+        })
         .unwrap_or_else(|| assets.syntaxes.find_syntax_plain_text())
 }
 

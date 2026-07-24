@@ -125,3 +125,8 @@ The full site lives under `docs/` and builds with `mkdocs-material`
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+Bundled syntax-highlighting definitions come in part via the
+[two-face](https://crates.io/crates/two-face) crate (MIT OR Apache-2.0), which
+republishes an extended Sublime syntax set along with per-syntax license
+acknowledgements.

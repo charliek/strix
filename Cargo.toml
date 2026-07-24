@@ -39,6 +39,10 @@ gix = { version = "0.84.0", default-features = false, features = [
 # Diff + syntax highlighting
 similar = "3.1.1"
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
+# Extended syntax set (two-face republishes more Sublime syntaxes than syntect's
+# bundled defaults); syntect-fancy pairs it with strix's existing fancy regex
+# engine choice above instead of pulling in onig too.
+two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
 
 # Filesystem watching (auto-refresh); debouncer coalesces event bursts
 notify = "8.2"
