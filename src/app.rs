@@ -17,12 +17,13 @@ use syntect::parsing::SyntaxReference;
 use crate::comments::{self, Comment, FileFacts, Scope, Side, Source};
 use crate::config::{Config, Setting};
 use crate::git::{
-    Change, CommitFile, CommitInfo, DiffLine, FileDiff, FileEntry, LineKind, RefLabel, Repo,
-    ReviewSpec, Section, Status,
+    Change, CommitFile, CommitInfo, CommitStat, DiffLine, FileDiff, FileEntry, LineKind, RefLabel,
+    Repo, ReviewSpec, Section, Status,
 };
 use crate::graph::{self, GraphRow};
 use crate::keys::{Action, Keymap};
 use crate::ui::theme::Theme;
+use crate::ui::MarkerTone;
 
 /// A path-based git mutation (stage / unstage); lets the select → run → refresh
 /// flow be shared via `run_on_selected`.
@@ -268,6 +269,7 @@ pub enum HitRegion {
     Code,
     Close(u64),
     Body(u64),
+    FileHeader,
 }
 
 /// The *semantic* region a click landed on, the part of a [`HitTarget`] that
@@ -370,6 +372,21 @@ pub enum RowContent {
     Box(BoxRow),
     /// One physical row of the in-place comment editor (plan §3.5).
     Editor(EditorPart),
+    /// The file's header row, present only with cross-file scroll on (plan 006
+    /// §3.1) — always exactly one physical row at the top of the file's layout.
+    FileHeader(FileHeaderRow),
+}
+
+/// The render payload of a [`RowContent::FileHeader`] row: everything the band
+/// draws, resolved once when the layout is built (plan 006 §3.1) so no frame
+/// re-derives it. The marker's colour is named ([`MarkerTone`]) rather than
+/// resolved, because a theme cycle does not rebuild the layout.
+pub struct FileHeaderRow {
+    pub marker: char,
+    pub tone: MarkerTone,
+    /// The file's list label — `old → new` for a rename.
+    pub path: String,
+    pub stat: CommitStat,
 }
 
 /// Which physical part of the in-place editor box a row draws. The editor mirrors
@@ -420,16 +437,25 @@ pub struct LayoutRow {
     pub content: RowContent,
 }
 
-/// The cached physical layout plus the inputs it was built for. A resize
-/// (`width`), a diff-mode toggle (`mode`), a wrap toggle (`wrap`), or a
-/// line-number toggle (`line_numbers`, which changes the gutter width and hence
-/// the wrap content width) each rebuild it; the logical `RowTarget`s survive
-/// (plan §3.3).
-struct CachedLayout {
+/// Everything a built layout depends on: a resize (`width`), a diff-mode toggle
+/// (`mode`), a wrap toggle (`wrap`), a line-number toggle (`line_numbers`, which
+/// changes the gutter width and hence the wrap content width), or a cross-file
+/// toggle (`cross_file`, which adds the file-header row — plan 006 §3.1) each
+/// rebuild it. Three of the five are `bool`, so they are named rather than
+/// positional.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct LayoutKey {
     width: u16,
     mode: DiffMode,
     wrap: bool,
     line_numbers: bool,
+    cross_file: bool,
+}
+
+/// The cached physical layout plus the inputs it was built for. The logical
+/// `RowTarget`s survive a rebuild (plan §3.3).
+struct CachedLayout {
+    key: LayoutKey,
     rows: Vec<LayoutRow>,
 }
 
@@ -482,6 +508,9 @@ pub enum RowTarget {
     /// The in-place editor box (plan §3.5). Only ever one at a time; keys route to
     /// it before the keymap, so the file cursor never navigates onto it.
     Editor,
+    /// The file's header row (plan 006 §3.1) — one cursor stop, anchoring nothing:
+    /// `c`, double-click-to-edit, and `x` are all no-ops on it.
+    FileHeader,
 }
 
 /// The in-place comment editor's state (plan §3.5): a multi-line buffer plus the
@@ -812,6 +841,11 @@ pub struct App {
     /// in both the staged and unstaged sections selects the same computed diff
     /// from either row — no recompute, no divergence.
     diff_key: Option<String>,
+    /// The section `diff_key`'s cached *layout* was built for. The diff itself is
+    /// section-independent (see above), but the file-header row's marker and tone
+    /// are not (plan 006 §3.1), so a same-path staged↔unstaged move keeps the diff
+    /// and drops the layout.
+    diff_section: Option<Section>,
     /// Set when an external refresh should recompute the open file's diff even
     /// though its `(section, path)` is unchanged (its content may have changed).
     /// Unlike navigating to a new file, this preserves the scroll position.
@@ -1051,6 +1085,7 @@ impl App {
             flash: None,
             current_diff: None,
             diff_key: None,
+            diff_section: None,
             diff_dirty: false,
             diff_mode: config.diff_mode(),
             show_line_numbers: config.line_numbers(),
@@ -1275,8 +1310,7 @@ impl App {
                 return;
             }
             Action::ToggleCrossFileScroll => {
-                self.cross_file_scroll = !self.cross_file_scroll;
-                self.wheel_edge = None;
+                self.set_cross_file_scroll(!self.cross_file_scroll);
                 self.persist_setting(Setting::CrossFileScroll(self.cross_file_scroll));
                 return;
             }
@@ -1878,7 +1912,7 @@ impl App {
     fn cursor_comment_id(&self) -> Option<u64> {
         match self.review_cursor_target()? {
             RowTarget::Comment(id) | RowTarget::Orphan(id) => Some(id),
-            RowTarget::Code(_) | RowTarget::Editor => None,
+            RowTarget::Code(_) | RowTarget::Editor | RowTarget::FileHeader => None,
         }
     }
 
@@ -3164,8 +3198,8 @@ impl App {
                 }
             }
             // The in-place editor isn't a double-click target (its own click
-            // handling ran above).
-            RowTarget::Editor => return None,
+            // handling ran above); neither is the file header.
+            RowTarget::Editor | RowTarget::FileHeader => return None,
         };
         Some(HitTarget {
             generation: self.layout_generation.get(),
@@ -3731,6 +3765,16 @@ impl App {
     fn recompute_status_diff(&mut self) {
         // Path only, not (section, path) — see the `diff_key` field doc.
         let key = self.selected_file().map(|(_, entry)| entry.path.clone());
+        // The section is *not* part of the diff key, but it is part of the layout:
+        // the file-header row's marker and tone read it (plan 006 §3.1). A
+        // same-path staged↔unstaged move therefore drops the layout — and only the
+        // layout, so the diff isn't recomputed and the highlight cache (same text,
+        // same syntax) stays warm.
+        let section = self.selected_file().map(|(section, _)| section);
+        if section != self.diff_section {
+            self.diff_section = section;
+            *self.layout.borrow_mut() = None;
+        }
         let file_changed = key != self.diff_key;
         if !file_changed && !self.diff_dirty {
             return;
@@ -4308,27 +4352,28 @@ impl App {
         // Wrap and the line-number gutter are both wrap inputs (the gutter sets
         // the content width a line wraps at), so a change in either invalidates
         // the cache alongside width and mode (plan §3.3).
-        let current = (
+        let current = LayoutKey {
             width,
-            self.diff_mode,
-            self.wrap_lines,
-            self.show_line_numbers,
-        );
-        let previous = self
-            .layout
-            .borrow()
-            .as_ref()
-            .map(|c| (c.width, c.mode, c.wrap, c.line_numbers));
-        let stale = previous != Some(current);
-        if stale {
+            mode: self.diff_mode,
+            wrap: self.wrap_lines,
+            line_numbers: self.show_line_numbers,
+            cross_file: self.cross_file_scroll,
+        };
+        let previous = self.layout.borrow().as_ref().map(|c| c.key);
+        if previous != Some(current) {
             // Anchor the top visible logical line across a *structural* relayout —
             // a resize, a wrap toggle, or a line-number toggle — so the row the
             // user was reading stays at the top (plan §3.3). Skip it when the mode
             // changed (`toggle_diff_mode` resets scroll+cursor itself) and when
             // there was no prior layout (first build, or a comment mutation dropped
-            // the cache to `None` — those preserve `diff_scroll` verbatim).
-            let anchor = match &previous {
-                Some((_, prev_mode, _, _)) if *prev_mode == self.diff_mode => {
+            // the cache to `None` — those preserve `diff_scroll` verbatim). A
+            // cross-file toggle is skipped for its own reason: re-anchoring would
+            // slide the arriving header row straight back off the top, so pressing
+            // `f` at the top of a file would draw nothing (plan 006 §3.1).
+            let anchor = match previous {
+                Some(prev)
+                    if prev.mode == current.mode && prev.cross_file == current.cross_file =>
+                {
                     let top = self.diff_scroll.get().min(self.diff_max_scroll());
                     self.layout
                         .borrow()
@@ -4352,13 +4397,7 @@ impl App {
                 let row = rows.iter().position(|r| r.target == target).unwrap_or(0);
                 self.diff_scroll.set(row);
             }
-            *self.layout.borrow_mut() = Some(CachedLayout {
-                width,
-                mode: self.diff_mode,
-                wrap: self.wrap_lines,
-                line_numbers: self.show_line_numbers,
-                rows,
-            });
+            *self.layout.borrow_mut() = Some(CachedLayout { key: current, rows });
         }
         Ref::map(self.layout.borrow(), |cached| {
             &cached.as_ref().expect("filled above").rows
@@ -4415,7 +4454,50 @@ impl App {
             block.append(&mut rows);
             rows = block;
         }
+        // Ahead of the orphan block, in both modes (plan 006 §3.1).
+        if let Some(header) = self.file_header_row() {
+            rows.insert(0, header);
+        }
         rows
+    }
+
+    /// The file's header row (plan 006 §3.1; History is never crossed, so it has
+    /// none). Its whole payload — marker, display path, counts — is resolved here,
+    /// once per layout build, so rendering never re-derives it.
+    fn file_header_row(&self) -> Option<LayoutRow> {
+        if !self.cross_file_scroll {
+            return None;
+        }
+        let header = match self.view {
+            ViewMode::Status => {
+                let (section, entry) = self.selected_file()?;
+                FileHeaderRow {
+                    marker: entry.change.marker(),
+                    tone: MarkerTone::for_status(section, entry.change),
+                    path: entry.display_path(),
+                    // A working-tree entry carries no stats, so the counts come
+                    // off the diff that was computed for this pane anyway.
+                    stat: self.active_diff().map(crate::git::diff::stat_of)?,
+                }
+            }
+            ViewMode::Review => {
+                let file = self.review_files().get(self.review_selected())?;
+                FileHeaderRow {
+                    marker: file.change.marker(),
+                    tone: MarkerTone::for_change_kind(file.change),
+                    path: file.display_path(),
+                    stat: file.stat,
+                }
+            }
+            ViewMode::History => return None,
+        };
+        Some(LayoutRow {
+            target: RowTarget::FileHeader,
+            subrow: 0,
+            side: None,
+            hit: HitRegion::FileHeader,
+            content: RowContent::FileHeader(header),
+        })
     }
 
     /// The unified physical layout: an orphan block at the top, then each diff
@@ -5158,6 +5240,26 @@ impl App {
         }
     }
 
+    /// Flip cross-file scroll on/off — the single seam both the `f` key and the
+    /// View-menu item go through, because turning it *off* retires the file-header
+    /// row and two things depend on that row existing:
+    ///
+    /// - a cursor pinned to `RowTarget::FileHeader` no longer resolves, and the
+    ///   `(0, 1)` span fallback would make the next `j` skip physical row 0;
+    /// - the row count changes by one, so the scroll metrics a same-batch wheel
+    ///   tick or click clamps against are stale until the next render (the same
+    ///   drained-batch rule `place_diff` follows).
+    fn set_cross_file_scroll(&mut self, on: bool) {
+        self.cross_file_scroll = on;
+        self.wheel_edge = None;
+        if !on && self.active_pane().and_then(|pane| pane.cursor) == Some(RowTarget::FileHeader) {
+            self.set_review_cursor(None);
+        }
+        let width = self.diff_pane_width();
+        let count = self.diff_layout(width).len();
+        self.set_diff_metrics(self.diff_viewport.get(), count);
+    }
+
     /// Advance to the next theme in `Theme::available` (presets then user themes),
     /// wrapping around. The available set is enumerated fresh here so a theme file
     /// added or removed since startup is honoured; a `theme_name` no longer in the
@@ -5390,8 +5492,7 @@ impl App {
             }
             MenuCommand::SetCrossFileScroll(on) => {
                 if self.cross_file_scroll != on {
-                    self.cross_file_scroll = on;
-                    self.wheel_edge = None;
+                    self.set_cross_file_scroll(on);
                     self.persist_setting(Setting::CrossFileScroll(self.cross_file_scroll));
                 }
             }

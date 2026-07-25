@@ -353,7 +353,9 @@ fn empty_binary_diff_keyboard_crossing() {
     let mut app = app_for(&repo, config(true, false));
     dump_frame(&app, W, H).unwrap();
     assert_eq!(selected_path(&app), "bin.dat");
-    assert_eq!(app.diff_row_count(), 0, "a binary diff has no code rows");
+    // With cross-file on the file-header row is the layout's only row: a binary
+    // diff still has no code rows, so it is a one-stop section (plan 006 §3.1).
+    assert_eq!(app.diff_row_count(), 1, "the header row and nothing else");
 
     press(&mut app, 'l'); // focus the diff
     press(&mut app, 'j'); // an empty diff is an immediate boundary
@@ -517,7 +519,8 @@ fn no_hop_while_editor_open() {
     let mut app = app_for(&repo, config(true, false));
     dump_frame(&app, W, H).unwrap();
     press(&mut app, 'l'); // focus the diff
-    press(&mut app, 'j'); // move onto a code row (off the hunk header)
+    press(&mut app, 'j'); // off the file-header row
+    press(&mut app, 'j'); // off the hunk header, onto the first anchorable code row
     press(&mut app, 'c'); // open the in-place editor
     assert!(app.editor_open(), "the editor is open");
     dump_frame(&app, W, H).unwrap();

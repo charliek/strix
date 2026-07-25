@@ -14,7 +14,7 @@ use crate::git::{CommitFile, CommitInfo};
 use crate::graph::GraphRow;
 use crate::ui::theme::Theme;
 use crate::ui::{
-    centered_hint, change_color, diff_view, file_stat_spans, panel_block, selection_style,
+    centered_hint, diff_view, file_stat_spans, panel_block, selection_style, MarkerTone,
 };
 
 pub fn render(frame: &mut Frame, body: Rect, app: &App) {
@@ -226,7 +226,7 @@ fn commit_row(commit: &CommitInfo, theme: &Theme) -> ListItem<'static> {
 }
 
 fn file_row(file: &CommitFile, theme: &Theme) -> ListItem<'static> {
-    let color = change_color(file.change, theme);
+    let color = MarkerTone::for_change_kind(file.change).color(theme);
     ListItem::new(Line::from(vec![
         Span::styled(
             format!("  {} ", file.change.marker()),

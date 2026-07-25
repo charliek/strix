@@ -15,7 +15,7 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthChar;
 
 use crate::app::{App, FlashKind, ViewMode};
-use crate::git::{ChangeKind, CommitFile};
+use crate::git::{Change, ChangeKind, CommitFile, CommitStat, Section};
 use crate::ui::theme::Theme;
 
 /// Top-level render: header / body / footer, with the body split into the
@@ -286,7 +286,7 @@ fn sub_rect(area: Rect, x: u16, width: u16) -> Rect {
 /// truncated across span boundaries with a **single** trailing `…`, one column
 /// reserved globally — so a span that exactly fills the width can't silently
 /// drop the spans after it (e.g. a repo name eating the ` · history` label).
-fn fit_spans(spans: Vec<Span<'static>>, max: usize) -> Vec<Span<'static>> {
+pub(crate) fn fit_spans(spans: Vec<Span<'static>>, max: usize) -> Vec<Span<'static>> {
     let total: usize = spans.iter().map(|s| text_width(&s.content)).sum();
     if total <= max {
         return spans;
@@ -448,44 +448,97 @@ pub fn selection_style(focused: bool, theme: &Theme) -> Style {
     }
 }
 
-/// A changed file's theme colour, keyed on its change kind. Shared by the review
-/// file list and the history commit-detail summary.
-pub(crate) fn change_color(change: ChangeKind, theme: &Theme) -> Color {
-    match change {
-        ChangeKind::Added | ChangeKind::Copied => theme.staged,
-        ChangeKind::Deleted => theme.del,
-        _ => theme.unstaged,
+/// Which theme colour a changed-file marker takes. Named rather than resolved so
+/// a marker can be stored somewhere that outlives one frame — the diff pane's
+/// file-header row lives in the cached layout, which a theme cycle doesn't
+/// rebuild (plan 006 §3.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarkerTone {
+    Staged,
+    Unstaged,
+    Untracked,
+    Deleted,
+}
+
+impl MarkerTone {
+    pub(crate) fn color(self, theme: &Theme) -> Color {
+        match self {
+            MarkerTone::Staged => theme.staged,
+            MarkerTone::Unstaged => theme.unstaged,
+            MarkerTone::Untracked => theme.untracked,
+            MarkerTone::Deleted => theme.del,
+        }
+    }
+
+    /// The tone for a committed/range file, keyed on its change kind. Shared by
+    /// the review file list and the history commit-detail summary.
+    pub(crate) fn for_change_kind(change: ChangeKind) -> Self {
+        match change {
+            ChangeKind::Added | ChangeKind::Copied => MarkerTone::Staged,
+            ChangeKind::Deleted => MarkerTone::Deleted,
+            _ => MarkerTone::Unstaged,
+        }
+    }
+
+    /// The tone for a working-tree entry, which reads from its *section* first: a
+    /// staged change is staged-coloured whatever kind of change it is.
+    pub(crate) fn for_status(section: Section, change: Change) -> Self {
+        match section {
+            Section::Staged => MarkerTone::Staged,
+            Section::Unstaged if change == Change::Untracked => MarkerTone::Untracked,
+            Section::Unstaged => MarkerTone::Unstaged,
+        }
     }
 }
 
 /// The spans for one changed-file row: a bold change marker, the display path,
-/// then `+a −d` line stats (or `(binary)`). Shared by the review file list and
-/// the history commit-detail per-file breakdown so the row stays identical.
-pub(crate) fn file_stat_spans(file: &CommitFile, theme: &Theme) -> Vec<Span<'static>> {
-    let color = change_color(file.change, theme);
+/// then `+a −d` line stats (or `(binary)`). The single source shared by the
+/// review file list, the history commit-detail per-file breakdown, and the diff
+/// pane's file-header row (plan 006 §3.1), so the three can't drift apart.
+pub(crate) fn stat_spans(
+    marker: char,
+    tone: MarkerTone,
+    display_path: String,
+    stat: CommitStat,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
     let mut spans = vec![
         Span::styled(
-            format!("  {} ", file.change.marker()),
-            Style::new().fg(color).add_modifier(Modifier::BOLD),
+            format!("  {marker} "),
+            Style::new()
+                .fg(tone.color(theme))
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(file.display_path(), Style::new().fg(theme.fg)),
+        Span::styled(display_path, Style::new().fg(theme.fg)),
     ];
-    if file.stat.binary {
+    if stat.binary {
         spans.push(Span::styled(
             "  (binary)".to_string(),
             Style::new().fg(theme.dim),
         ));
     } else {
         spans.push(Span::styled(
-            format!("  +{} ", file.stat.added),
+            format!("  +{} ", stat.added),
             Style::new().fg(theme.add),
         ));
         spans.push(Span::styled(
-            format!("−{}", file.stat.deleted),
+            format!("−{}", stat.deleted),
             Style::new().fg(theme.del),
         ));
     }
     spans
+}
+
+/// [`stat_spans`] for a committed/range file, the form the review and history
+/// file lists render.
+pub(crate) fn file_stat_spans(file: &CommitFile, theme: &Theme) -> Vec<Span<'static>> {
+    stat_spans(
+        file.change.marker(),
+        MarkerTone::for_change_kind(file.change),
+        file.display_path(),
+        file.stat,
+        theme,
+    )
 }
 
 /// A bordered panel with focus-aware border + title colours. Shared by the

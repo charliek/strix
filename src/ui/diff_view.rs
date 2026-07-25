@@ -9,14 +9,14 @@ use ratatui::Frame;
 use syntect::parsing::SyntaxReference;
 
 use crate::app::{
-    sbs_columns, App, BoxPart, BoxRow, EditorPart, LayoutRow, PairCell, PairEmphasis, RowContent,
-    Seg,
+    sbs_columns, App, BoxPart, BoxRow, EditorPart, FileHeaderRow, LayoutRow, PairCell,
+    PairEmphasis, RowContent, Seg,
 };
 use crate::comments::Side;
 use crate::git::{DiffLine, FileDiff, LineKind};
 use crate::ui::syntax::syntax_for;
 use crate::ui::theme::Theme;
-use crate::ui::{centered_hint, char_width, panel_block};
+use crate::ui::{centered_hint, char_width, fit_spans, panel_block, stat_spans, text_width};
 
 /// The minimum width of one line-number column (`nnnn`), so a ≤9999-line file
 /// renders the classic 4-digit gutter unchanged; wider files widen it per-diff.
@@ -203,6 +203,9 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
                 &mut x_rects,
             ),
             RowContent::Editor(part) => editor_row_line(row, part, theme, inner, left_w, right_w),
+            // Full-width in both modes, and unshifted: the header names the file,
+            // so `hskip` must not slide it out of the pane (plan 006 §3.1).
+            RowContent::FileHeader(header) => file_header_line(header, theme, inner.width as usize),
         };
         let in_cursor = cursor.as_ref().is_some_and(|span| span.contains(&i));
         out.push(mark_cursor_row(line, in_cursor, theme));
@@ -458,6 +461,24 @@ fn hunk_line(line: &DiffLine, theme: &Theme) -> Line<'static> {
         line.text.clone(),
         Style::new().fg(theme.hunk).add_modifier(Modifier::BOLD),
     ))
+}
+
+/// The file-header row (plan 006 §3.1): the review/history file-list spans over a
+/// band of the theme's header surface. The trailing pad is what makes the band
+/// run the full pane width; `stat_spans`/`fit_spans` never set a background, so
+/// the line-level style shows through every span.
+fn file_header_line(header: &FileHeaderRow, theme: &Theme, width: usize) -> Line<'static> {
+    let spans = stat_spans(
+        header.marker,
+        header.tone,
+        header.path.clone(),
+        header.stat,
+        theme,
+    );
+    let mut spans = fit_spans(spans, width);
+    let used: usize = spans.iter().map(|s| text_width(&s.content)).sum();
+    spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
+    Line::from(spans).style(Style::new().bg(theme.header_bg))
 }
 
 /// Render one physical row of a comment box (plan §3.4). Unified boxes span the
