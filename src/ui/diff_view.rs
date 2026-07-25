@@ -119,17 +119,25 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let layout = app.diff_layout(inner.width);
     app.set_diff_metrics(inner.height, layout.len());
 
-    // The diff lines backing the code rows; empty for a no-text diff (the layout
-    // then holds only orphan boxes).
+    // The viewport-sized slice of the stream: the anchor from the current offset,
+    // then each following file's prepared section (plan 006 §3.4). With cross-file
+    // scroll off — and in History — it is always the single anchor segment, drawn
+    // from exactly the offset this renderer always used.
+    let window = app.diff_window(inner.width, inner.height);
+    let crossing = window.segments.len() > 1;
+
+    // The diff lines backing the *anchor's* code rows; empty for a no-text diff
+    // (the layout then holds only orphan boxes).
     let lines: &[DiffLine] = match app.active_diff() {
         Some(FileDiff::Text(lines)) => lines,
         _ => &[],
     };
     let is_text = !lines.is_empty();
 
-    // No diff and no orphan boxes: the plain centered hint, as before. Clear any
-    // `[x]` rects a previous frame recorded so a stale click can't hit them.
-    if !is_text && layout.is_empty() {
+    // No diff, no orphan boxes, and nothing below to stream in: the plain centered
+    // hint, as before. Clear any `[x]` rects a previous frame recorded so a stale
+    // click can't hit them.
+    if !is_text && layout.is_empty() && window.rows() == 0 {
         app.set_x_rects(HashMap::new());
         centered_hint(
             frame,
@@ -140,82 +148,104 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let syntax = syntax_for(path.as_deref().unwrap_or(""));
     let (left_w, right_w) = sbs_columns(inner.width);
-    // Per-diff number-column width — matches what the layout builder wrapped at
-    // (both derive it from the same lines), so gutter and content never drift.
-    let number_width = line_number_width(lines);
-    let content_width =
-        unified_content_width(inner.width as usize, app.show_line_numbers, number_width);
     // Horizontal offset for code content only, clamped to the longest code line at
-    // read time and always 0 while wrap is on (plan §3.5).
+    // read time and always 0 while wrap is on (plan §3.5). The clamp stays
+    // anchor-based and the same `hskip` applies to strip rows: visual column
+    // continuity across a handoff beats a per-file clamp (plan 006 §3.4).
     let hskip = app.effective_hscroll();
-    let offset = app.diff_scroll.get().min(app.diff_max_scroll());
 
     let mut out: Vec<Line> = Vec::new();
     let mut x_rects: HashMap<u64, Rect> = HashMap::new();
-    for (i, row) in layout
-        .iter()
-        .enumerate()
-        .skip(offset)
-        .take(inner.height as usize)
-    {
-        let screen_y = inner.y + (i - offset) as u16;
-        let line = match &row.content {
-            RowContent::Line { line: li, seg } => unified_line(
-                app,
-                &lines[*li],
-                theme,
-                syntax,
-                content_width,
-                number_width,
-                *seg,
-                row.subrow == 0,
-                hskip,
+    // Strip comment boxes render, but record no close rects: `[x]` is anchor-only
+    // in v1 (plan 006 §3.4).
+    let mut strip_rects: HashMap<u64, Rect> = HashMap::new();
+    for segment in &window.segments {
+        // Each segment draws from its own file's rows and diff lines, with its own
+        // syntax, gutter width, and content width — the same values that file gets
+        // when it is the selected one, which is what makes the handoff pixel-stable.
+        let (rows, seg_lines): (&[LayoutRow], &[DiffLine]) = match &segment.section {
+            None => (&layout[segment.row_range.clone()], lines),
+            Some(section) => (
+                &section.rows[segment.row_range.clone()],
+                match &section.diff {
+                    FileDiff::Text(lines) => lines,
+                    FileDiff::Binary => &[],
+                },
             ),
-            RowContent::Hunk(h) => hunk_line(&lines[*h], theme),
-            RowContent::Pair {
-                left,
-                right,
-                emphasis,
-            } => sbs_pair_line(
-                app,
-                left.as_ref(),
-                right.as_ref(),
-                lines,
-                theme,
-                syntax,
-                left_w,
-                right_w,
-                number_width,
-                row.subrow == 0,
-                hskip,
-                emphasis.as_deref(),
-            ),
-            RowContent::Box(boxed) => box_row_line(
-                row,
-                boxed,
-                theme,
-                inner,
-                left_w,
-                right_w,
-                screen_y,
-                &mut x_rects,
-            ),
-            RowContent::Editor(part) => editor_row_line(row, part, theme, inner, left_w, right_w),
-            // Full-width in both modes, and unshifted: the header names the file,
-            // so `hskip` must not slide it out of the pane (plan 006 §3.1).
-            RowContent::FileHeader(header) => file_header_line(header, theme, inner.width as usize),
         };
-        let in_cursor = cursor.as_ref().is_some_and(|span| span.contains(&i));
-        out.push(mark_cursor_row(line, in_cursor, theme));
+        let is_anchor = segment.is_anchor();
+        let syntax = syntax_for(&segment.path);
+        let number_width = line_number_width(seg_lines);
+        let content_width =
+            unified_content_width(inner.width as usize, app.show_line_numbers, number_width);
+        let rects = if is_anchor {
+            &mut x_rects
+        } else {
+            &mut strip_rects
+        };
+        for (k, row) in rows.iter().enumerate() {
+            let screen_y = inner.y + out.len() as u16;
+            let line = match &row.content {
+                RowContent::Line { line: li, seg } => unified_line(
+                    app,
+                    &segment.path,
+                    &seg_lines[*li],
+                    theme,
+                    syntax,
+                    content_width,
+                    number_width,
+                    *seg,
+                    row.subrow == 0,
+                    hskip,
+                ),
+                RowContent::Hunk(h) => hunk_line(&seg_lines[*h], theme),
+                RowContent::Pair {
+                    left,
+                    right,
+                    emphasis,
+                } => sbs_pair_line(
+                    app,
+                    &segment.path,
+                    left.as_ref(),
+                    right.as_ref(),
+                    seg_lines,
+                    theme,
+                    syntax,
+                    left_w,
+                    right_w,
+                    number_width,
+                    row.subrow == 0,
+                    hskip,
+                    emphasis.as_deref(),
+                ),
+                RowContent::Box(boxed) => {
+                    box_row_line(row, boxed, theme, inner, left_w, right_w, screen_y, rects)
+                }
+                RowContent::Editor(part) => {
+                    editor_row_line(row, part, theme, inner, left_w, right_w)
+                }
+                // Full-width in both modes, and unshifted: the header names the
+                // file, so `hskip` must not slide it out of the pane (plan 006 §3.1).
+                RowContent::FileHeader(header) => {
+                    file_header_line(header, theme, inner.width as usize)
+                }
+            };
+            // The cursor addresses the anchor file only, so an outgoing file's
+            // highlight goes with it once its rows become strip rows (plan §3.2f).
+            let in_cursor = is_anchor
+                && cursor
+                    .as_ref()
+                    .is_some_and(|span| span.contains(&(segment.row_range.start + k)));
+            out.push(mark_cursor_row(line, in_cursor, theme));
+        }
     }
     app.set_x_rects(x_rects);
 
     // A no-text diff (binary / empty) still surfaces its orphan boxes; the hint
     // follows them when there's vertical room (finding 2), exactly as the old
-    // orphan block did.
-    if !is_text && out.len() < inner.height as usize {
+    // orphan block did — but only when nothing streams in below it.
+    if !is_text && !crossing && out.len() < inner.height as usize {
         out.push(Line::from(Span::styled(
             no_diff_message(app).to_string(),
             Style::new().fg(theme.dim),
@@ -259,6 +289,7 @@ fn mark_cursor_row(line: Line<'static>, is_cursor: bool, theme: &Theme) -> Line<
 #[allow(clippy::too_many_arguments)]
 fn unified_line(
     app: &App,
+    path: &str,
     line: &DiffLine,
     theme: &Theme,
     syntax: &SyntaxReference,
@@ -300,7 +331,7 @@ fn unified_line(
         }
         spans.push(Span::styled(" ".repeat(SIGN_WIDTH), gutter_style));
     }
-    let highlighted = app.highlight(syntax, &theme.syntax_theme, &sanitize(&line.text));
+    let highlighted = app.highlight_for(path, syntax, &theme.syntax_theme, &sanitize(&line.text));
     spans.extend(slice_spans(
         &highlighted,
         seg,
@@ -324,6 +355,7 @@ fn unified_line(
 #[allow(clippy::too_many_arguments)]
 fn sbs_pair_line(
     app: &App,
+    path: &str,
     left: Option<&PairCell>,
     right: Option<&PairCell>,
     lines: &[DiffLine],
@@ -340,6 +372,7 @@ fn sbs_pair_line(
     // them never moves (plan §3.5).
     let mut spans = cell(
         app,
+        path,
         left,
         lines,
         Col::Old,
@@ -354,6 +387,7 @@ fn sbs_pair_line(
     spans.push(Span::styled("│", Style::new().fg(theme.border)));
     spans.extend(cell(
         app,
+        path,
         right,
         lines,
         Col::New,
@@ -378,6 +412,7 @@ enum Col {
 #[allow(clippy::too_many_arguments)]
 fn cell(
     app: &App,
+    path: &str,
     cell: Option<&PairCell>,
     lines: &[DiffLine],
     side: Col,
@@ -439,7 +474,8 @@ fn cell(
             let emphasis = emph_ranges
                 .filter(|_| active)
                 .map(|ranges| (ranges, emph_bg));
-            let highlighted = app.highlight(syntax, &theme.syntax_theme, &sanitize(&line.text));
+            let highlighted =
+                app.highlight_for(path, syntax, &theme.syntax_theme, &sanitize(&line.text));
             spans.extend(slice_spans(
                 &highlighted,
                 seg,

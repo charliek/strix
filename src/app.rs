@@ -156,15 +156,6 @@ pub(crate) enum MenuCommand {
     ToggleChangesPanel,
 }
 
-/// Which end of the diff a wheel tick / cursor step is pressing against, for the
-/// cross-file scroll arming (plan §3.4). One tick at a boundary records the edge;
-/// a subsequent tick at the *same* edge crosses into the neighbouring file.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Edge {
-    Top,
-    Bottom,
-}
-
 /// Where a cross-file hop lands the arriving diff (plan §3.4): a downward hop
 /// shows the next file from its top; an upward hop shows the previous file from
 /// its bottom.
@@ -1045,11 +1036,6 @@ pub struct App {
     /// file's diff (Status + Review; History excluded). Off by default; from
     /// `Config.cross_file_scroll`, toggled with `f` (plan §3.4).
     pub cross_file_scroll: bool,
-    /// One-bit edge memory for the cross-file *wheel* arming: a wheel tick at a
-    /// boundary records the edge here; a subsequent tick at the same edge hops.
-    /// Cleared on any non-wheel event, selection change, or view change, so it
-    /// only ever spans consecutive wheel ticks over one diff (plan §3.4).
-    wheel_edge: Option<Edge>,
     /// A queued cross-file placement: the destination the hop targets plus which
     /// end (top/bottom) to land on. Consumed the next time the destination view's
     /// diff syncs — applied when the selection still matches, dropped otherwise
@@ -1284,7 +1270,6 @@ impl App {
             show_menu_bar: config.menu_bar(),
             wrap_lines: config.wrap_lines(),
             cross_file_scroll: config.cross_file_scroll(),
-            wheel_edge: None,
             pending_diff_placement: None,
             diff_hscroll: 0,
             diff_generation: Cell::new(0),
@@ -1431,9 +1416,6 @@ impl App {
         // A watcher-driven reload can shrink the menu's row list (a theme file
         // vanished); drop any open dropdown rather than risk a stale `item`.
         self.open_menu = None;
-        // A reload landing between two wheel ticks must not leave the arm set, or
-        // the next tick would hop instantly (FIX 2). A refresh is not a scroll.
-        self.wheel_edge = None;
         // Whatever the watcher saw may have rewritten any file in the stream.
         self.bump_stream_generation();
         self.refresh_active();
@@ -1454,10 +1436,6 @@ impl App {
         // the entry point rather than in the reveal/scroll helpers, which a single
         // click's own reveal also runs through.
         self.last_click = None;
-        // Any keyboard event is a non-wheel event, so it breaks the cross-file
-        // wheel arming (plan §3.4): the edge memory only ever spans consecutive
-        // wheel ticks over one diff.
-        self.wheel_edge = None;
 
         if self.modal.is_some() {
             self.on_key_modal(key);
@@ -1968,7 +1946,10 @@ impl App {
         };
         let (start, end) = (span.start, span.end);
         let count = self.review_row_count();
-        let top = self.diff_scroll.get();
+        // Read in the extended domain (plan 006 §3.2e): clamping to the anchor's
+        // own max would read a wheel-extended view as higher than it is and yank
+        // it. The write below stays anchor-domain (never above `max_top`).
+        let top = self.diff_scroll.get().min(self.diff_scroll_limit());
         let new_top = if start < top || end.saturating_sub(start) >= viewport {
             // Above the viewport, or taller than it: top-align the box's first row.
             start
@@ -1995,7 +1976,7 @@ impl App {
         if viewport == 0 {
             return false;
         }
-        let top = self.diff_scroll.get().min(self.diff_max_scroll());
+        let top = self.diff_scroll.get().min(self.diff_scroll_limit());
         cursor >= top && cursor < top + viewport
     }
 
@@ -2535,9 +2516,6 @@ impl App {
     /// directly (dump-frame/press tests can't emit a real paste). A no-op when the
     /// editor is closed, so a stray paste never leaks into the diff.
     pub fn on_paste(&mut self, text: &str) {
-        // A paste is a non-wheel event: it breaks the cross-file wheel arming
-        // (FIX 3), even on the early return when no editor is open.
-        self.wheel_edge = None;
         if !self.editing() {
             return;
         }
@@ -3071,11 +3049,48 @@ impl App {
     /// click queued at the same coordinates could be dispatched *before* that
     /// redraw and match the pre-resize target — so clear the tracker eagerly here.
     /// Called from the event loop's resize arm.
-    pub fn on_resize(&mut self) {
+    pub fn on_resize(&mut self, cols: u16, rows: u16) {
         self.last_click = None;
-        // A resize relays out the diff (its metrics change), so it breaks the
-        // cross-file wheel arming just like any other non-wheel event (FIX 3).
-        self.wheel_edge = None;
+        // A resize changes the window's geometry: prepare the sections the new
+        // viewport needs, on the event path (plan 006 §3.3). The recorded pane
+        // rect is still the *pre-resize* one and its width keys both the layout
+        // and the section cache, so preparing against it would tag every section
+        // for a geometry the next frame no longer draws — a short window until
+        // some later event happens to re-prepare. Derive the new pane instead.
+        let (width, height) = self.diff_geometry_for(cols, rows);
+        self.ensure_diff_window(width, height);
+    }
+
+    /// The diff pane's geometry for a terminal `cols` × `rows`, derived the way
+    /// [`crate::ui::draw`] lays the Status and Review bodies out: the file list
+    /// takes [`App::changes_pane_width`] off the left when shown, and the pane's
+    /// block borders take a column on each side — so the width returned is exactly
+    /// what the renderer passes to [`App::diff_layout`], which is what makes the
+    /// sections prepared here match the key the next frame reads them under.
+    ///
+    /// The height is only a fill target, so the whole terminal height stands in
+    /// for the pane's: overshooting prepares at most a section the frame won't
+    /// draw, while undershooting would leave the shortfall this is here to
+    /// prevent. History needs no derivation — it has no strip, so
+    /// [`App::ensure_diff_window`] is a no-op there.
+    fn diff_geometry_for(&self, cols: u16, rows: u16) -> (u16, u16) {
+        let list = if self.show_changes {
+            self.changes_pane_width(cols)
+        } else {
+            0
+        };
+        (cols.saturating_sub(list).saturating_sub(2), rows)
+    }
+
+    /// Re-prepare the window for the pane's recorded geometry. The seam every
+    /// change to the layout key ends with: sections are tagged with the key they
+    /// were built for, so a wrap / line-number / diff-mode / cross-file toggle
+    /// invalidates all of them at once, and the render path never computes. The
+    /// toggles hold that invariant themselves rather than leaning on the trailing
+    /// `sync_active` of whichever path dispatched them.
+    fn reprepare_diff_window(&mut self) {
+        let area = self.diff_area.get();
+        self.ensure_diff_window(area.width, area.height);
     }
 
     /// Handle a mouse event at logical time `now` (the injectable double-click
@@ -3090,13 +3105,6 @@ impl App {
             x: event.column,
             y: event.row,
         };
-
-        // Take the cross-file wheel arm up front: every mouse event but a
-        // consecutive wheel tick over the diff clears it (FIX 3). Only the
-        // wheel-over-diff path threads the taken value back into the arming helper,
-        // which re-records it as needed; every other kind drops it → cleared. A
-        // `Moved` event returns below without re-arming, so hover clears it too.
-        let prev_edge = self.wheel_edge.take();
 
         // Free movement (no button held) only updates the hover affordance: it
         // must not clear the error toast, recompute the diff, or touch the
@@ -3134,17 +3142,15 @@ impl App {
             // a click before and after a scroll must not read as a double (plan §3.6).
             MouseEventKind::ScrollDown => {
                 self.last_click = None;
-                self.on_scroll(pos, true, prev_edge);
+                self.on_scroll(pos, true);
             }
             MouseEventKind::ScrollUp => {
                 self.last_click = None;
-                self.on_scroll(pos, false, prev_edge);
+                self.on_scroll(pos, false);
             }
             // Trackpad horizontal scroll shifts code content only, view-agnostic
             // (Status / Review / History), and — like vertical — clears the
-            // double-click tracker. `wheel_edge` was already dropped by the
-            // take-and-clear above, so a horizontal tick also disarms any pending
-            // cross-file hop (plan §3.5). No re-arm, so nothing to thread.
+            // double-click tracker.
             MouseEventKind::ScrollRight => {
                 self.last_click = None;
                 self.horizontal_scroll(pos, true);
@@ -3350,8 +3356,7 @@ impl App {
         // time metric — keeps the layout, offset, and lookup one consistent
         // snapshot, so the click resolves against the rows the next frame paints.
         let rows = self.diff_layout(self.diff_pane_width()).len();
-        let max = rows.saturating_sub(diff.height as usize);
-        let offset = self.diff_scroll.get().min(max);
+        let offset = self.paint_offset(rows, diff.height as usize);
         Some(offset + (pos.y - diff.y) as usize)
     }
 
@@ -3581,17 +3586,13 @@ impl App {
                     review.pane.cursor = None; // a new file starts at its first row
                 }
             }
-        } else if self.diff_area.get().contains(pos) {
+        } else if let Some(row) = self.diff_row_at(pos) {
             // Focus the diff and move the cursor to the clicked row. A click below
             // the last row just focuses (no cursor move); wheel scroll never moves
-            // the cursor (that path is `review_scroll`).
+            // the cursor (that path is `review_scroll`). `diff_row_at` resolves it
+            // against the offset the renderer paints with, so a strip row maps past
+            // the anchor's last row and hits nothing — inert until C5 (§3.6).
             self.set_review_focus(ReviewFocus::Diff);
-            let diff = self.diff_area.get();
-            // Hit-test against the same clamped offset the renderer paints with
-            // (diff_view.rs clamps to diff_max_scroll); a raw diff_scroll would
-            // desync clicks after content shrank at max scroll (finding 5).
-            let offset = self.diff_scroll.get().min(self.diff_max_scroll());
-            let row = offset + (pos.y - diff.y) as usize;
             let count = self.review_row_count();
             if row < count {
                 let target = self.review_target_at(row);
@@ -3649,15 +3650,13 @@ impl App {
         self.committed_height = self.committed_pane_height(left.height);
     }
 
-    fn on_scroll(&mut self, pos: Position, down: bool, prev_edge: Option<Edge>) {
-        // `wheel_edge` was already taken (cleared) by `on_mouse_at`; only the
-        // wheel-over-diff path below re-arms it, threading `prev_edge` (FIX 3).
+    fn on_scroll(&mut self, pos: Position, down: bool) {
         // Wheel scroll while editing is allowed but only moves the diff (the editor
         // stays anchored); a scroll over the file list is ignored so the file can't
         // change mid-edit (plan §3.5).
         if self.editing() {
             if self.diff_area.get().contains(pos) {
-                // Scrolling while editing never hops (plan §3.4).
+                // Scrolling while editing never crosses (plan §3.4).
                 self.scroll_diff(down, SCROLL_STEP);
             }
             return;
@@ -3668,13 +3667,13 @@ impl App {
                 return;
             }
             ViewMode::Review => {
-                self.review_scroll(pos, down, prev_edge);
+                self.review_scroll(pos, down);
                 return;
             }
             ViewMode::Status => {}
         }
         match self.pane_at(pos) {
-            Some(Focus::Diff) => self.wheel_scroll_diff(down, prev_edge),
+            Some(Focus::Diff) => self.wheel_scroll_diff(down),
             Some(Focus::Staging) if down => self.select_next(),
             Some(Focus::Staging) => self.select_prev(),
             None => {}
@@ -3683,44 +3682,27 @@ impl App {
 
     /// Route a wheel event in the review view: over the list it moves the
     /// selection, over the diff it scrolls the diff.
-    fn review_scroll(&mut self, pos: Position, down: bool, prev_edge: Option<Edge>) {
+    fn review_scroll(&mut self, pos: Position, down: bool) {
         let list = self.review_list_area();
         if list.contains(pos) {
             self.set_review_focus(ReviewFocus::List);
             self.review_move(down);
         } else if self.diff_area.get().contains(pos) {
-            self.wheel_scroll_diff(down, prev_edge);
+            self.wheel_scroll_diff(down);
         }
     }
 
     /// A wheel tick over the diff pane in a cursor-bearing view (Status or Review;
-    /// History routes to `scroll_diff` directly and never hops). With cross-file
-    /// scroll off this is a plain clamp. With it on, the arming model (plan §3.4):
-    /// a tick at the pressed edge with the edge already recorded crosses into the
-    /// neighbouring file; a first tick at the edge only records it (and otherwise
-    /// clamps as today); a tick that isn't at the edge clears the arming and
-    /// scrolls normally.
-    fn wheel_scroll_diff(&mut self, down: bool, prev_edge: Option<Edge>) {
-        // `wheel_edge` is already cleared (taken in `on_mouse_at`); `prev_edge` is
-        // the value the previous tick recorded. This path re-records it only when
-        // arming, so any intervening non-wheel event leaves it cleared (FIX 3).
+    /// History routes to `scroll_diff` directly and never crosses). With cross-file
+    /// scroll off this is the plain per-file clamp it always was; with it on the
+    /// tick is a signed delta in the extended stream domain (plan 006 §3.2a).
+    fn wheel_scroll_diff(&mut self, down: bool) {
         if !self.cross_file_scroll {
             self.scroll_diff(down, SCROLL_STEP);
             return;
         }
-        let tick_edge = if down { Edge::Bottom } else { Edge::Top };
-        if self.at_hard_edge(down) {
-            if prev_edge == Some(tick_edge) {
-                // Armed at this edge already → cross into the neighbour.
-                self.cross_file_hop(down);
-            } else {
-                // First tick at the edge: record it; the tick otherwise clamps.
-                self.wheel_edge = Some(tick_edge);
-                self.scroll_diff(down, SCROLL_STEP);
-            }
-        } else {
-            self.scroll_diff(down, SCROLL_STEP);
-        }
+        let step = i64::from(SCROLL_STEP);
+        self.wheel_scroll_window(if down { step } else { -step });
     }
 
     /// Whether the diff viewport is pinned against its hard edge in the scroll
@@ -3742,7 +3724,9 @@ impl App {
     /// (down) or retreat it (up) and queue a placement so the arriving diff lands
     /// at its top (down) or bottom (up). At the first/last file it clamps — no
     /// wraparound, no placement. History is excluded (never a caller). No-op while
-    /// editing (a defensive guard; the wheel/keyboard callers are already exempt).
+    /// editing (a defensive guard; the keyboard callers are already exempt). Only
+    /// the keyboard reaches this since C3 — the wheel streams continuously
+    /// (`wheel_scroll_window`), and C4 retires the hop with the keyboard landings.
     fn cross_file_hop(&mut self, down: bool) {
         if self.editing() {
             return;
@@ -4074,8 +4058,8 @@ impl App {
         // Refresh the scroll metrics from the destination's freshly-built layout so
         // a queued wheel tick drained in the same batch — the event loop drains all
         // input before it redraws — sees the destination's real bounds, not the
-        // source file's stale metrics (FIX 1). Otherwise a fling could double-hop
-        // through a tall destination, or fail to arm on a short one.
+        // source file's stale metrics (FIX 1). Otherwise a keyboard fling could
+        // double-hop through a tall destination.
         let width = self.diff_pane_width();
         let count = self.diff_layout(width).len();
         self.set_diff_metrics(self.diff_viewport.get(), count);
@@ -4099,6 +4083,12 @@ impl App {
             ViewMode::History => self.sync_history_diff(),
             ViewMode::Review => self.sync_review_diff(),
         }
+        // Keep the visible window prepared: a selection change or a refresh can
+        // leave a short anchor with an unfilled strip, and the render path may
+        // never compute (plan 006 §3.3). A no-op with cross-file scroll off, in
+        // History, or before the first frame (the pane has no geometry yet).
+        let area = self.diff_area.get();
+        self.ensure_diff_window(area.width, area.height);
     }
 
     /// Re-read the active view's data: status re-reads the working tree; history
@@ -4824,7 +4814,11 @@ impl App {
     /// scrolling on, and a stream the anchor sits in (History has none). The single
     /// gate both the event-path fill and the read-only assembly ask.
     fn strip_anchor(&self) -> Option<usize> {
-        if !self.cross_file_scroll {
+        // Crossing and strips are both off while the in-place editor is open
+        // (plan 006 §3.3): the anchor's layout carries the editor box, no section
+        // ever does, and every clamp falls back to the anchor domain for the
+        // duration — which is exactly what the editing wheel path expects.
+        if !self.cross_file_scroll || self.editing() {
             return None;
         }
         self.stream_position()
@@ -4894,15 +4888,140 @@ impl App {
         list.iter().find(|entry| entry.path == path)
     }
 
-    /// The anchor's contribution to a window `viewport` rows deep: the half-open
-    /// span of its *own* layout rows drawn from the current scroll offset, clamped
-    /// to the rows it actually has. The one place the anchor's share of the window
-    /// is decided, so the event-path fill and the render-path assembly can't
-    /// disagree about where the strip starts.
-    fn anchor_span(&self, width: u16, viewport: usize) -> Range<usize> {
+    /// The anchor's contribution to a window `viewport` rows deep, drawn from
+    /// scroll offset `offset`: the half-open span of its *own* layout rows,
+    /// clamped to the rows it actually has. The one place the anchor's share of
+    /// the window is decided, so the event-path fill and the render-path assembly
+    /// can't disagree about where the strip starts.
+    fn anchor_span(&self, width: u16, viewport: usize, offset: usize) -> Range<usize> {
         let rows = self.diff_layout(width).len();
-        let offset = self.diff_scroll.get().min(rows);
+        let offset = offset.min(rows);
         offset..offset + (rows - offset).min(viewport)
+    }
+
+    /// The stored offset read as a stream position. An offset *past* the anchor's
+    /// last row is never a legal extended position — renormalization keeps
+    /// `o <= R_anchor` (plan 006 §3.2a) — so it can only be a stale park: the
+    /// keyboard bottom-placement sentinel, or an offset a shrunken relayout left
+    /// behind. Both read as the anchor-domain bottom, exactly as they did before
+    /// the domain was extended.
+    fn stream_offset(&self, rows: usize, viewport: usize) -> usize {
+        let stored = self.diff_scroll.get();
+        if stored > rows {
+            rows.saturating_sub(viewport)
+        } else {
+            stored
+        }
+    }
+
+    /// The offset a frame (or a click hit-test against that frame) reads from:
+    /// the stored offset normalized, then held to what the prepared stream can
+    /// actually fill. Rows below the anchor's own last row belong to the strip —
+    /// C3 leaves them click-inert, since every consumer resolves them against the
+    /// anchor layout and finds nothing there (plan 006 §3.2e/§3.6).
+    fn paint_offset(&self, rows: usize, viewport: usize) -> usize {
+        self.stream_offset(rows, viewport)
+            .min(self.stream_scroll_limit(rows, viewport))
+    }
+
+    /// The largest offset the extended domain allows (plan 006 §3.2a+b): the
+    /// anchor's rows plus every **prepared** following section, less the viewport,
+    /// so the viewport bottom can never pass the last row the stream offers. Walks
+    /// prepared sections only — it never computes, which is what keeps it callable
+    /// from the render path; `wheel_scroll_window` ensures first, then clamps
+    /// against the filled window. With cross-file scroll off (or in History) the
+    /// strip is empty and this *is* the anchor-content clamp.
+    ///
+    /// The walk stops once the result exceeds the anchor's own row count: no legal
+    /// offset can reach past that (renormalization keeps `o <= R_anchor`), so
+    /// every clamp site gets the same answer for a bounded amount of work.
+    fn stream_scroll_limit(&self, anchor_rows: usize, viewport: usize) -> usize {
+        let mut total = anchor_rows;
+        if let Some(anchor) = self.strip_anchor() {
+            let key = self.layout_key(self.diff_pane_width());
+            let generation = self.stream_generation.get();
+            let mut index = anchor + 1;
+            while index < self.stream_len() && total < viewport.saturating_add(anchor_rows) {
+                let Some((_, section)) = self.prepared_section(index, key, generation) else {
+                    break;
+                };
+                total += section.rows.len();
+                index += 1;
+            }
+        }
+        total.saturating_sub(viewport)
+    }
+
+    /// [`App::stream_scroll_limit`] at the last render's metrics — the `limit` of
+    /// the reader audit (plan 006 §3.2e), and the extended-domain counterpart of
+    /// [`App::diff_max_scroll`].
+    pub fn diff_scroll_limit(&self) -> usize {
+        self.stream_scroll_limit(
+            self.diff_content_rows.get(),
+            self.diff_viewport.get() as usize,
+        )
+    }
+
+    /// The section stream file `index` *already* has prepared, with its identity.
+    /// The read-only counterpart of [`App::prepare_section`]: a miss is reported,
+    /// never filled, which is what keeps every render-path reader (the window
+    /// assembly, the scroll limit) free of repo reads.
+    fn prepared_section(
+        &self,
+        index: usize,
+        key: LayoutKey,
+        generation: u64,
+    ) -> Option<(FileId, Rc<FileSection>)> {
+        let id = self.stream_file_id(index)?;
+        let section = self.sections.borrow_mut().get(&id, key, generation)?;
+        Some((id, section))
+    }
+
+    /// The live section for stream file `index`, computing (and caching) it on a
+    /// miss. The event path's single compute seam — every laziness trigger goes
+    /// through here, so `diff_compute_count` counts exactly the files the stream
+    /// legitimately needed.
+    fn prepare_section(&mut self, index: usize, width: u16) -> Option<Rc<FileSection>> {
+        let id = self.stream_file_id(index)?;
+        let key = self.layout_key(width);
+        let generation = self.stream_generation.get();
+        if let Some(section) = self.sections.borrow_mut().get(&id, key, generation) {
+            return Some(section);
+        }
+        let section = Rc::new(self.compute_section(&id, width)?);
+        self.sections
+            .borrow_mut()
+            .insert(id, key, generation, Rc::clone(&section));
+        Some(section)
+    }
+
+    /// How many physical rows stream file `index` has. The anchor's rows are the
+    /// live layout (never the cache — it is the one file whose layout can carry the
+    /// in-place editor); every other file's come from its section.
+    fn stream_rows(&mut self, index: usize, width: u16) -> usize {
+        if Some(index) == self.stream_position() {
+            return self.diff_layout(width).len();
+        }
+        self.prepare_section(index, width)
+            .map_or(0, |section| section.rows.len())
+    }
+
+    /// How many rows a window anchored at `(index, offset)` can actually draw,
+    /// capped at `viewport`, preparing the following sections it needs on the way
+    /// (laziness trigger (a)). A result below `viewport` is the end-of-stream
+    /// shortfall the clamp backs off by (plan 006 §3.2b).
+    fn window_rows(&mut self, index: usize, offset: usize, width: u16, viewport: usize) -> usize {
+        let rows = self.stream_rows(index, width);
+        let mut filled = rows.saturating_sub(offset).min(viewport);
+        let mut next = index + 1;
+        while filled < viewport && next < self.stream_len() {
+            let Some(section) = self.prepare_section(next, width) else {
+                break;
+            };
+            filled = (filled + section.rows.len()).min(viewport);
+            next += 1;
+        }
+        filled
     }
 
     /// Prepare the sections the window at the **current** scroll offset needs, on
@@ -4923,37 +5042,22 @@ impl App {
         let Some(anchor) = self.strip_anchor() else {
             return;
         };
-        let key = self.layout_key(width);
-        let generation = self.stream_generation.get();
         let viewport = height as usize;
-        let mut filled = self.anchor_span(width, viewport).len();
-        let mut pinned: Vec<FileId> = self.active_file_id().into_iter().collect();
+        let rows = self.diff_layout(width).len();
+        let offset = self.stream_offset(rows, viewport);
+        let mut filled = self.anchor_span(width, viewport, offset).len();
         let mut index = anchor + 1;
         while filled < viewport && index < self.stream_len() {
-            let Some(id) = self.stream_file_id(index) else {
+            let Some(section) = self.prepare_section(index, width) else {
                 break;
             };
-            let cached = self.sections.borrow_mut().get(&id, key, generation);
-            let section = match cached {
-                Some(section) => section,
-                None => {
-                    let Some(section) = self.compute_section(&id, width) else {
-                        break;
-                    };
-                    let section = Rc::new(section);
-                    self.sections.borrow_mut().insert(
-                        id.clone(),
-                        key,
-                        generation,
-                        Rc::clone(&section),
-                    );
-                    section
-                }
-            };
             filled += section.rows.len();
-            pinned.push(id);
             index += 1;
         }
+        // Everything the window touches — the anchor plus the strip just walked.
+        let pinned: Vec<FileId> = (anchor..index)
+            .filter_map(|file| self.stream_file_id(file))
+            .collect();
         self.sections.borrow_mut().evict(&pinned);
         self.prune_highlight_cache();
     }
@@ -4966,7 +5070,11 @@ impl App {
     /// segment (it is never crossed).
     pub fn diff_window(&self, width: u16, height: u16) -> DiffWindow {
         let viewport = height as usize;
-        let row_range = self.anchor_span(width, viewport);
+        let rows = self.diff_layout(width).len();
+        // The render-time clamp of the reader audit (plan 006 §3.2e): the stored
+        // offset, normalized, then held to what the *prepared* stream can fill.
+        let offset = self.paint_offset(rows, viewport);
+        let row_range = self.anchor_span(width, viewport, offset);
         let mut filled = row_range.len();
         // The anchor segment is always present, even when it contributes no rows
         // (`o == R`, the position pixel-identical to the next file's own row 0):
@@ -4982,10 +5090,7 @@ impl App {
             let generation = self.stream_generation.get();
             let mut index = anchor + 1;
             while filled < viewport && index < self.stream_len() {
-                let Some(id) = self.stream_file_id(index) else {
-                    break;
-                };
-                let Some(section) = self.sections.borrow_mut().get(&id, key, generation) else {
+                let Some((id, section)) = self.prepared_section(index, key, generation) else {
                     break;
                 };
                 let take = section.rows.len().min(viewport - filled);
@@ -5000,6 +5105,176 @@ impl App {
             }
         }
         DiffWindow { segments }
+    }
+
+    /// A wheel tick in the extended stream domain (plan 006 §3.2a–b) — the wheel
+    /// entry whenever cross-file scroll is on and the pane isn't editing. `delta`
+    /// is a signed physical-row count.
+    ///
+    /// Three steps, in order: **renormalize** the offset across file boundaries
+    /// (`(B, o) ≡ (A, R_A + o)`), **fill** the window from where that landed, and
+    /// **clamp** by any shortfall so the viewport bottom never passes the last row
+    /// the stream offers. All arithmetic is `i64`: an up-tick legitimately goes
+    /// negative before renormalization moves the anchor, and a `usize` would wrap.
+    ///
+    /// `pub` for the same reason as [`App::diff_window`]: the renormalizer's
+    /// property test drives exact deltas, which a synthetic wheel event (fixed at
+    /// [`SCROLL_STEP`] rows) cannot express.
+    pub fn wheel_scroll_window(&mut self, delta: i64) {
+        let Some(anchor) = self.strip_anchor() else {
+            self.scroll_diff(delta >= 0, SCROLL_STEP);
+            return;
+        };
+        let width = self.diff_pane_width();
+        let height = self.diff_viewport.get();
+        let viewport = height as usize;
+        if viewport == 0 {
+            return;
+        }
+        let mut index = anchor;
+        // Build the layout before reading the offset: a relayout queued earlier in
+        // this batch re-anchors `diff_scroll`, and the tick must move from the
+        // settled value. Starting from `paint_offset` — what the last frame drew —
+        // is what makes a tick continuous with the picture on screen, and it
+        // normalizes the keyboard bottom-placement sentinel out of the arithmetic.
+        let anchor_rows = self.diff_layout(width).len();
+        let mut offset = self.paint_offset(anchor_rows, viewport) as i64 + delta;
+
+        // Renormalize. Each step moves the anchor one file and rebases the offset
+        // on that file's row count, so the *rendered* top row never moves — the
+        // identity is exact. Down-renormalization stops at the last file (an offset
+        // past its end is what the clamp below eats); up-renormalization triggers
+        // only at `o < 0`, which is what makes `(B, 0)` a legal resting state and
+        // the boundary hysteresis directional (plan 006 §3.2c).
+        loop {
+            let rows = self.stream_rows(index, width) as i64;
+            if offset > rows && index + 1 < self.stream_len() {
+                offset -= rows;
+                index += 1;
+                continue;
+            }
+            if offset < 0 && index > 0 {
+                index -= 1;
+                offset += self.stream_rows(index, width) as i64;
+                continue;
+            }
+            break;
+        }
+
+        // End-of-stream clamp, discovered by filling: back the offset off by
+        // however many rows the window came up short, walking back into previous
+        // files when one file's own rows can't absorb it. Each pass strictly
+        // lowers the top position and the stream floors at `(first file, 0)`, so
+        // this terminates.
+        loop {
+            if offset < 0 {
+                if index == 0 {
+                    offset = 0;
+                    break;
+                }
+                index -= 1;
+                offset += self.stream_rows(index, width) as i64;
+                continue;
+            }
+            let filled = self.window_rows(index, offset as usize, width, viewport);
+            let short = viewport - filled;
+            if short == 0 {
+                break;
+            }
+            if index == 0 && offset == 0 {
+                // The whole stream is shorter than the viewport: floor at 0.
+                break;
+            }
+            offset -= short as i64;
+        }
+
+        let offset = offset.max(0) as usize;
+        if index == anchor {
+            self.diff_scroll.set(offset);
+        } else {
+            self.flip_anchor(index, offset);
+        }
+        self.ensure_diff_window(width, height);
+    }
+
+    /// Make stream file `to` the anchor at `new_offset`, seeded from its prepared
+    /// section — no recompute, no scroll reset, no placement token (plan 006
+    /// §3.2d). `sync_diff`/`sync_review_diff` early-return afterwards because the
+    /// diff key (and, for Status, the section) already match and nothing is dirty.
+    /// A wheel flip carries no cursor; the border title follows the selection, so
+    /// the one-row-past-the-top handoff falls out of *when* this is called.
+    ///
+    /// A no-op if `to` has no prepared section: callers ensure first.
+    fn flip_anchor(&mut self, to: usize, new_offset: usize) {
+        let width = self.diff_pane_width();
+        let key = self.layout_key(width);
+        let generation = self.stream_generation.get();
+        let Some((id, section)) = self.prepared_section(to, key, generation) else {
+            return;
+        };
+        // Retire the file being left into the cache *before* the selection moves,
+        // so scrolling back across the boundary re-reads it instead of recomputing
+        // its diff (the oscillation case of the laziness contract).
+        self.retire_anchor_section(key, generation);
+        match &id {
+            FileId::Status { section: sec, path } => {
+                self.selected = to;
+                self.current_diff = Some(section.diff.clone());
+                self.diff_key = Some(path.clone());
+                self.diff_section = Some(*sec);
+                // A pending dirty flag is satisfied by the section: every status
+                // snapshot replacement bumps `stream_generation`, so a section old
+                // enough to predate the flag could not have been handed out here.
+                self.diff_dirty = false;
+                self.set_review_cursor(None);
+            }
+            FileId::Review { path } => {
+                self.select_review_file(to);
+                let diff_key = self
+                    .review
+                    .as_ref()
+                    .map(|review| (review.spec.base, review.spec.head, path.clone()));
+                if let (Some(review), Some(diff_key)) = (self.review.as_mut(), diff_key) {
+                    review.diff = Some(section.diff.clone());
+                    review.diff_key = Some(diff_key);
+                }
+            }
+        }
+        // The arriving file's rows *are* its section's (C2 builds both through one
+        // seam), so the layout is installed rather than rebuilt. The generation
+        // bump keeps a double-click straddling the flip inert.
+        *self.layout.borrow_mut() = Some(CachedLayout {
+            key,
+            rows: section.rows.clone(),
+        });
+        self.layout_generation.set(self.layout_generation.get() + 1);
+        // The h-scroll offset is kept; its read-time clamp must now measure the
+        // *new* file's longest line.
+        self.bump_diff_generation();
+        self.diff_scroll.set(new_offset);
+        // Drained-batch rule (mirroring `place_diff`): a tick queued behind this
+        // one, drained before any redraw, must clamp against the new file's bounds.
+        self.set_diff_metrics(self.diff_viewport.get(), section.rows.len());
+        self.prune_highlight_cache();
+    }
+
+    /// Store the current anchor's diff + built rows as its stream section, so the
+    /// file a flip leaves behind stays warm. Skipped when its layout was built for
+    /// a different key (it would be discarded on the next read anyway).
+    fn retire_anchor_section(&mut self, key: LayoutKey, generation: u64) {
+        let Some(id) = self.active_file_id() else {
+            return;
+        };
+        let Some(diff) = self.active_diff().cloned() else {
+            return;
+        };
+        let rows = match self.layout.borrow().as_ref() {
+            Some(cached) if cached.key == key => cached.rows.clone(),
+            _ => return,
+        };
+        self.sections
+            .borrow_mut()
+            .insert(id, key, generation, Rc::new(FileSection { diff, rows }));
     }
 
     /// The unified physical layout: an orphan block at the top, then each diff
@@ -5737,6 +6012,7 @@ impl App {
         // different physical row), so the cursor doesn't carry over — reset to
         // the top (plan §3.4).
         self.set_review_cursor(None);
+        self.reprepare_diff_window();
     }
 
     /// Flip the line-number gutter on/off. The gutter width feeds the content
@@ -5747,6 +6023,7 @@ impl App {
     /// render time, so it never needs invalidating.
     fn toggle_line_numbers(&mut self) {
         self.show_line_numbers = !self.show_line_numbers;
+        self.reprepare_diff_window();
     }
 
     /// Flip hard line wrapping on/off. Wrap is a physical-layout input, so the
@@ -5761,6 +6038,7 @@ impl App {
         if self.wrap_lines {
             self.diff_hscroll = 0;
         }
+        self.reprepare_diff_window();
     }
 
     /// Flip cross-file scroll on/off — the single seam both the `f` key and the
@@ -5774,13 +6052,24 @@ impl App {
     ///   drained-batch rule `place_diff` follows).
     fn set_cross_file_scroll(&mut self, on: bool) {
         self.cross_file_scroll = on;
-        self.wheel_edge = None;
         if !on && self.active_pane().and_then(|pane| pane.cursor) == Some(RowTarget::FileHeader) {
             self.set_review_cursor(None);
         }
         let width = self.diff_pane_width();
         let count = self.diff_layout(width).len();
         self.set_diff_metrics(self.diff_viewport.get(), count);
+        if !on {
+            // Turning the mode off retires the extended domain. The frame paints
+            // the anchor's own bottom from here on, so *store* that: an extended
+            // offset left behind would be resurrected — jumping back to a boundary
+            // the user last saw before the toggle — the moment the mode is turned
+            // on again (plan 006 §3.2e, the `max` clamp).
+            let max = self.diff_max_scroll();
+            if self.diff_scroll.get() > max {
+                self.diff_scroll.set(max);
+            }
+        }
+        self.reprepare_diff_window();
     }
 
     /// Advance to the next theme in `Theme::available` (presets then user themes),

@@ -335,17 +335,19 @@ fn sections_the_window_no_longer_needs_are_lru_evicted() {
     window(&mut app);
     assert_eq!(app.cached_section_count(), 32, "trimmed to the LRU budget");
 
-    // Back to the top: the survivors are the 32 most recently used, so exactly
-    // the 7 evicted files are recomputed.
+    // Back to the top: since C3 every selection change re-fills the window on the
+    // event path (`sync_active`), so the evicted tail is recomputed during the
+    // walk itself — by the time the window is assembled it needs nothing more,
+    // and every file the viewport shows is pinned again.
     for _ in 0..39 {
         press(&mut app, 'k');
     }
     let computed = app.diff_compute_count();
     window(&mut app);
     assert_eq!(
-        app.diff_compute_count() - computed,
-        7,
-        "only the evicted tail recomputes"
+        app.diff_compute_count(),
+        computed,
+        "the walk back already prepared everything the window needs"
     );
     assert_eq!(app.cached_section_count(), 39);
 }
