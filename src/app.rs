@@ -341,6 +341,11 @@ pub struct PairCell {
 /// What a physical [`LayoutRow`] draws. Code rows carry diff-line indices (a
 /// unified line, a side-by-side hunk header, or a side-by-side pair); a comment
 /// box expands to several `Box` rows sharing one [`RowTarget`].
+///
+/// `Clone` so a prepared section's rows can be handed to a window segment (and,
+/// in a later commit, installed into the active layout) without rebuilding them
+/// — the heavy payload (`emphasis`) is already behind an `Rc` (plan 006 §3.3).
+#[derive(Clone)]
 pub enum RowContent {
     /// One display row of a unified diff line: the line index into the file's
     /// `Vec<DiffLine>` plus the char window this row renders. With wrap off the
@@ -381,6 +386,7 @@ pub enum RowContent {
 /// draws, resolved once when the layout is built (plan 006 §3.1) so no frame
 /// re-derives it. The marker's colour is named ([`MarkerTone`]) rather than
 /// resolved, because a theme cycle does not rebuild the layout.
+#[derive(Clone)]
 pub struct FileHeaderRow {
     pub marker: char,
     pub tone: MarkerTone,
@@ -391,6 +397,7 @@ pub struct FileHeaderRow {
 
 /// Which physical part of the in-place editor box a row draws. The editor mirrors
 /// a saved comment box (title / body / bottom) but is editable and caret-bearing.
+#[derive(Clone)]
 pub enum EditorPart {
     /// The top border, carrying the editor title (`✎ you — <file> R<line>`).
     Title(String),
@@ -405,6 +412,7 @@ pub enum EditorPart {
 /// the `[x]` rect), whether the note has drifted (`stale` → a dim accent), and
 /// which part of the box this row draws. The `● you`/`⚠ orphan` marker lives in
 /// the pre-formatted title text, so it isn't repeated here.
+#[derive(Clone)]
 pub struct BoxRow {
     pub id: u64,
     pub stale: bool,
@@ -412,6 +420,7 @@ pub struct BoxRow {
 }
 
 /// Which physical part of a comment box a row draws.
+#[derive(Clone)]
 pub enum BoxPart {
     /// The top border, carrying the title text (`● you — <file> R<line>`); the
     /// renderer truncates it to the box width and appends the right-aligned `[x]`.
@@ -429,6 +438,7 @@ pub enum BoxPart {
 /// `LayoutRow`; a comment box is N rows sharing one `target`. The layout is
 /// cached width-keyed (see [`App::diff_layout`]), so a resize rebuilds it while
 /// preserving the logical targets.
+#[derive(Clone)]
 pub struct LayoutRow {
     pub target: RowTarget,
     pub subrow: usize,
@@ -457,6 +467,175 @@ struct LayoutKey {
 struct CachedLayout {
     key: LayoutKey,
     rows: Vec<LayoutRow>,
+}
+
+/// One file's comment placements: the orphan ids that lead its layout, and the
+/// diff-line index → comment-ids map for the boxes anchored under its lines.
+#[derive(Default)]
+struct FilePlacements {
+    orphans: Vec<u64>,
+    anchored: BTreeMap<usize, Vec<u64>>,
+}
+
+/// Everything a layout build needs *about the file being built* — so the same
+/// builders serve the selected file and any other file in the stream (plan 006
+/// §3.3). `editor` is true only on the active file's build: a section never
+/// carries the in-place editor.
+struct LayoutInput<'a> {
+    diff: Option<&'a FileDiff>,
+    placements: FilePlacements,
+    header: Option<LayoutRow>,
+    editor: bool,
+}
+
+/// Which file of the current view's scroll stream a section belongs to. Status
+/// keys on `(Section, path)` — a path that is both staged *and* modified is two
+/// stream entries whose headers differ — while `diff_key` stays deliberately
+/// path-only (see its field doc: one net HEAD→worktree *diff* serves both rows).
+/// The two keys answer different questions; don't unify them (plan 006 §3.3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FileId {
+    Status { section: Section, path: String },
+    Review { path: String },
+}
+
+impl FileId {
+    /// The file's path, whichever view it came from.
+    pub fn path(&self) -> &str {
+        match self {
+            FileId::Status { path, .. } | FileId::Review { path } => path,
+        }
+    }
+}
+
+/// One file's prepared contribution to the stream: the diff computed for it and
+/// the physical rows built from that diff. Named `FileSection` because `Section`
+/// alone is the staged/unstaged enum (`git::Section`).
+pub struct FileSection {
+    pub diff: FileDiff,
+    pub rows: Vec<LayoutRow>,
+}
+
+/// How many sections *not* needed by the current window the cache keeps around
+/// (plan 006 §3.3). Window need comes first — a viewport of header-only files can
+/// legitimately pin more than this — and the budget only bounds what is retained
+/// for re-crossing.
+const SECTION_BUDGET: usize = 32;
+
+/// The bounded per-file section cache: a hand-rolled LRU over a `Vec` (no new
+/// dependency, and the working set is tens of entries, so a linear scan beats
+/// allocating a key per lookup). Each entry is tagged with the [`LayoutKey`] and
+/// the `stream_generation` it was built at; a stale tag is discarded when the
+/// entry is next touched, never in an eager sweep.
+#[derive(Default)]
+struct SectionCache {
+    entries: Vec<SectionEntry>,
+    /// Monotonic use stamp — the LRU order.
+    clock: u64,
+}
+
+struct SectionEntry {
+    id: FileId,
+    key: LayoutKey,
+    generation: u64,
+    used: u64,
+    section: Rc<FileSection>,
+}
+
+impl SectionCache {
+    /// The live section for `id`, marked most-recently-used. A tag mismatch — a
+    /// resize, a mode/wrap/number/cross toggle, or any `stream_generation` bump —
+    /// drops the entry here and reports a miss.
+    fn get(&mut self, id: &FileId, key: LayoutKey, generation: u64) -> Option<Rc<FileSection>> {
+        let pos = self.entries.iter().position(|entry| entry.id == *id)?;
+        if self.entries[pos].key != key || self.entries[pos].generation != generation {
+            self.entries.swap_remove(pos);
+            return None;
+        }
+        self.clock += 1;
+        self.entries[pos].used = self.clock;
+        Some(Rc::clone(&self.entries[pos].section))
+    }
+
+    fn insert(&mut self, id: FileId, key: LayoutKey, generation: u64, section: Rc<FileSection>) {
+        self.entries.retain(|entry| entry.id != id);
+        self.clock += 1;
+        self.entries.push(SectionEntry {
+            id,
+            key,
+            generation,
+            used: self.clock,
+            section,
+        });
+    }
+
+    /// Evict least-recently-used entries past [`SECTION_BUDGET`], never one the
+    /// current window still needs (`pinned`).
+    fn evict(&mut self, pinned: &[FileId]) {
+        while self.entries.len() > SECTION_BUDGET {
+            let victim = self
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| !pinned.contains(&entry.id))
+                .min_by_key(|(_, entry)| entry.used)
+                .map(|(index, _)| index);
+            match victim {
+                Some(index) => drop(self.entries.swap_remove(index)),
+                // Everything left is pinned: window need outranks the budget.
+                None => break,
+            }
+        }
+    }
+
+    /// Whether any cached section belongs to `path` (in either status section) —
+    /// what ties a file's highlight sub-map to its section's lifetime.
+    fn holds_path(&self, path: &str) -> bool {
+        self.entries.iter().any(|entry| entry.id.path() == path)
+    }
+}
+
+/// One file's contribution to the rendered window: which file it is, and the
+/// half-open span of *that file's own* layout rows this segment draws.
+pub struct WindowSegment {
+    /// The file's stream identity. `None` only where there is no stream entry —
+    /// History (never crossed) or an empty file list.
+    pub id: Option<FileId>,
+    pub path: String,
+    /// The prepared section a *strip* segment draws from, owned (`Rc`) so a window
+    /// outlives every borrow it was assembled from. `None` for the anchor segment,
+    /// whose rows are the live `diff_layout` — the anchor is never read from the
+    /// section cache (plan 006 §3.4).
+    pub section: Option<Rc<FileSection>>,
+    pub row_range: Range<usize>,
+}
+
+impl WindowSegment {
+    /// Whether this is the anchor (selected-file) segment.
+    pub fn is_anchor(&self) -> bool {
+        self.section.is_none()
+    }
+
+    /// How many physical rows the segment draws.
+    pub fn rows(&self) -> usize {
+        self.row_range.len()
+    }
+}
+
+/// The viewport-sized slice of the stream: the anchor segment from the current
+/// scroll offset, then as many following files as fit. Assembly is read-only — a
+/// file the cache doesn't hold ends the window as a shortfall rather than
+/// computing anything (`ensure_diff_window` fills the cache on the event path).
+pub struct DiffWindow {
+    pub segments: Vec<WindowSegment>,
+}
+
+impl DiffWindow {
+    /// Total physical rows the window draws (below the viewport height when the
+    /// stream — or the prepared part of it — ran out).
+    pub fn rows(&self) -> usize {
+        self.segments.iter().map(WindowSegment::rows).sum()
+    }
 }
 
 /// How a comment box is placed when building its rows: full-width (unified, or an
@@ -925,12 +1104,25 @@ pub struct App {
     /// the content in either mode. Interior-mutable because rendering takes `&App`.
     diff_viewport: Cell<u16>,
     diff_content_rows: Cell<usize>,
-    /// Per-file caches that make scrolling cheap: syntax-highlighted lines keyed
-    /// by their (sanitised) text, and the diff pane's physical row layout. Both
-    /// are cleared whenever `sync_diff` recomputes `current_diff`, so they never
-    /// outlive the file they describe. Interior-mutable because rendering, which
-    /// fills them, takes `&App`.
-    highlight_cache: RefCell<HashMap<String, HighlightedLine>>,
+    /// Per-file sub-maps of syntax-highlighted lines, keyed by file *path* then by
+    /// the line's sanitized text, so a strip row highlights with its own file's
+    /// syntax instead of colliding with another file's identical text (plan 006
+    /// §3.3). Path — not the full [`FileId`] — because a highlight depends only on
+    /// (syntax, text), both path-derived: a path listed in both status sections
+    /// shares one warm sub-map rather than keeping two. A sub-map lives as long as
+    /// its file is the active one or holds a cached section
+    /// (`prune_highlight_cache`).
+    highlight_cache: RefCell<HashMap<String, HashMap<String, HighlightedLine>>>,
+    /// Prepared sections for the files *around* the anchor — the stream's working
+    /// set (plan 006 §3.3). Interior-mutable because window assembly runs on the
+    /// render path's `&self`; it only ever reads what the event path prepared.
+    sections: RefCell<SectionCache>,
+    /// Bumped by anything that can change which files the stream holds, or what
+    /// any file's diff or rows contain: a status snapshot replacement, a review
+    /// relist, a comment mutation, a view change. Cached sections carry the value
+    /// they were built at and are dropped on access once it moves. Layout-key
+    /// changes need no bump — they invalidate by tag mismatch (plan 006 §3.3).
+    stream_generation: Cell<u64>,
     /// The diff pane's physical [`LayoutRow`] list (code rows interleaved with
     /// multi-row comment boxes), rebuilt when the pane width or diff mode changes,
     /// or on any comment/diff mutation. `None` until first built for the current
@@ -1106,6 +1298,8 @@ impl App {
             diff_viewport: Cell::new(0),
             diff_content_rows: Cell::new(0),
             highlight_cache: RefCell::new(HashMap::new()),
+            sections: RefCell::new(SectionCache::default()),
+            stream_generation: Cell::new(0),
             layout: RefCell::new(None),
             layout_generation: Cell::new(0),
             last_click: None,
@@ -1178,13 +1372,19 @@ impl App {
 
     /// The file under the cursor, with the section it belongs to.
     pub fn selected_file(&self) -> Option<(Section, &FileEntry)> {
+        self.file_at_index(self.selected)
+    }
+
+    /// The `(section, entry)` at flattened index `index` — staged entries first,
+    /// then unstaged, the order the Changes panel lists and the stream crosses.
+    pub fn file_at_index(&self, index: usize) -> Option<(Section, &FileEntry)> {
         let staged = &self.status.staged;
-        if self.selected < staged.len() {
-            Some((Section::Staged, &staged[self.selected]))
+        if index < staged.len() {
+            Some((Section::Staged, &staged[index]))
         } else {
             self.status
                 .unstaged
-                .get(self.selected - staged.len())
+                .get(index - staged.len())
                 .map(|entry| (Section::Unstaged, entry))
         }
     }
@@ -1197,6 +1397,10 @@ impl App {
         match self.repo.status() {
             Ok(status) => {
                 self.status = status;
+                // A staging mutation reaches here *without* a `reload()`, and it
+                // rewrites the files' diffs in place — so every cached section is
+                // stale from this point (plan 006 §3.3).
+                self.bump_stream_generation();
                 match previous.and_then(|(section, path)| self.index_of(section, &path)) {
                     Some(index) => self.selected = index,
                     None => self.clamp_selection(),
@@ -1230,6 +1434,8 @@ impl App {
         // A reload landing between two wheel ticks must not leave the arm set, or
         // the next tick would hop instantly (FIX 2). A refresh is not a scroll.
         self.wheel_edge = None;
+        // Whatever the watcher saw may have rewritten any file in the stream.
+        self.bump_stream_generation();
         self.refresh_active();
         self.sync_active();
     }
@@ -2675,6 +2881,8 @@ impl App {
             self.load_history();
         }
         self.view = ViewMode::History;
+        // A view change re-scopes the stream (History has none); drop its sections.
+        self.bump_stream_generation();
         self.last_click = None; // a view change resets the double-click tracker (§3.6)
                                 // Hidden left column ⇒ the Diff is the only visible pane to focus.
         self.history_focus = if self.show_changes {
@@ -2692,6 +2900,8 @@ impl App {
     fn exit_history(&mut self) {
         // Return to the session's home view (status or review), not always status.
         self.view = self.home_view();
+        // The stream is the home view's file list now, not History's nothing.
+        self.bump_stream_generation();
         self.last_click = None; // a view change resets the double-click tracker (§3.6)
                                 // Respect the hidden-panel invariant in whichever home we return to:
                                 // when the left panel is hidden, focus must be the only visible pane
@@ -3810,9 +4020,11 @@ impl App {
             // top (`None`), resolved to row 0 by the render.
             self.status_pane.cursor = None;
         }
-        // The cached highlights / row layout describe the previous diff; drop them
-        // so the new one is recomputed lazily on next render.
-        self.highlight_cache.borrow_mut().clear();
+        // The cached row layout describes the previous diff; drop it so the new one
+        // is recomputed lazily on next render. Highlights are per-file (keyed by
+        // path, then line text), so the departed file's map is simply pruned —
+        // whatever the stream still holds stays warm (plan 006 §3.3).
+        self.prune_highlight_cache();
         *self.layout.borrow_mut() = None;
         // An in-place refresh may have shrunk the row list under a pinned cursor
         // (e.g. an edit removed lines); clamp it to the new layout. A fresh file
@@ -4012,6 +4224,9 @@ impl App {
             // Force the open diff to recompute against the new tips.
             review.diff_key = None;
         }
+        // The range moved and the list was rebuilt: every section was computed
+        // against the old tips (plan 006 §3.3).
+        self.bump_stream_generation();
         // The range moved, so a full re-anchor pass runs against the new diff
         // (write elided when nothing moved — plan §3.2b), updating the in-memory
         // set the row model reads.
@@ -4206,6 +4421,18 @@ impl App {
     /// comment mutation or reload — a box appeared, vanished, or changed).
     fn invalidate_comment_rows(&self) {
         *self.layout.borrow_mut() = None;
+        // Neighbours' sections carry *their* comment boxes, so a mutation anywhere
+        // in the inbox invalidates the stream too (plan 006 §3.3).
+        self.bump_stream_generation();
+    }
+
+    /// Invalidate every cached section. Anything that can change which files the
+    /// stream holds, or what a file's diff or rows contain, lands here: a status
+    /// snapshot replacement, a review relist, a comment mutation, a view change.
+    /// Layout-key changes need no bump — a stale tag is caught on access (plan 006
+    /// §3.3).
+    fn bump_stream_generation(&self) {
+        self.stream_generation.set(self.stream_generation.get() + 1);
     }
 
     /// A successful review refresh clears a lingering review failure flash, so a
@@ -4316,30 +4543,82 @@ impl App {
     fn reset_diff_view(&mut self) {
         self.diff_scroll.set(0);
         self.diff_hscroll = 0;
-        self.highlight_cache.borrow_mut().clear();
+        self.prune_highlight_cache();
         *self.layout.borrow_mut() = None;
     }
 
-    /// Syntax-highlight one already-sanitised line, memoised per file so
-    /// scrolling reuses the result instead of re-parsing through syntect on
-    /// every frame. Single-line highlighting carries no cross-line state (see
-    /// `ui::syntax`), so the line text is a sound key; the cache is cleared when
-    /// the selected file changes (`sync_diff`).
+    /// Syntax-highlight one already-sanitised line of the *active* file, memoised
+    /// per file so scrolling reuses the result instead of re-parsing through
+    /// syntect on every frame.
     pub fn highlight(
         &self,
         syntax: &SyntaxReference,
         theme_name: &str,
         text: &str,
     ) -> HighlightedLine {
-        if let Some(hit) = self.highlight_cache.borrow().get(text) {
+        self.highlight_for(
+            self.active_path().unwrap_or_default(),
+            syntax,
+            theme_name,
+            text,
+        )
+    }
+
+    /// Syntax-highlight one already-sanitised line of `path`'s content, memoised
+    /// in that file's own sub-map. Single-line highlighting carries no cross-line
+    /// state (see `ui::syntax`), so the line text is a sound key *within* a file;
+    /// across files it is not (identical text, different syntax), which is why the
+    /// map is per-file (plan 006 §3.3).
+    pub fn highlight_for(
+        &self,
+        path: &str,
+        syntax: &SyntaxReference,
+        theme_name: &str,
+        text: &str,
+    ) -> HighlightedLine {
+        if let Some(hit) = self
+            .highlight_cache
+            .borrow()
+            .get(path)
+            .and_then(|lines| lines.get(text))
+        {
             return Rc::clone(hit);
         }
         let computed: HighlightedLine =
             crate::ui::syntax::highlight_line(syntax, theme_name, text).into();
         self.highlight_cache
             .borrow_mut()
+            .entry(path.to_string())
+            .or_default()
             .insert(text.to_string(), Rc::clone(&computed));
         computed
+    }
+
+    /// Drop the highlight sub-maps of files the pane no longer holds — everything
+    /// but the active file's and those with a live cached section. Tying sub-map
+    /// lifetime to the section cache is what keeps a long browsing (or scrolling)
+    /// session from growing the map without bound (plan 006 §3.3).
+    fn prune_highlight_cache(&self) {
+        let active = self.active_path();
+        let sections = self.sections.borrow();
+        self.highlight_cache
+            .borrow_mut()
+            .retain(|path, _| Some(path.as_str()) == active || sections.holds_path(path));
+    }
+
+    /// Everything a built layout depends on besides the file itself. Wrap and the
+    /// line-number gutter are both wrap inputs (the gutter sets the content width
+    /// a line wraps at), so a change in either invalidates alongside width and
+    /// mode (plan §3.3); `cross_file` adds the header row (plan 006 §3.1). Cached
+    /// sections carry the same key, so one toggle invalidates the whole stream.
+    fn layout_key(&self, width: u16) -> LayoutKey {
+        LayoutKey {
+            width,
+            mode: self.diff_mode,
+            wrap: self.wrap_lines,
+            line_numbers: self.show_line_numbers,
+            cross_file: self.cross_file_scroll,
+        }
     }
 
     /// The diff pane's physical [`LayoutRow`] list at pane width `width`, computed
@@ -4349,16 +4628,7 @@ impl App {
     /// This is the single backing store read by both the cursor seam and the
     /// renderer.
     pub fn diff_layout(&self, width: u16) -> Ref<'_, Vec<LayoutRow>> {
-        // Wrap and the line-number gutter are both wrap inputs (the gutter sets
-        // the content width a line wraps at), so a change in either invalidates
-        // the cache alongside width and mode (plan §3.3).
-        let current = LayoutKey {
-            width,
-            mode: self.diff_mode,
-            wrap: self.wrap_lines,
-            line_numbers: self.show_line_numbers,
-            cross_file: self.cross_file_scroll,
-        };
+        let current = self.layout_key(width);
         let previous = self.layout.borrow().as_ref().map(|c| c.key);
         if previous != Some(current) {
             // Anchor the top visible logical line across a *structural* relayout —
@@ -4404,38 +4674,65 @@ impl App {
         })
     }
 
-    /// Build the physical layout for the active diff at pane width `width`: the
-    /// code rows for the current mode interleaved with comment boxes, or (for an
-    /// empty/binary/no diff) just the orphan boxes. When the in-place editor is
-    /// open its box is injected too — after the anchored code line for a new
-    /// comment, or in place of the edited comment's box (plan §3.5).
+    /// Build the physical layout for the *active* file at pane width `width` —
+    /// the selected-file path, expressed as one call through the file-parameterized
+    /// seam so the selected file and a stream neighbour can never diverge.
     fn build_layout(&self, width: u16) -> Vec<LayoutRow> {
-        let mut rows = match self.active_diff() {
+        self.build_file_layout(self.active_layout_input(), width)
+    }
+
+    /// The build inputs for the active file: its diff, its comment placements, its
+    /// header row, and the in-place editor (only ever the active file's).
+    fn active_layout_input(&self) -> LayoutInput<'_> {
+        let diff = self.active_diff();
+        LayoutInput {
+            diff,
+            placements: self.file_placements(self.comment_path(), diff),
+            header: self.file_header_row(),
+            editor: true,
+        }
+    }
+
+    /// Build one file's physical layout at pane width `width`: the code rows for
+    /// the current mode interleaved with that file's comment boxes, or (for an
+    /// empty/binary/no diff) just its orphan boxes, led by its header row. When
+    /// the in-place editor is open *and* this is the active file, its box is
+    /// injected too — after the anchored code line for a new comment, or in place
+    /// of the edited comment's box (plan §3.5).
+    ///
+    /// Every input that varies per file arrives in `input`; everything read off
+    /// `self` (mode, wrap, line-number toggle) is pane-global, so a neighbour's
+    /// section is byte-identical to the layout that file gets when selected — the
+    /// property a pixel-stable handoff needs (plan 006 §3.3).
+    fn build_file_layout(&self, input: LayoutInput<'_>, width: u16) -> Vec<LayoutRow> {
+        let mut rows = match input.diff {
             Some(FileDiff::Text(lines)) if !lines.is_empty() => {
-                let (orphans, placements) = self.active_placements(lines);
                 // A new-comment editor anchors after this diff-line index (re-resolved
                 // from the anchor every build, never a captured row — plan §3.5).
-                let editor_line = self.editor_new_anchor_line(lines);
+                let editor_line = input
+                    .editor
+                    .then(|| self.editor_new_anchor_line(lines))
+                    .flatten();
                 match self.diff_mode {
                     DiffMode::Unified => {
-                        self.build_unified_layout(lines, &orphans, &placements, width, editor_line)
+                        self.build_unified_layout(&input, lines, width, editor_line)
                     }
                     DiffMode::SideBySide => {
-                        self.build_sbs_layout(lines, &orphans, &placements, width, editor_line)
+                        self.build_sbs_layout(&input, lines, width, editor_line)
                     }
                 }
             }
             // Empty/binary/no diff: the only selectable rows are orphan boxes,
             // rendered full-width (there are no columns to anchor them into).
             _ => {
-                let orphans = self.selected_file_orphans();
                 let mut rows = Vec::new();
-                for &id in &orphans {
+                for &id in &input.placements.orphans {
                     self.push_comment_box(
                         &mut rows,
                         id,
                         true,
                         BoxPlacement::Unified(width as usize),
+                        input.editor,
                     );
                 }
                 rows
@@ -4444,7 +4741,8 @@ impl App {
         // Orphan fallback: an open editor that resolved to no row — its anchor no
         // longer maps to a diff line, or the edited comment vanished — renders as a
         // full-width block at the diff top (plan §3.5).
-        if self.editing()
+        if input.editor
+            && self.editing()
             && !rows
                 .iter()
                 .any(|r| matches!(r.content, RowContent::Editor(_)))
@@ -4455,14 +4753,34 @@ impl App {
             rows = block;
         }
         // Ahead of the orphan block, in both modes (plan 006 §3.1).
-        if let Some(header) = self.file_header_row() {
+        if let Some(header) = input.header {
             rows.insert(0, header);
         }
         rows
     }
 
-    /// The file's header row (plan 006 §3.1; History is never crossed, so it has
-    /// none). Its whole payload — marker, display path, counts — is resolved here,
+    /// One file's comment placements, resolved exactly the way the active file's
+    /// are: a non-empty text diff anchors boxes to lines, while an empty/binary one
+    /// has no line to anchor to and shows only its orphan block. `None` path
+    /// (History, or nothing selected) has neither.
+    fn file_placements(&self, path: Option<&str>, diff: Option<&FileDiff>) -> FilePlacements {
+        let Some(path) = path else {
+            return FilePlacements::default();
+        };
+        match diff {
+            Some(FileDiff::Text(lines)) if !lines.is_empty() => {
+                let (orphans, anchored) = comment_placements(lines, self.active_comments(), path);
+                FilePlacements { orphans, anchored }
+            }
+            _ => FilePlacements {
+                orphans: self.file_orphans(path),
+                anchored: BTreeMap::new(),
+            },
+        }
+    }
+
+    /// The active file's header row (plan 006 §3.1; History is never crossed, so
+    /// it has none). Its whole payload — marker, display path, counts — is resolved
     /// once per layout build, so rendering never re-derives it.
     fn file_header_row(&self) -> Option<LayoutRow> {
         if !self.cross_file_scroll {
@@ -4471,33 +4789,217 @@ impl App {
         let header = match self.view {
             ViewMode::Status => {
                 let (section, entry) = self.selected_file()?;
-                FileHeaderRow {
-                    marker: entry.change.marker(),
-                    tone: MarkerTone::for_status(section, entry.change),
-                    path: entry.display_path(),
-                    // A working-tree entry carries no stats, so the counts come
-                    // off the diff that was computed for this pane anyway.
-                    stat: self.active_diff().map(crate::git::diff::stat_of)?,
-                }
+                status_header(section, entry, self.active_diff()?)
             }
-            ViewMode::Review => {
-                let file = self.review_files().get(self.review_selected())?;
-                FileHeaderRow {
-                    marker: file.change.marker(),
-                    tone: MarkerTone::for_change_kind(file.change),
-                    path: file.display_path(),
-                    stat: file.stat,
-                }
-            }
+            ViewMode::Review => review_header(self.review_files().get(self.review_selected())?),
             ViewMode::History => return None,
         };
-        Some(LayoutRow {
-            target: RowTarget::FileHeader,
-            subrow: 0,
-            side: None,
-            hit: HitRegion::FileHeader,
-            content: RowContent::FileHeader(header),
-        })
+        Some(header_row(header))
+    }
+
+    // --- The stream: identities, sections, window (plan 006 §3.3–3.4) ---
+
+    /// How many files the current view's scroll stream holds. History is never
+    /// crossed, so its stream is empty.
+    fn stream_len(&self) -> usize {
+        match self.view {
+            ViewMode::Status => self.status.total(),
+            ViewMode::Review => self.review_files().len(),
+            ViewMode::History => 0,
+        }
+    }
+
+    /// The anchor's index in the stream, or `None` when the view has no stream
+    /// (History) or nothing is selected.
+    fn stream_position(&self) -> Option<usize> {
+        let index = match self.view {
+            ViewMode::Status => self.selected,
+            ViewMode::Review => self.review_selected(),
+            ViewMode::History => return None,
+        };
+        (index < self.stream_len()).then_some(index)
+    }
+
+    /// The anchor's index when the pane has a *strip* to walk below it: cross-file
+    /// scrolling on, and a stream the anchor sits in (History has none). The single
+    /// gate both the event-path fill and the read-only assembly ask.
+    fn strip_anchor(&self) -> Option<usize> {
+        if !self.cross_file_scroll {
+            return None;
+        }
+        self.stream_position()
+    }
+
+    /// The stream identity of the file at `index`.
+    fn stream_file_id(&self, index: usize) -> Option<FileId> {
+        match self.view {
+            ViewMode::Status => {
+                let (section, entry) = self.file_at_index(index)?;
+                Some(FileId::Status {
+                    section,
+                    path: entry.path.clone(),
+                })
+            }
+            ViewMode::Review => Some(FileId::Review {
+                path: self.review_files().get(index)?.path.clone(),
+            }),
+            ViewMode::History => None,
+        }
+    }
+
+    /// The anchor file's stream identity.
+    pub fn active_file_id(&self) -> Option<FileId> {
+        self.stream_file_id(self.stream_position()?)
+    }
+
+    /// Compute one file's section: its diff plus the rows built from that diff at
+    /// the current layout key. The only place a *non-selected* file's diff is read,
+    /// and it runs on the event path (`ensure_diff_window`) — never during render.
+    fn compute_section(&self, id: &FileId, width: u16) -> Option<FileSection> {
+        let (diff, header) = match id {
+            FileId::Status { section, path } => {
+                let entry = self.status_entry(*section, path)?;
+                let diff = self.repo.file_diff_head_vs_worktree(entry);
+                let header = status_header(*section, entry, &diff);
+                (diff, header)
+            }
+            FileId::Review { path } => {
+                let review = self.review.as_ref()?;
+                let file = review.files.iter().find(|file| file.path == *path)?;
+                let diff = self.repo.range_file_diff(&review.spec, file);
+                (diff, review_header(file))
+            }
+        };
+        // Counted only once the file resolved and its diff was actually read —
+        // the laziness observable is "per-file diff computations" (plan §3.4).
+        self.diff_compute_count
+            .set(self.diff_compute_count.get() + 1);
+        let input = LayoutInput {
+            diff: Some(&diff),
+            placements: self.file_placements(Some(id.path()), Some(&diff)),
+            header: self.cross_file_scroll.then(|| header_row(header)),
+            editor: false,
+        };
+        let rows = self.build_file_layout(input, width);
+        Some(FileSection { diff, rows })
+    }
+
+    /// The working-tree entry for `path` in `section`, by identity rather than by
+    /// index (a refresh can renumber the list under a queued window fill).
+    fn status_entry(&self, section: Section, path: &str) -> Option<&FileEntry> {
+        let list = match section {
+            Section::Staged => &self.status.staged,
+            Section::Unstaged => &self.status.unstaged,
+        };
+        list.iter().find(|entry| entry.path == path)
+    }
+
+    /// The anchor's contribution to a window `viewport` rows deep: the half-open
+    /// span of its *own* layout rows drawn from the current scroll offset, clamped
+    /// to the rows it actually has. The one place the anchor's share of the window
+    /// is decided, so the event-path fill and the render-path assembly can't
+    /// disagree about where the strip starts.
+    fn anchor_span(&self, width: u16, viewport: usize) -> Range<usize> {
+        let rows = self.diff_layout(width).len();
+        let offset = self.diff_scroll.get().min(rows);
+        offset..offset + (rows - offset).min(viewport)
+    }
+
+    /// Prepare the sections the window at the **current** scroll offset needs, on
+    /// the event path — repo reads never happen during render (plan 006 §3.3).
+    ///
+    /// The laziness contract's trigger (a): a following file is computed only when
+    /// the viewport actually reaches past the anchor's last row (`o + V > R`) and a
+    /// next file exists. Scrolling anywhere inside one large file computes nothing.
+    /// Triggers (b)/(c) — the renormalization an up- or fling-delta needs — belong
+    /// to the scroll domain and land with it.
+    ///
+    /// Sections beyond what the window pins are LRU-trimmed to [`SECTION_BUDGET`],
+    /// and each file's highlight sub-map goes with its section.
+    pub fn ensure_diff_window(&mut self, width: u16, height: u16) {
+        if self.editing() {
+            return;
+        }
+        let Some(anchor) = self.strip_anchor() else {
+            return;
+        };
+        let key = self.layout_key(width);
+        let generation = self.stream_generation.get();
+        let viewport = height as usize;
+        let mut filled = self.anchor_span(width, viewport).len();
+        let mut pinned: Vec<FileId> = self.active_file_id().into_iter().collect();
+        let mut index = anchor + 1;
+        while filled < viewport && index < self.stream_len() {
+            let Some(id) = self.stream_file_id(index) else {
+                break;
+            };
+            let cached = self.sections.borrow_mut().get(&id, key, generation);
+            let section = match cached {
+                Some(section) => section,
+                None => {
+                    let Some(section) = self.compute_section(&id, width) else {
+                        break;
+                    };
+                    let section = Rc::new(section);
+                    self.sections.borrow_mut().insert(
+                        id.clone(),
+                        key,
+                        generation,
+                        Rc::clone(&section),
+                    );
+                    section
+                }
+            };
+            filled += section.rows.len();
+            pinned.push(id);
+            index += 1;
+        }
+        self.sections.borrow_mut().evict(&pinned);
+        self.prune_highlight_cache();
+    }
+
+    /// The window to render at `width` × `height`: the anchor's rows from the
+    /// current offset, then each following file's prepared section until the
+    /// viewport is full or the stream ends. Read-only — a file the cache doesn't
+    /// hold ends the window as a shortfall rather than computing anything, so a
+    /// frame can never block on a repo read. History is always the single anchor
+    /// segment (it is never crossed).
+    pub fn diff_window(&self, width: u16, height: u16) -> DiffWindow {
+        let viewport = height as usize;
+        let row_range = self.anchor_span(width, viewport);
+        let mut filled = row_range.len();
+        // The anchor segment is always present, even when it contributes no rows
+        // (`o == R`, the position pixel-identical to the next file's own row 0):
+        // segment 1 is the anchor by definition.
+        let mut segments = vec![WindowSegment {
+            id: self.active_file_id(),
+            path: self.active_path().unwrap_or_default().to_string(),
+            section: None,
+            row_range,
+        }];
+        if let Some(anchor) = self.strip_anchor() {
+            let key = self.layout_key(width);
+            let generation = self.stream_generation.get();
+            let mut index = anchor + 1;
+            while filled < viewport && index < self.stream_len() {
+                let Some(id) = self.stream_file_id(index) else {
+                    break;
+                };
+                let Some(section) = self.sections.borrow_mut().get(&id, key, generation) else {
+                    break;
+                };
+                let take = section.rows.len().min(viewport - filled);
+                filled += take;
+                segments.push(WindowSegment {
+                    path: id.path().to_string(),
+                    id: Some(id),
+                    section: Some(section),
+                    row_range: 0..take,
+                });
+                index += 1;
+            }
+        }
+        DiffWindow { segments }
     }
 
     /// The unified physical layout: an orphan block at the top, then each diff
@@ -4505,15 +5007,14 @@ impl App {
     /// new-comment editor box after its anchor line when `editor_line` matches.
     fn build_unified_layout(
         &self,
+        input: &LayoutInput<'_>,
         lines: &[DiffLine],
-        orphans: &[u64],
-        placements: &BTreeMap<usize, Vec<u64>>,
         width: u16,
         editor_line: Option<usize>,
     ) -> Vec<LayoutRow> {
         let place = BoxPlacement::Unified(width as usize);
         // Wrap at the same content width the renderer draws into — derived from
-        // this diff's line-number column width, so a 5+-digit number can't clip a
+        // *this file's* line-number column width, so a 5+-digit number can't clip a
         // wrapped segment (they must agree; both call `line_number_width(lines)`).
         let number_width = crate::ui::diff_view::line_number_width(lines);
         let content_w = crate::ui::diff_view::unified_content_width(
@@ -4521,9 +5022,10 @@ impl App {
             self.show_line_numbers,
             number_width,
         );
-        let mut rows = Vec::with_capacity(lines.len() + orphans.len());
-        for &id in orphans {
-            self.push_comment_box(&mut rows, id, true, place);
+        let placements = &input.placements.anchored;
+        let mut rows = Vec::with_capacity(lines.len() + input.placements.orphans.len());
+        for &id in &input.placements.orphans {
+            self.push_comment_box(&mut rows, id, true, place, input.editor);
         }
         for (index, line) in lines.iter().enumerate() {
             // One display row per wrapped segment, all sharing `Code(index)` with
@@ -4543,7 +5045,7 @@ impl App {
             // Comment boxes and the editor insert after the anchored line's *last*
             // subrow (they are appended after the whole segment run above).
             for &id in comments_after(placements, index) {
-                self.push_comment_box(&mut rows, id, false, place);
+                self.push_comment_box(&mut rows, id, false, place, input.editor);
             }
             if editor_line == Some(index) {
                 self.push_editor_box(&mut rows, place);
@@ -4594,15 +5096,14 @@ impl App {
     /// renders as blank sibling rows so the two sides stay aligned (plan §3.4).
     fn build_sbs_layout(
         &self,
+        input: &LayoutInput<'_>,
         lines: &[DiffLine],
-        orphans: &[u64],
-        placements: &BTreeMap<usize, Vec<u64>>,
         width: u16,
         editor_line: Option<usize>,
     ) -> Vec<LayoutRow> {
         let (left_w, right_w) = sbs_columns(width);
         let place = BoxPlacement::Sbs { left_w, right_w };
-        // Per-diff number-column width feeds each column's content width, so a
+        // Per-file number-column width feeds each column's content width, so a
         // wrapped segment fits exactly where it is drawn (matches the renderer,
         // which derives the same width from the same lines).
         let number_width = crate::ui::diff_view::line_number_width(lines);
@@ -4610,10 +5111,17 @@ impl App {
             crate::ui::diff_view::sbs_content_width(left_w, self.show_line_numbers, number_width);
         let right_content =
             crate::ui::diff_view::sbs_content_width(right_w, self.show_line_numbers, number_width);
+        let placements = &input.placements.anchored;
         let mut rows = Vec::new();
-        for &id in orphans {
+        for &id in &input.placements.orphans {
             // Orphan boxes have no live anchor side; keep them full-width at top.
-            self.push_comment_box(&mut rows, id, true, BoxPlacement::Unified(width as usize));
+            self.push_comment_box(
+                &mut rows,
+                id,
+                true,
+                BoxPlacement::Unified(width as usize),
+                input.editor,
+            );
         }
         for row in side_by_side_rows(lines) {
             match row {
@@ -4678,13 +5186,13 @@ impl App {
                     // its comments once (they carry the new side themselves).
                     if let Some(l) = left {
                         for &id in comments_after(placements, l) {
-                            self.push_comment_box(&mut rows, id, false, place);
+                            self.push_comment_box(&mut rows, id, false, place, input.editor);
                         }
                     }
                     if let Some(r) = right {
                         if Some(r) != left {
                             for &id in comments_after(placements, r) {
-                                self.push_comment_box(&mut rows, id, false, place);
+                                self.push_comment_box(&mut rows, id, false, place, input.editor);
                             }
                         }
                     }
@@ -4711,13 +5219,15 @@ impl App {
         id: u64,
         orphan: bool,
         placement: BoxPlacement,
+        editor: bool,
     ) {
         let Some(comment) = self.active_comment(id) else {
             return;
         };
         // Editing this comment? Its box becomes the in-place editor, rendered where
-        // the saved box would have been (plan §3.5).
-        if self.editor_edits_comment(id) {
+        // the saved box would have been (plan §3.5) — never in a non-active file's
+        // section, which carries no editor at all (plan 006 §3.3).
+        if editor && self.editor_edits_comment(id) {
             self.push_editor_box(rows, placement);
             return;
         }
@@ -4802,19 +5312,6 @@ impl App {
             .is_some_and(|edit| edit.editing_id == Some(id))
     }
 
-    /// The comment placements for the diff being rendered: the orphaned ids (for
-    /// the top block) and a map of diff-line index → comment ids anchored just
-    /// below it, both ordered by id. Empty outside a review session (comments are
-    /// a Review-only feature in v1), so status/history rows are unchanged.
-    fn active_placements(&self, lines: &[DiffLine]) -> (Vec<u64>, BTreeMap<usize, Vec<u64>>) {
-        let empty = || (Vec::new(), BTreeMap::new());
-        let path = match self.selected_comment_file() {
-            Some(path) => path,
-            None => return empty(),
-        };
-        comment_placements(lines, self.active_comments(), &path)
-    }
-
     /// The comment set the active view renders and navigates: the status view's
     /// worktree inbox or the review session's range inbox. Both are already
     /// scope-filtered when populated, so a comment of the wrong scope never leaks
@@ -4833,10 +5330,10 @@ impl App {
 
     /// The path of the file whose comments the diff pane is showing — the same file
     /// `active_diff_path` backs, except History carries no comments (→ `None`).
-    fn selected_comment_file(&self) -> Option<String> {
+    fn comment_path(&self) -> Option<&str> {
         match self.view {
             ViewMode::History => None,
-            _ => self.active_diff_path(),
+            _ => self.active_path(),
         }
     }
 
@@ -4879,19 +5376,16 @@ impl App {
             .count()
     }
 
-    /// The orphaned comments on the currently-selected review file, ordered by id.
-    /// These render in the diff pane's top orphan block; for a file whose diff is
-    /// empty or binary (no lines to anchor to) it's the *only* place they can
-    /// appear, so the block must render regardless of diff kind (finding 2).
-    /// Always empty outside an active review session in the Review view.
-    pub fn selected_file_orphans(&self) -> Vec<u64> {
-        let Some(path) = self.selected_comment_file() else {
-            return Vec::new();
-        };
+    /// The orphaned comment ids on `file`, ordered by id — the block any file's
+    /// layout leads with, selected or not. For a file whose diff is empty or binary
+    /// (no lines to anchor to) it is the *only* place they can appear, so the block
+    /// renders regardless of diff kind (finding 2). Always empty outside an active
+    /// review session in the Review view.
+    fn file_orphans(&self, file: &str) -> Vec<u64> {
         let mut ids: Vec<u64> = self
             .active_comments()
             .iter()
-            .filter(|c| c.orphaned && c.file == path)
+            .filter(|c| c.orphaned && c.file == file)
             .map(|c| c.id)
             .collect();
         ids.sort_unstable();
@@ -4922,17 +5416,24 @@ impl App {
 
     /// The path backing `active_diff`, for the diff title and syntax lookup.
     pub fn active_diff_path(&self) -> Option<String> {
+        self.active_path().map(str::to_string)
+    }
+
+    /// The path backing `active_diff`, borrowed — the allocation-free form the
+    /// per-line highlight lookup needs (`active_diff_path` clones for callers that
+    /// keep it past a mutation).
+    pub fn active_path(&self) -> Option<&str> {
         match self.view {
-            ViewMode::Status => self.selected_file().map(|(_, entry)| entry.path.clone()),
+            ViewMode::Status => self.selected_file().map(|(_, entry)| entry.path.as_str()),
             ViewMode::History => self
                 .commit_files
                 .get(self.committed_row.checked_sub(1)?)
-                .map(|file| file.path.clone()),
+                .map(|file| file.path.as_str()),
             ViewMode::Review => self
                 .review
                 .as_ref()
                 .and_then(|review| review.files.get(review.selected))
-                .map(|file| file.path.clone()),
+                .map(|file| file.path.as_str()),
         }
     }
 
@@ -4988,6 +5489,28 @@ impl App {
     #[doc(hidden)]
     pub fn diff_compute_count(&self) -> u64 {
         self.diff_compute_count.get()
+    }
+
+    /// How many prepared sections the stream cache currently holds (live or
+    /// stale-tagged — staleness is resolved on access). A test-only observable for
+    /// the window-pinned capacity rule (plan 006 §3.3).
+    #[doc(hidden)]
+    pub fn cached_section_count(&self) -> usize {
+        self.sections.borrow().entries.len()
+    }
+
+    /// The stream invalidation counter (plan 006 §3.3). A test-only observable
+    /// proving a refresh / comment mutation retires every cached section.
+    #[doc(hidden)]
+    pub fn stream_generation(&self) -> u64 {
+        self.stream_generation.get()
+    }
+
+    /// How many files the active view's scroll stream holds. A test-only
+    /// observable (the window walks this list).
+    #[doc(hidden)]
+    pub fn stream_file_count(&self) -> usize {
+        self.stream_len()
     }
 
     /// How many times the physical diff-pane layout has actually been
@@ -6004,6 +6527,40 @@ fn line_no(line: &DiffLine, side: Side) -> Option<usize> {
     match side {
         Side::Old => line.old_no,
         Side::New => line.new_no,
+    }
+}
+
+/// The header payload for a working-tree file: its section-aware marker and tone,
+/// its display path (`old → new` for a rename), and the counts recounted off the
+/// diff — a `FileEntry` carries no stats of its own (plan 006 §3.1).
+fn status_header(section: Section, entry: &FileEntry, diff: &FileDiff) -> FileHeaderRow {
+    FileHeaderRow {
+        marker: entry.change.marker(),
+        tone: MarkerTone::for_status(section, entry.change),
+        path: entry.display_path(),
+        stat: crate::git::diff::stat_of(diff),
+    }
+}
+
+/// The header payload for a reviewed file, whose `+a −d` come from the range's
+/// numstat rather than a recount.
+fn review_header(file: &CommitFile) -> FileHeaderRow {
+    FileHeaderRow {
+        marker: file.change.marker(),
+        tone: MarkerTone::for_change_kind(file.change),
+        path: file.display_path(),
+        stat: file.stat,
+    }
+}
+
+/// Wrap a header payload as the one physical row that leads a file's layout.
+fn header_row(header: FileHeaderRow) -> LayoutRow {
+    LayoutRow {
+        target: RowTarget::FileHeader,
+        subrow: 0,
+        side: None,
+        hit: HitRegion::FileHeader,
+        content: RowContent::FileHeader(header),
     }
 }
 
