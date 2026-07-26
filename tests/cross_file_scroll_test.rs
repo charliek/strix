@@ -5,8 +5,11 @@
 //! viewport bottom never passes the last row the stream offers (§3.2b), with the
 //! border title following the anchor (§3.2c).
 //!
-//! The keyboard still crosses by the arm/hop machinery (removed in C4); those
-//! tests are unchanged. Off by default; the History view is excluded.
+//! The keyboard crosses in one press into the same stream (§3.5): `j` at the last
+//! stop lands the next file's header at the top, `k` at the header lands the
+//! previous file's tail with the departed header at the bottom edge, and a
+//! list-focused half page is a plain continuous tick. Off by default; the History
+//! view is excluded.
 
 mod common;
 
@@ -16,7 +19,7 @@ use std::collections::BTreeMap;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier};
-use strix::app::{App, DiffWindow, RowContent};
+use strix::app::{App, DiffWindow, RowContent, RowTarget};
 use strix::comments::{Branch, Comment, Scope, Side, Source, Store};
 use strix::config::Config;
 use strix::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
@@ -1100,53 +1103,127 @@ fn disabled_clamps_and_never_hops() {
     );
 }
 
-// --- keyboard: Status ------------------------------------------------------
+// --- keyboard: crossing in one press (plan 006 §3.5) -----------------------
 
-#[test]
-fn keyboard_j_at_hard_edge_crosses() {
-    let repo = short_status_repo();
-    let mut app = app_for(&repo, config(true, false));
-    dump_frame(&app, W, H).unwrap();
-    press(&mut app, 'l'); // focus the diff
-    press(&mut app, 'G'); // cursor to the last row (a short diff → at the hard edge)
-    assert_eq!(app.selected, 0);
+/// The [`RowTarget`] the diff cursor names right now.
+fn cursor_target(app: &App) -> RowTarget {
+    app.diff_layout(app.diff_area().width)[app.review_cursor()].target
+}
 
-    press(&mut app, 'j');
-    assert_eq!(app.selected, 1, "j at the hard edge crosses immediately");
-    assert_eq!(app.diff_scroll.get(), 0, "landed at the top");
-    assert_eq!(app.review_cursor(), 0);
+/// The glyphs of body row `y` of the diff pane.
+fn body_text(rows: &[Vec<Cell>], y: usize) -> String {
+    rows[y].iter().map(|cell| cell.0.as_str()).collect()
+}
+
+/// Type `text` into the open comment editor.
+fn typ(app: &mut App, text: &str) {
+    for ch in text.chars() {
+        press(app, ch);
+    }
 }
 
 #[test]
-fn keyboard_k_at_top_crosses_landing_bottom() {
-    let repo = multi_status_repo();
-    let mut app = app_for(&repo, config(true, false));
-    dump_frame(&app, W, H).unwrap();
+fn j_at_the_last_stop_crosses_in_one_press() {
+    let repo = short_status_repo(); // b.txt then c.txt, both short
+    let mut app = rendered_app(&repo, config(true, false), H);
+    press(&mut app, 'l'); // focus the diff
+    press(&mut app, 'G'); // cursor to b.txt's last stop
+    assert_eq!(app.selected, 0);
+
+    press(&mut app, 'j');
+    assert_eq!(app.selected, 1, "one press crosses the boundary");
+    assert_eq!(selected_path(&app), "c.txt");
+    assert_eq!(
+        app.diff_scroll.get(),
+        0,
+        "the arriving file leads the viewport"
+    );
+    assert_eq!(app.review_cursor(), 0);
+    assert_eq!(
+        cursor_target(&app),
+        RowTarget::FileHeader,
+        "the cursor lands on the arriving file's header row"
+    );
+
+    // The title is selection-driven and the selection *is* the anchor, so it reads
+    // the arriving file the moment its header leads the pane (§3.2a).
+    let (title, body) = frame(&app, H);
+    assert!(title.contains("c.txt"), "the title flipped: {title}");
+    let first = body_text(&body, 0);
+    assert!(first.contains("c.txt"), "the header row leads: {first}");
+}
+
+#[test]
+fn k_at_the_header_crosses_to_the_previous_files_tail() {
+    let repo = multi_status_repo(); // a.txt is tall, b.txt short
+    let mut app = rendered_app(&repo, config(true, false), H);
+    let prev_rows = app.diff_row_count(); // a.txt's layout, header included
+    let v = viewport_at(H);
+    assert!(prev_rows > v, "a.txt is deeper than the viewport");
+
     press(&mut app, 'j'); // select b.txt
-    assert_eq!(selected_path(&app), "b.txt");
     dump_frame(&app, W, H).unwrap();
-    press(&mut app, 'l'); // focus the diff (cursor at the top)
+    press(&mut app, 'l'); // focus the diff — the cursor rests on b.txt's header
+    assert_eq!(cursor_target(&app), RowTarget::FileHeader);
 
     press(&mut app, 'k');
-    assert_eq!(app.selected, 0, "k at the top crosses to the previous file");
+    assert_eq!(app.selected, 0, "k at the header crosses back");
     assert_eq!(selected_path(&app), "a.txt");
     assert_eq!(
         app.diff_scroll.get(),
-        usize::MAX,
-        "an up hop lands at the bottom"
+        prev_rows + 1 - v,
+        "bottom-aligned plus one strip row (§3.5)"
     );
-    dump_frame(&app, W, H).unwrap();
-    assert_eq!(app.review_cursor(), app.diff_row_count() - 1);
+    assert_eq!(
+        app.review_cursor(),
+        prev_rows - 1,
+        "the cursor is on the previous file's last target"
+    );
+
+    let (title, body) = frame(&app, H);
+    assert!(
+        title.contains("a.txt"),
+        "the title followed the anchor: {title}"
+    );
+    let bottom = body_text(&body, v - 1);
+    assert!(
+        bottom.contains("b.txt"),
+        "the departed file's header is visible at the bottom edge: {bottom}"
+    );
 }
 
 #[test]
 fn first_file_keyboard_up_clamps() {
     let repo = short_status_repo();
-    let mut app = app_for(&repo, config(true, false));
-    dump_frame(&app, W, H).unwrap();
+    let mut app = rendered_app(&repo, config(true, false), H);
     press(&mut app, 'l');
     press(&mut app, 'k'); // at the first file, top edge
     assert_eq!(app.selected, 0, "no wraparound off the first file");
+    assert_eq!(app.diff_scroll.get(), 0);
+    assert_eq!(app.review_cursor(), 0);
+}
+
+#[test]
+fn keyboard_j_and_k_with_cross_off_clamp() {
+    let repo = short_status_repo();
+    let mut app = rendered_app(&repo, config(false, false), H);
+    press(&mut app, 'l');
+    press(&mut app, 'G'); // the last stop of the first file
+    let last = app.review_cursor();
+    press(&mut app, 'j');
+    assert_eq!(app.selected, 0, "cross-off never crosses downward");
+    assert_eq!(
+        app.review_cursor(),
+        last,
+        "the cursor clamps at the last row"
+    );
+
+    press(&mut app, 'g'); // back to the first stop
+    assert_eq!(app.review_cursor(), 0);
+    press(&mut app, 'k');
+    assert_eq!(app.selected, 0, "cross-off never crosses upward");
+    assert_eq!(app.review_cursor(), 0, "the cursor clamps at the first row");
+    assert_eq!(app.diff_scroll.get(), 0);
 }
 
 #[test]
@@ -1168,14 +1245,14 @@ fn tall_wrapped_target_scrolls_internally_before_crossing() {
     press(&mut app, 'j');
     assert_eq!(
         app.selected, 0,
-        "no hop while there is more of the line to see"
+        "no crossing while there is more of the line to see"
     );
     assert!(
         app.diff_scroll.get() > before,
         "the step scrolled within the tall target"
     );
 
-    // Keep stepping: once the viewport reaches the hard edge, the next step hops.
+    // Keep stepping: once the viewport reaches the hard edge, the next step crosses.
     for _ in 0..500 {
         if app.selected != 0 {
             break;
@@ -1186,26 +1263,231 @@ fn tall_wrapped_target_scrolls_internally_before_crossing() {
     assert_eq!(
         app.diff_scroll.get(),
         0,
-        "the arriving file lands at the top"
+        "the arriving file leads the viewport"
+    );
+    assert_eq!(cursor_target(&app), RowTarget::FileHeader);
+}
+
+#[test]
+fn an_up_cross_onto_a_multi_row_last_target_shows_its_tail() {
+    let repo = init_repo();
+    write(repo.path(), "a.txt", "one\ntwo\n");
+    write(repo.path(), "b.txt", "x\ny\n");
+    let h = 10; // a 6-row viewport, shallower than the comment box below
+    let mut app = rendered_app(&repo, config(true, false), h);
+
+    // Anchor a five-line note to a.txt's last code row, so the box (several rows,
+    // one target) becomes that file's last stop.
+    press(&mut app, 'l');
+    press(&mut app, 'G');
+    press(&mut app, 'c');
+    assert!(app.editor_open(), "the comment editor opened");
+    for i in 0..5 {
+        typ(&mut app, &format!("note {i}"));
+        if i < 4 {
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        }
+    }
+    app.on_key(KeyEvent::from(KeyCode::Enter)); // save
+    dump_frame(&app, W, h).unwrap();
+
+    let v = viewport_at(h);
+    let prev_rows = app.diff_row_count();
+    let last_target = app.diff_layout(app.diff_area().width)[prev_rows - 1].target;
+    let box_start = app
+        .diff_layout(app.diff_area().width)
+        .iter()
+        .position(|row| row.target == last_target)
+        .unwrap();
+    assert!(
+        prev_rows - box_start > 1,
+        "the last target spans several physical rows"
+    );
+
+    press(&mut app, 'h'); // back to the file list
+    press(&mut app, 'j'); // select b.txt
+    dump_frame(&app, W, h).unwrap();
+    press(&mut app, 'l'); // focus the diff — the cursor rests on b.txt's header
+
+    press(&mut app, 'k');
+    assert_eq!(app.selected, 0, "crossed back into a.txt");
+    let offset = prev_rows + 1 - v;
+    assert_eq!(app.diff_scroll.get(), offset, "the §3.5 landing offset");
+    assert_eq!(
+        cursor_target(&app),
+        last_target,
+        "the cursor names the whole box"
+    );
+    assert!(
+        box_start < offset,
+        "the box starts above the viewport, so only its tail shows"
+    );
+    let (_, body) = frame(&app, h);
+    assert!(
+        body_text(&body, v - 1).contains("b.txt"),
+        "the departed header still holds the bottom edge"
     );
 }
 
 #[test]
-fn empty_binary_diff_keyboard_crossing() {
+fn an_empty_file_is_a_one_stop_section_the_keyboard_crosses_through() {
     let repo = init_repo();
+    write(repo.path(), "a.txt", "one\n");
     write(repo.path(), "bin.dat", "a\0b\0c\n"); // NUL bytes → a binary diff
     write(repo.path(), "z.txt", "text\n");
-    let mut app = app_for(&repo, config(true, false));
-    dump_frame(&app, W, H).unwrap();
-    assert_eq!(selected_path(&app), "bin.dat");
-    // With cross-file on the file-header row is the layout's only row: a binary
-    // diff still has no code rows, so it is a one-stop section (plan 006 §3.1).
-    assert_eq!(app.diff_row_count(), 1, "the header row and nothing else");
+    let mut app = rendered_app(&repo, config(true, false), H);
+    assert_eq!(selected_path(&app), "a.txt");
 
-    press(&mut app, 'l'); // focus the diff
-    press(&mut app, 'j'); // an empty diff is an immediate boundary
-    assert_eq!(app.selected, 1, "crossed off the empty diff");
+    press(&mut app, 'l');
+    press(&mut app, 'G'); // a.txt's last stop
+    press(&mut app, 'j');
+    assert_eq!(
+        selected_path(&app),
+        "bin.dat",
+        "crossed onto the binary file"
+    );
+    assert_eq!(
+        app.diff_row_count(),
+        1,
+        "with cross-file on its header row is the whole section"
+    );
+    assert_eq!(cursor_target(&app), RowTarget::FileHeader);
+    assert_eq!(app.diff_scroll.get(), 0);
+
+    dump_frame(&app, W, H).unwrap();
+    press(&mut app, 'j'); // a one-stop section: the next press crosses onward
     assert_eq!(selected_path(&app), "z.txt");
+    assert_eq!(app.review_cursor(), 0);
+
+    // Symmetric upward: back onto the one-stop section, then off it again.
+    dump_frame(&app, W, H).unwrap();
+    press(&mut app, 'k');
+    assert_eq!(selected_path(&app), "bin.dat");
+    assert_eq!(app.review_cursor(), 0, "its only stop");
+    dump_frame(&app, W, H).unwrap();
+    press(&mut app, 'k');
+    assert_eq!(selected_path(&app), "a.txt");
+    assert_eq!(
+        app.review_cursor(),
+        app.diff_row_count() - 1,
+        "the previous file's last target"
+    );
+}
+
+#[test]
+fn the_keyboard_crosses_a_staged_unstaged_same_path_boundary() {
+    // `dup.txt` is both staged and unstaged: two stream entries, one path, with
+    // different header markers — the landing must flip the marker.
+    let repo = init_repo();
+    let staged: String = (0..60).map(|i| format!("line {i}\n")).collect();
+    write(repo.path(), "dup.txt", &staged);
+    git(repo.path(), &["add", "dup.txt"]);
+    write(
+        repo.path(),
+        "dup.txt",
+        &format!("{staged}extra a\nextra b\n"),
+    );
+    let mut app = rendered_app(&repo, config(true, false), H);
+    assert_eq!(app.status.total(), 2, "staged and unstaged rows");
+    let staged_marker = anchor_header_marker(&app);
+    let staged_rows = app.diff_row_count();
+
+    press(&mut app, 'l');
+    press(&mut app, 'G'); // the staged entry's last stop
+    press(&mut app, 'j');
+    assert_eq!(
+        app.selected, 1,
+        "crossed into the same path's other section"
+    );
+    assert_eq!(selected_path(&app), "dup.txt");
+    assert_eq!(app.diff_scroll.get(), 0);
+    assert_eq!(cursor_target(&app), RowTarget::FileHeader);
+    assert_ne!(
+        anchor_header_marker(&app),
+        staged_marker,
+        "the header marker flips at the landing"
+    );
+
+    dump_frame(&app, W, H).unwrap();
+    press(&mut app, 'k');
+    assert_eq!(app.selected, 0, "and back the other way");
+    assert_eq!(anchor_header_marker(&app), staged_marker);
+    assert_eq!(
+        app.diff_scroll.get(),
+        staged_rows + 1 - viewport_at(H),
+        "the §3.5 landing offset, measured against the staged entry"
+    );
+}
+
+#[test]
+fn a_keypress_while_wheel_extended_snaps_back_to_the_cursor() {
+    let repo = handoff_repo(); // a.txt is tall, b.txt deep enough to follow it
+    let mut app = rendered_app(&repo, config(true, false), H);
+    press(&mut app, 'l');
+    for _ in 0..5 {
+        press(&mut app, 'j'); // the cursor sits mid-file
+    }
+    let cursor = app.review_cursor();
+    dump_frame(&app, W, H).unwrap();
+
+    // Wheel into the strip without crossing: `o ∈ (max, R]` (§3.5).
+    for _ in 0..16 {
+        wheel_down(&mut app);
+    }
+    assert_eq!(app.selected, 0, "still anchored on a.txt");
+    assert!(
+        app.diff_scroll.get() > app.diff_max_scroll(),
+        "the view is extended past the anchor's own bottom"
+    );
+    assert_eq!(
+        app.review_cursor(),
+        cursor,
+        "the wheel never moved the cursor"
+    );
+
+    press(&mut app, 'j');
+    assert_eq!(app.review_cursor(), cursor + 1, "the cursor stepped");
+    assert_eq!(
+        app.diff_scroll.get(),
+        cursor + 1,
+        "act-and-reveal snapped the viewport back to the cursor"
+    );
+}
+
+#[test]
+fn the_h_scroll_clamp_follows_a_keyboard_flip() {
+    let repo = init_repo();
+    write(repo.path(), "a.txt", &format!("{}\n", "x".repeat(400)));
+    write(repo.path(), "b.txt", "short\n");
+    let mut app = rendered_app(&repo, config(true, false), H);
+    let d = app.diff_area();
+    for _ in 0..4 {
+        app.on_mouse(mouse(d.x + 2, d.y + 2, MouseEventKind::ScrollRight));
+    }
+    let shifted = app.diff_hscroll;
+    assert!(shifted > 0, "a.txt is horizontally scrolled");
+    assert_eq!(app.effective_hscroll(), shifted);
+
+    press(&mut app, 'l');
+    press(&mut app, 'G');
+    press(&mut app, 'j'); // cross onto the short-lined b.txt
+    assert_eq!(selected_path(&app), "b.txt");
+    assert_eq!(
+        app.diff_hscroll, shifted,
+        "the offset itself is kept across the flip"
+    );
+    assert!(
+        app.effective_hscroll() < shifted,
+        "but it reads clamped against the arriving file's longest line"
+    );
+
+    dump_frame(&app, W, H).unwrap();
+    press(&mut app, 'k'); // back to the wide file
+    assert_eq!(
+        app.effective_hscroll(),
+        shifted,
+        "crossing back restores the full shift"
+    );
 }
 
 // --- refresh + editing safety ----------------------------------------------
@@ -1240,31 +1522,35 @@ fn no_crossing_while_the_editor_is_open() {
     assert!(app.editor_open(), "the editor stays open");
 }
 
-// --- keyboard: list-focused half page --------------------------------------
+// --- keyboard: list-focused half page (continuous, §3.5) -------------------
 
 #[test]
-fn list_focused_ctrl_d_at_bottom_crosses() {
-    let repo = multi_status_repo(); // a.txt (tall) is index 0, staging focused
-    let mut app = app_for(&repo, config(true, false));
-    dump_frame(&app, W, H).unwrap();
-    assert_eq!(app.selected, 0);
+fn list_focused_ctrl_d_streams_through_the_boundary() {
+    let repo = handoff_repo(); // a.txt tall, b.txt deep enough to lead the pane
+    let mut app = rendered_app(&repo, config(true, false), H);
+    let rows = stream_rows(&mut app, H);
+    let half = (viewport_at(H) / 2).max(1);
 
-    // Half-page down through the tall diff with the file list focused (the default).
-    for _ in 0..200 {
-        let max = app.diff_max_scroll();
-        if app.diff_scroll.get().min(max) >= max {
-            break;
-        }
+    // Every press advances exactly a half page in the flattened stream — no
+    // clamp-at-the-edge pause, no arming tick, and the cursor is never touched.
+    for press_no in 1..=7 {
         ctrl(&mut app, 'd');
-        assert_eq!(app.selected, 0, "must not cross before reaching the bottom");
+        assert_eq!(
+            flat_top(&app, &rows),
+            half * press_no,
+            "press {press_no} advanced one half page"
+        );
     }
-    ctrl(&mut app, 'd'); // pinned at the bottom → cross
-    assert_eq!(app.selected, 1, "list-focused ctrl-d at the bottom crosses");
+    assert_eq!(app.selected, 1, "the anchor flipped at the boundary");
+    assert_eq!(app.diff_scroll.get(), half * 7 - rows[0]);
+
+    ctrl(&mut app, 'u');
     assert_eq!(
-        app.diff_scroll.get(),
-        0,
-        "the arriving file lands at the top"
+        flat_top(&app, &rows),
+        half * 6,
+        "and back, just as continuous"
     );
+    assert_eq!(app.selected, 0, "the anchor flipped back");
 }
 
 #[test]
@@ -1284,20 +1570,27 @@ fn list_focused_half_page_disabled_clamps() {
 }
 
 #[test]
-fn review_list_focused_ctrl_d_crosses() {
-    let (_repo, mut app) = review_app(true); // list-focused by default
-    dump_frame(&app, W, H).unwrap();
+fn review_list_focused_ctrl_d_streams_through_the_boundary() {
+    let (_repo, mut app) = review_app(true);
+    let h = 8; // a 4-row viewport: the review's small diffs still form a stream
+    dump_frame(&app, W, h).unwrap();
     assert_eq!(app.review_selected(), 0);
+    let first_rows = app.diff_row_count();
+    let half = (viewport_at(h) / 2).max(1);
 
-    // The review diffs are short (already at the bottom), so a half-page press is
-    // pinned at the edge and crosses.
+    ctrl(&mut app, 'd');
+    assert_eq!((app.review_selected(), app.diff_scroll.get()), (0, half));
     ctrl(&mut app, 'd');
     assert_eq!(
         app.review_selected(),
         1,
-        "list-focused ctrl-d crosses in review"
+        "list-focused ctrl-d streams across the boundary"
     );
-    assert_eq!(app.diff_scroll.get(), 0);
+    assert_eq!(app.diff_scroll.get(), 2 * half - first_rows);
+
+    ctrl(&mut app, 'u');
+    assert_eq!(app.review_selected(), 0, "and back");
+    assert_eq!(app.diff_scroll.get(), half);
 }
 
 // --- Review view -----------------------------------------------------------
@@ -1349,4 +1642,48 @@ fn review_disabled_never_hops() {
         wheel_down(&mut app);
     }
     assert_eq!(app.review_selected(), 0, "disabled review never crosses");
+}
+
+#[test]
+fn review_keyboard_crosses_both_directions() {
+    let (_repo, mut app) = review_app(true);
+    let h = 8; // a 4-row viewport, so the up-cross has a strip row to show
+    dump_frame(&app, W, h).unwrap();
+    let v = viewport_at(h);
+    let first_rows = app.diff_row_count();
+    let first = app.review_files()[0].path.clone();
+    let second = app.review_files()[1].path.clone();
+
+    press(&mut app, 'l'); // focus the diff
+    press(&mut app, 'G'); // the first file's last stop
+    press(&mut app, 'j');
+    assert_eq!(app.review_selected(), 1, "one press crosses");
+    assert_eq!(app.diff_scroll.get(), 0);
+    assert_eq!(cursor_target(&app), RowTarget::FileHeader);
+    let (title, body) = frame(&app, h);
+    assert!(title.contains(&second), "the title flipped: {title}");
+    assert!(body_text(&body, 0).contains(&second));
+
+    press(&mut app, 'k');
+    assert_eq!(app.review_selected(), 0, "and back the other way");
+    assert_eq!(
+        app.diff_scroll.get(),
+        (first_rows + 1).saturating_sub(v),
+        "the §3.5 landing offset"
+    );
+    assert_eq!(
+        app.review_cursor(),
+        first_rows - 1,
+        "the cursor is on the previous file's last target"
+    );
+    let (title, body) = frame(&app, h);
+    assert!(
+        title.contains(&first),
+        "the title followed the anchor: {title}"
+    );
+    let bottom = body_text(&body, v - 1);
+    assert!(
+        bottom.contains(&second),
+        "the departed file's header holds the bottom edge: {bottom}"
+    );
 }

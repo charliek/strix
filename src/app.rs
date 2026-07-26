@@ -156,29 +156,6 @@ pub(crate) enum MenuCommand {
     ToggleChangesPanel,
 }
 
-/// Where a cross-file hop lands the arriving diff (plan §3.4): a downward hop
-/// shows the next file from its top; an upward hop shows the previous file from
-/// its bottom.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Placement {
-    Top,
-    Bottom,
-}
-
-/// Identifies the destination file a pending cross-file placement belongs to, so a
-/// refresh that moves the selection underneath a queued hop makes the placement
-/// inert instead of mis-applying it (plan §3.4 refresh safety). Keyed on identity
-/// that survives an index shift: Status on `(section, path)` (the section
-/// disambiguates a staged↔unstaged same-path hop), Review on `path`. The absolute
-/// index is deliberately *not* stored — a refresh that renumbers the list while the
-/// destination file survives must still apply, and the check reads the current
-/// selection's identity rather than a stale index.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum SelectionId {
-    Status { section: Section, path: String },
-    Review { path: String },
-}
-
 /// The recorded hit-map for the open dropdown, mirroring the `x_rects`
 /// interior-mutability pattern: the whole box's `bounds` plus one entry per
 /// **visible** row. Re-recorded every render and cleared to `None` when no menu
@@ -1036,11 +1013,6 @@ pub struct App {
     /// file's diff (Status + Review; History excluded). Off by default; from
     /// `Config.cross_file_scroll`, toggled with `f` (plan §3.4).
     pub cross_file_scroll: bool,
-    /// A queued cross-file placement: the destination the hop targets plus which
-    /// end (top/bottom) to land on. Consumed the next time the destination view's
-    /// diff syncs — applied when the selection still matches, dropped otherwise
-    /// (plan §3.4).
-    pending_diff_placement: Option<(SelectionId, Placement)>,
     /// Horizontal scroll offset for code content, in display columns (plan §3.5).
     /// Applies only when wrap is off; shifts unified content and both side-by-side
     /// cells by the same amount, never the gutters / sign / hunk headers / comment
@@ -1065,7 +1037,7 @@ pub struct App {
     max_line_width_compute_count: Cell<u64>,
     /// Count of per-file diff computations, bumped in `sync_diff` /
     /// `sync_review_diff`'s actual compute branches. A test-only observable
-    /// proving a cross-file hop computes exactly the destination file's diff
+    /// proving a cross-file crossing computes exactly the destination file's diff
     /// (laziness, plan §3.4). Not otherwise read.
     diff_compute_count: Cell<u64>,
     /// The open dropdown, or `None` when no menu is open. Opening is mouse-first
@@ -1270,7 +1242,6 @@ impl App {
             show_menu_bar: config.menu_bar(),
             wrap_lines: config.wrap_lines(),
             cross_file_scroll: config.cross_file_scroll(),
-            pending_diff_placement: None,
             diff_hscroll: 0,
             diff_generation: Cell::new(0),
             max_line_width: Cell::new(None),
@@ -1862,12 +1833,10 @@ impl App {
     fn review_move_cursor(&mut self, down: bool, step: usize) {
         let count = self.review_row_count();
         if count == 0 {
-            // An empty or binary diff has no code rows, so it is an immediate
-            // boundary in both directions: hop straight across if cross-file scroll
-            // is on (plan §3.4). The early return must not swallow that hop.
-            if self.cross_file_scroll && !self.editing() {
-                self.cross_file_hop(down);
-            }
+            // Only reachable with cross-file scroll off: with it on, the file-header
+            // row makes an empty or binary file a normal one-stop section rather
+            // than a rowless one (plan 006 §3.5), so crossing off it goes through
+            // the ordinary no-advance path below.
             return;
         }
         let current = self.review_cursor_target();
@@ -1886,17 +1855,19 @@ impl App {
         // cursor is already on the last (down) or first (up) target. With
         // cross-file scroll on, either scroll within a taller-than-viewport target
         // or, once the viewport is pinned at the hard edge, cross into the
-        // neighbouring file (plan §3.4). With it off this falls through to the
-        // plain reveal — today's clamping.
+        // neighbouring file in one press (plan 006 §3.5) — the residual step past
+        // the boundary is discarded. With it off, or at the first/last file, this
+        // falls through to the plain reveal — today's clamping.
         if target == current && self.cross_file_scroll && !self.editing() {
-            if self.at_hard_edge(down) {
-                self.cross_file_hop(down);
-            } else {
+            if !self.at_hard_edge(down) {
                 // Step within the tall target (cursor unchanged); Ctrl-d/u clamps
-                // toward the edge first, a later press then hops.
+                // toward the edge first, a later press then crosses.
                 self.scroll_diff(down, step.min(u16::MAX as usize) as u16);
+                return;
             }
-            return;
+            if self.cross_file_step(down) {
+                return;
+            }
         }
         self.set_review_cursor(target);
         self.review_reveal_cursor();
@@ -1913,17 +1884,21 @@ impl App {
     }
 
     /// A half-page scroll of the diff viewport while the *file list* is focused
-    /// (Status staging pane / Review list). With cross-file scroll on this crosses
-    /// at the boundary (FIX 4): a press already pinned at the hard edge hops, one
-    /// that merely reaches it clamps (a later press then hops) — the same "clamp
-    /// first, cross next" rule the diff-focused keyboard path uses, so it needs no
-    /// separate edge memory. With cross-file off, or in History, it is the plain
-    /// clamping scroll it always was.
+    /// (Status staging pane / Review list). The list has no diff cursor to move, so
+    /// with cross-file scroll on this is a plain wheel-sized tick in the stream
+    /// domain (plan 006 §3.5): continuous through a boundary, no clamp-then-cross
+    /// step, no cursor. With cross-file off, in History, or while editing, it is
+    /// the plain clamping scroll it always was.
     fn list_scroll_half_page(&mut self, down: bool) {
-        if self.cross_file_scroll && self.at_hard_edge(down) {
-            self.cross_file_hop(down);
+        let step = self.half_page();
+        if self.strip_anchor().is_some() {
+            self.wheel_scroll_window(if down {
+                i64::from(step)
+            } else {
+                -i64::from(step)
+            });
         } else {
-            self.scroll_diff(down, self.half_page());
+            self.scroll_diff(down, step);
         }
     }
 
@@ -3720,54 +3695,54 @@ impl App {
         }
     }
 
-    /// Cross into the neighbouring file's diff (plan §3.4): advance the selection
-    /// (down) or retreat it (up) and queue a placement so the arriving diff lands
-    /// at its top (down) or bottom (up). At the first/last file it clamps — no
-    /// wraparound, no placement. History is excluded (never a caller). No-op while
-    /// editing (a defensive guard; the keyboard callers are already exempt). Only
-    /// the keyboard reaches this since C3 — the wheel streams continuously
-    /// (`wheel_scroll_window`), and C4 retires the hop with the keyboard landings.
-    fn cross_file_hop(&mut self, down: bool) {
-        if self.editing() {
-            return;
-        }
-        let placement = if down {
-            Placement::Top
-        } else {
-            Placement::Bottom
+    /// Cross one file boundary with the keyboard, in one press (plan 006 §3.5).
+    /// Returns `false` at the first/last file (the caller clamps as before) and in
+    /// any view without a stream.
+    ///
+    /// Down lands `(next, 0)`: the arriving file's header row leads the viewport
+    /// and takes the cursor, which is the whole transition marker. Up lands the
+    /// previous file bottom-aligned **plus one strip row** — `R_prev + 1 - V`,
+    /// held to `R_prev` for a file shorter than the viewport — so the departed
+    /// file's own header row stays visible at the bottom edge, marking where the
+    /// cursor came from. That offset is legal only in the extended domain, so it
+    /// is set directly through `flip_anchor`; `review_reveal_cursor` would clamp
+    /// the strip row back off.
+    fn cross_file_step(&mut self, down: bool) -> bool {
+        let Some(anchor) = self.strip_anchor() else {
+            return false;
         };
-        match self.view {
-            ViewMode::Status => {
-                let total = self.status.total();
-                let Some(next) = neighbour_index(self.selected, total, down) else {
-                    return; // at the first/last file → clamp
-                };
-                self.selected = next;
-                // Record the destination's identity (section + path), not its index:
-                // a later refresh may renumber the list but keeps section + path.
-                let id = self
-                    .selected_file()
-                    .map(|(section, entry)| SelectionId::Status {
-                        section,
-                        path: entry.path.clone(),
-                    });
-                if let Some(id) = id {
-                    self.pending_diff_placement = Some((id, placement));
-                }
-            }
-            ViewMode::Review => {
-                let total = self.review_files().len();
-                let Some(next) = neighbour_index(self.review_selected(), total, down) else {
-                    return;
-                };
-                self.select_review_file(next);
-                let path = self.review_files().get(next).map(|file| file.path.clone());
-                if let Some(path) = path {
-                    self.pending_diff_placement = Some((SelectionId::Review { path }, placement));
-                }
-            }
-            ViewMode::History => {}
-        }
+        let Some(to) = neighbour_index(anchor, self.stream_len(), down) else {
+            return false; // first/last file → clamp, no wraparound
+        };
+        let width = self.diff_pane_width();
+        let height = self.diff_viewport.get();
+        // Laziness trigger: a keyboard cross needs exactly the destination
+        // (plan 006 §3.3), which `flip_anchor` then requires to be prepared.
+        let Some(section) = self.prepare_section(to, width) else {
+            return false;
+        };
+        let rows = section.rows.len();
+        let offset = if down {
+            0
+        } else {
+            rows.saturating_add(1)
+                .saturating_sub(height as usize)
+                .min(rows)
+        };
+        self.flip_anchor(to, offset);
+        // `flip_anchor` resets the cursor (a wheel flip carries none), so the
+        // keyboard's own landing is pinned afterwards — against the layout the flip
+        // installed, which is why the row index resolves to the arriving file's
+        // targets rather than the departed file's.
+        let row = if down {
+            0
+        } else {
+            self.review_row_count().saturating_sub(1)
+        };
+        let target = self.review_target_at(row);
+        self.set_review_cursor(target);
+        self.ensure_diff_window(width, height);
+        true
     }
 
     fn history_scroll(&mut self, pos: Position, down: bool) {
@@ -3944,19 +3919,6 @@ impl App {
     /// external refresh marked it dirty. Navigating to a different file resets
     /// the scroll; a same-file content refresh keeps it.
     fn sync_diff(&mut self) {
-        self.recompute_status_diff();
-        // A queued cross-file placement is consumed after any recompute so a Bottom
-        // placement reads the freshly-built layout, and it is reached even on the
-        // same-path cache-hit path (a staged↔unstaged section hop) — which the
-        // recompute's early returns would otherwise skip (plan §3.4).
-        self.apply_pending_placement();
-    }
-
-    /// The recompute half of [`App::sync_diff`]: rebuild the selected file's diff
-    /// on a file change or dirty flag. Split out (mirroring `recompute_review_diff`)
-    /// so placement always runs afterwards regardless of which early return this
-    /// takes.
-    fn recompute_status_diff(&mut self) {
         // Path only, not (section, path) — see the `diff_key` field doc.
         let key = self.selected_file().map(|(_, entry)| entry.path.clone());
         // The section is *not* part of the diff key, but it is part of the layout:
@@ -3976,8 +3938,8 @@ impl App {
         self.diff_dirty = false;
         // Compute into a local first so the immutable borrow of the file list
         // (and repo) is released before assigning the cached fields. The compute
-        // counter proves a cross-file hop touches only the destination file's diff
-        // (plan §3.4 laziness).
+        // counter proves a cross-file crossing touches only the destination
+        // file's diff (plan §3.4 laziness).
         let diff = self.selected_file().map(|(_, entry)| {
             self.diff_compute_count
                 .set(self.diff_compute_count.get() + 1);
@@ -4015,64 +3977,6 @@ impl App {
         // already reset the cursor above.
         if !file_changed {
             self.clamp_review_cursor();
-        }
-    }
-
-    /// Consume a queued cross-file placement, applied only when the current
-    /// selection still matches the destination the hop recorded, so a refresh that
-    /// moved the selection underneath a queued hop makes it inert (plan §3.4 refresh
-    /// safety). The token is always taken; one addressed to the inactive view is
-    /// dropped. Status keys on the flattened index + path, Review on the file index.
-    fn apply_pending_placement(&mut self) {
-        let Some((sel, placement)) = self.pending_diff_placement.take() else {
-            return;
-        };
-        // The check reads the *current* selection's identity, so it holds even if a
-        // refresh renumbered the list while the destination file survived (FIX 5).
-        let matches = match sel {
-            SelectionId::Status { section, path } => {
-                self.view == ViewMode::Status
-                    && self
-                        .selected_file()
-                        .is_some_and(|(s, entry)| s == section && entry.path == path)
-            }
-            SelectionId::Review { path } => {
-                self.view == ViewMode::Review
-                    && self
-                        .review_files()
-                        .get(self.review_selected())
-                        .is_some_and(|file| file.path == path)
-            }
-        };
-        if matches {
-            self.place_diff(placement);
-        }
-    }
-
-    /// Land the (already-selected) arriving diff at its top or bottom (plan §3.4).
-    /// Top resets the scroll and cursor to row 0. Bottom parks the scroll at the
-    /// `usize::MAX` sentinel (every reader clamps it to the real max, normalizing
-    /// on first clamp) and pins the cursor to the last physical row — read from the
-    /// freshly-built layout for the current diff.
-    fn place_diff(&mut self, placement: Placement) {
-        // Refresh the scroll metrics from the destination's freshly-built layout so
-        // a queued wheel tick drained in the same batch — the event loop drains all
-        // input before it redraws — sees the destination's real bounds, not the
-        // source file's stale metrics (FIX 1). Otherwise a keyboard fling could
-        // double-hop through a tall destination.
-        let width = self.diff_pane_width();
-        let count = self.diff_layout(width).len();
-        self.set_diff_metrics(self.diff_viewport.get(), count);
-        match placement {
-            Placement::Top => {
-                self.diff_scroll.set(0);
-                self.set_review_cursor(None);
-            }
-            Placement::Bottom => {
-                self.diff_scroll.set(usize::MAX);
-                let target = self.review_target_at(count.saturating_sub(1));
-                self.set_review_cursor(target);
-            }
         }
     }
 
@@ -4437,16 +4341,6 @@ impl App {
     /// `(base, head, path)` so a moved tip refreshes the same file's diff. Clears
     /// the cache when the range is empty (nothing selected).
     fn sync_review_diff(&mut self) {
-        self.recompute_review_diff();
-        // Consume a queued Review-view placement after any recompute, so a Bottom
-        // placement reads the freshly-built layout (plan §3.4).
-        self.apply_pending_placement();
-    }
-
-    /// The recompute half of [`App::sync_review_diff`]: rebuild the selected file's
-    /// diff on a cache miss. Split out so placement always runs afterwards
-    /// regardless of which early return the recompute takes.
-    fn recompute_review_diff(&mut self) {
         if self.view != ViewMode::Review {
             return;
         }
@@ -4529,7 +4423,7 @@ impl App {
     /// Reset the diff pane to the top and drop the per-file render caches, which
     /// describe the diff being replaced. A different diff also starts unshifted
     /// (Review/History file changes route through here; Status resets h-scroll in
-    /// `recompute_status_diff`'s file-changed branch — plan §3.5).
+    /// `sync_diff`'s file-changed branch — plan §3.5).
     fn reset_diff_view(&mut self) {
         self.diff_scroll.set(0);
         self.diff_hscroll = 0;
@@ -4901,10 +4795,10 @@ impl App {
 
     /// The stored offset read as a stream position. An offset *past* the anchor's
     /// last row is never a legal extended position — renormalization keeps
-    /// `o <= R_anchor` (plan 006 §3.2a) — so it can only be a stale park: the
-    /// keyboard bottom-placement sentinel, or an offset a shrunken relayout left
-    /// behind. Both read as the anchor-domain bottom, exactly as they did before
-    /// the domain was extended.
+    /// `o <= R_anchor` (plan 006 §3.2a) and every flip sets an offset from a known
+    /// layout — so it can only be what a shrunken relayout left behind, and it
+    /// reads as the anchor-domain bottom, exactly as it did before the domain was
+    /// extended. Defensive, not a protocol.
     fn stream_offset(&self, rows: usize, viewport: usize) -> usize {
         let stored = self.diff_scroll.get();
         if stored > rows {
@@ -5135,8 +5029,7 @@ impl App {
         // Build the layout before reading the offset: a relayout queued earlier in
         // this batch re-anchors `diff_scroll`, and the tick must move from the
         // settled value. Starting from `paint_offset` — what the last frame drew —
-        // is what makes a tick continuous with the picture on screen, and it
-        // normalizes the keyboard bottom-placement sentinel out of the arithmetic.
+        // is what makes a tick continuous with the picture on screen.
         let anchor_rows = self.diff_layout(width).len();
         let mut offset = self.paint_offset(anchor_rows, viewport) as i64 + delta;
 
@@ -5252,8 +5145,8 @@ impl App {
         // *new* file's longest line.
         self.bump_diff_generation();
         self.diff_scroll.set(new_offset);
-        // Drained-batch rule (mirroring `place_diff`): a tick queued behind this
-        // one, drained before any redraw, must clamp against the new file's bounds.
+        // Drained-batch rule: a tick queued behind this one, drained before any
+        // redraw, must clamp against the new file's bounds.
         self.set_diff_metrics(self.diff_viewport.get(), section.rows.len());
         self.prune_highlight_cache();
     }
@@ -5759,8 +5652,8 @@ impl App {
     }
 
     /// Count of per-file diff computations so far (Status + Review). A test-only
-    /// observable proving a cross-file hop computes exactly the destination file's
-    /// diff — nothing eager (plan §3.4 laziness).
+    /// observable proving a cross-file crossing computes exactly the destination
+    /// file's diff — nothing eager (plan §3.4 laziness).
     #[doc(hidden)]
     pub fn diff_compute_count(&self) -> u64 {
         self.diff_compute_count.get()
@@ -5808,8 +5701,8 @@ impl App {
     }
 
     /// The number of physical rows the active diff's layout renders (needs a
-    /// prior render so the pane width is known). A test-only observable so a
-    /// cross-file hop's Bottom landing can be pinned to the last row.
+    /// prior render so the pane width is known). A test-only observable so an
+    /// up-crossing's landing can be pinned to the previous file's last row.
     #[doc(hidden)]
     pub fn diff_row_count(&self) -> usize {
         self.review_row_count()
@@ -6049,7 +5942,7 @@ impl App {
     ///   `(0, 1)` span fallback would make the next `j` skip physical row 0;
     /// - the row count changes by one, so the scroll metrics a same-batch wheel
     ///   tick or click clamps against are stale until the next render (the same
-    ///   drained-batch rule `place_diff` follows).
+    ///   drained-batch rule [`App::flip_anchor`] follows).
     fn set_cross_file_scroll(&mut self, on: bool) {
         self.cross_file_scroll = on;
         if !on && self.active_pane().and_then(|pane| pane.cursor) == Some(RowTarget::FileHeader) {
@@ -6763,7 +6656,7 @@ fn col_at_display(line: &str, target: usize) -> usize {
 
 /// The neighbouring selection index in `[0, total)`: the next one going down, the
 /// previous going up. `None` at the boundary (last going down, first going up) or
-/// an empty list — a cross-file hop clamps there rather than wrapping (plan §3.4).
+/// an empty list — a keyboard cross clamps there rather than wrapping (plan §3.4).
 fn neighbour_index(current: usize, total: usize, down: bool) -> Option<usize> {
     if total == 0 {
         return None;
