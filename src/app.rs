@@ -606,6 +606,59 @@ impl DiffWindow {
     }
 }
 
+/// One row of the per-frame window hit map (plan 006 §3.6): which stream file a
+/// screen row belongs to and which of that file's own [`RowTarget`]s it draws,
+/// plus whether the row is the anchor segment's or a strip segment's. Recorded
+/// by the renderer straight from the same [`DiffWindow`] segment list it draws,
+/// mirroring the `x_rects`/`diff_area` interior-mutability pattern.
+///
+/// A click resolves against this instead of `diff_row_at`'s anchor-layout-only
+/// arithmetic, which is what makes a strip row — inert since C3 — clickable: an
+/// `is_anchor` hit still delegates to the unchanged `hit_target`/`diff_row_at`
+/// path (only strip rows need the new handling), and a row in the shortfall
+/// region (below the last row the window drew) has no entry at all.
+#[derive(Clone)]
+pub(crate) struct WindowHit {
+    /// The row's stream identity — `None` only where the window has no stream
+    /// entry at all (History, or an empty file list); always an anchor row.
+    pub(crate) id: Option<FileId>,
+    /// The target within `id`'s own layout this row draws.
+    pub(crate) target: RowTarget,
+    pub(crate) is_anchor: bool,
+}
+
+/// The state signature a [`WindowHit`] map was recorded against. The event
+/// loop drains a whole batch (wheel, resize, toggles, a refresh, a click)
+/// before the next redraw, so a click can be processed several state changes
+/// after the frame that recorded the map — a flip, a scroll, a relayout, a
+/// relist, or a view change all shift which screen row means what. Unlike
+/// `x_rects` (a stale comment rect is caught because the click still resolves
+/// against the *current* layout before acting), a window-hit lookup drives
+/// `strip_click` directly, so staleness has to be caught up front: any field
+/// mismatch between record time and lookup time means "something happened
+/// in between," and the map is treated as absent rather than trusted.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct WindowEpoch {
+    layout_generation: u64,
+    stream_generation: u64,
+    view: ViewMode,
+    /// The anchor-domain scroll offset — not just the flip-only
+    /// `layout_generation` — so a plain same-file scroll (no flip, no
+    /// relayout) is caught too.
+    offset: usize,
+    diff_area: Rect,
+}
+
+/// The current frame's window hit map, plus the [`WindowEpoch`] it was built
+/// against (plan 006 §3.6). `Default` is the pre-first-render state: no
+/// epoch, so the very first lookup (before anything has ever rendered) misses
+/// cleanly rather than matching a placeholder.
+#[derive(Default)]
+struct WindowHitMap {
+    epoch: Option<WindowEpoch>,
+    rows: Vec<WindowHit>,
+}
+
 /// How a comment box is placed when building its rows: full-width (unified, or an
 /// orphan block) at the given width, or into one side-by-side column (the side is
 /// taken from the comment's own anchor side).
@@ -1099,6 +1152,15 @@ pub struct App {
     /// Reset (`None`) after a recognized double-click, a consumed `[x]`, any drag
     /// or scroll, and any click that isn't a plain diff-row single click.
     last_click: Option<(Instant, HitTarget)>,
+    /// The current frame's window hit map (plan 006 §3.6): one [`WindowHit`] per
+    /// drawn row, top to bottom, recorded by the renderer alongside `x_rects`,
+    /// tagged with the [`WindowEpoch`] it was recorded under so a click drained
+    /// after a later state change (in the same input batch, no redraw between)
+    /// can detect the staleness instead of acting on it. Empty whenever the
+    /// window has nothing drawn (the early-return no-diff frame) or, off
+    /// cross-file scroll / in History, holds only anchor rows — so a click
+    /// always falls through to the unchanged path there.
+    window_hits: RefCell<WindowHitMap>,
 
     /// The status view's worktree-comment inbox (the checked-out branch's
     /// `Scope::WorkTree` set) and its diff-pane cursor/editor. Status has no
@@ -1259,6 +1321,7 @@ impl App {
             layout: RefCell::new(None),
             layout_generation: Cell::new(0),
             last_click: None,
+            window_hits: RefCell::new(WindowHitMap::default()),
             status_comments: Vec::new(),
             status_branch_key,
             status_pane: DiffPaneState::default(),
@@ -3282,6 +3345,22 @@ impl App {
             return;
         }
 
+        // A click on a strip row selects that file and places the cursor on
+        // the clicked target (plan 006 §3.6), resolved from the per-frame
+        // window hit map — `diff_row_at`/`hit_target` only ever resolve rows
+        // inside the *anchor's* own layout, which is what keeps a strip row
+        // click-inert otherwise. An anchor-row hit (or no hit at all: outside
+        // the diff pane, History, or the shortfall region) falls through to
+        // the unchanged path below. Never a double-click candidate, so the
+        // tracker is cleared like every other fully-consumed click.
+        if let Some(hit) = self.window_hit_at(pos) {
+            if !hit.is_anchor {
+                self.strip_click(hit);
+                self.last_click = None;
+                return;
+            }
+        }
+
         let target = self.hit_target(pos);
         // The `[x]` close cell deletes its note on a single click, handled before
         // the double-click logic and resetting the tracker so the next click can't
@@ -3425,6 +3504,38 @@ impl App {
             let target = self.review_target_at(row);
             self.set_review_cursor(target);
         }
+    }
+
+    /// Handle a left-click on a strip row (plan 006 §3.6): select that file
+    /// through the same prepared-section path the keyboard cross uses
+    /// (`flip_anchor`) — the row was drawn this frame, so its section is
+    /// already prepared and the flip never recomputes — then place the cursor
+    /// on the clicked target and reveal. A strip click is a jump, not a
+    /// scroll: like a list click, the view reorients around the new cursor
+    /// rather than preserving the old offset.
+    ///
+    /// Two defensive checks, both for a section that vanished between "the
+    /// row was drawn" and "the click resolved" (a `window_hit_at` epoch
+    /// mismatch already screens out most such staleness, but a same-frame
+    /// invalidation with the epoch still intact is conceivable): a failed
+    /// flip is a full no-op (nothing moved, so acting on `hit.target` would
+    /// resolve against whichever file is still selected); a successful flip
+    /// whose installed layout no longer contains `hit.target` (the file's own
+    /// content changed shape) resets the cursor to the top instead of pinning
+    /// a target that isn't there.
+    fn strip_click(&mut self, hit: WindowHit) {
+        let Some(id) = hit.id else { return };
+        let Some(index) = self.stream_index_of(&id) else {
+            return;
+        };
+        if !self.flip_anchor(index, 0) {
+            return;
+        }
+        self.focus_active_diff();
+        let target_resolves = self.review_index_of(hit.target).is_some();
+        self.set_review_cursor(target_resolves.then_some(hit.target));
+        self.review_reveal_cursor();
+        self.ensure_diff_window(self.diff_pane_width(), self.diff_viewport.get());
     }
 
     /// Route a left-button press that isn't consumed by the editor: grab a split
@@ -3729,7 +3840,12 @@ impl App {
                 .saturating_sub(height as usize)
                 .min(rows)
         };
-        self.flip_anchor(to, offset);
+        if !self.flip_anchor(to, offset) {
+            // The section prepared above vanished before the flip could seed it
+            // (an invalidation drained in between) — stay put rather than pin a
+            // cursor against whichever file is still selected.
+            return false;
+        }
         // `flip_anchor` resets the cursor (a wheel flip carries none), so the
         // keyboard's own landing is pinned afterwards — against the layout the flip
         // installed, which is why the row index resolves to the arriving file's
@@ -4740,6 +4856,19 @@ impl App {
         self.stream_file_id(self.stream_position()?)
     }
 
+    /// The stream index of `id` — the reverse of `stream_file_id`, and what
+    /// lets a strip click (identified by [`FileId`], plan 006 §3.6) find the
+    /// index `flip_anchor` takes.
+    fn stream_index_of(&self, id: &FileId) -> Option<usize> {
+        match id {
+            FileId::Status { section, path } => self.index_of(*section, path),
+            FileId::Review { path } => self
+                .review_files()
+                .iter()
+                .position(|file| file.path == *path),
+        }
+    }
+
     /// Compute one file's section: its diff plus the rows built from that diff at
     /// the current layout key. The only place a *non-selected* file's diff is read,
     /// and it runs on the event path (`ensure_diff_window`) — never during render.
@@ -5084,8 +5213,10 @@ impl App {
         let offset = offset.max(0) as usize;
         if index == anchor {
             self.diff_scroll.set(offset);
-        } else {
-            self.flip_anchor(index, offset);
+        } else if !self.flip_anchor(index, offset) {
+            // The destination's section vanished between the fill loop above
+            // and here — stay on the current anchor rather than half-apply.
+            return;
         }
         self.ensure_diff_window(width, height);
     }
@@ -5097,13 +5228,18 @@ impl App {
     /// A wheel flip carries no cursor; the border title follows the selection, so
     /// the one-row-past-the-top handoff falls out of *when* this is called.
     ///
-    /// A no-op if `to` has no prepared section: callers ensure first.
-    fn flip_anchor(&mut self, to: usize, new_offset: usize) {
+    /// Returns `false` — a no-op, nothing touched — if `to` has no prepared
+    /// section under the current key/generation; callers ensure first, but
+    /// must still check the return: a section can vanish between "ensure" and
+    /// "flip" (a queued invalidation drained in between), and installing the
+    /// caller's cursor/offset against whichever file is still selected would
+    /// silently resolve against the wrong layout.
+    fn flip_anchor(&mut self, to: usize, new_offset: usize) -> bool {
         let width = self.diff_pane_width();
         let key = self.layout_key(width);
         let generation = self.stream_generation.get();
         let Some((id, section)) = self.prepared_section(to, key, generation) else {
-            return;
+            return false;
         };
         // Retire the file being left into the cache *before* the selection moves,
         // so scrolling back across the boundary re-reads it instead of recomputing
@@ -5149,6 +5285,7 @@ impl App {
         // redraw, must clamp against the new file's bounds.
         self.set_diff_metrics(self.diff_viewport.get(), section.rows.len());
         self.prune_highlight_cache();
+        true
     }
 
     /// Store the current anchor's diff + built rows as its stream section, so the
@@ -5848,6 +5985,52 @@ impl App {
     pub fn comment_close_rect(&self, id: u64) -> Option<Rect> {
         self.active_pane()
             .and_then(|pane| pane.x_rects.borrow().get(&id).copied())
+    }
+
+    /// Record this frame's window hit map (plan 006 §3.6): one [`WindowHit`]
+    /// per drawn row, top to bottom — the same order `out` is built in, so
+    /// index `k` here is screen row `diff_area.y + k`. Mirrors `set_x_rects`,
+    /// plus the [`WindowEpoch`] snapshot `window_hit_at` validates a later
+    /// lookup against — captured here, in the same render pass that just
+    /// built `hits`, so it's exactly the state the rows describe.
+    pub(crate) fn set_window_hits(&self, hits: Vec<WindowHit>) {
+        *self.window_hits.borrow_mut() = WindowHitMap {
+            epoch: Some(self.window_epoch()),
+            rows: hits,
+        };
+    }
+
+    /// The state signature a window hit map is valid for right now — see
+    /// [`WindowEpoch`]. Read both when recording (during render) and when
+    /// looking up (at click time); any field drifting between the two calls
+    /// means the map predates something that happened since.
+    fn window_epoch(&self) -> WindowEpoch {
+        WindowEpoch {
+            layout_generation: self.layout_generation.get(),
+            stream_generation: self.stream_generation.get(),
+            view: self.view,
+            offset: self.diff_scroll.get(),
+            diff_area: self.diff_area.get(),
+        }
+    }
+
+    /// The window hit map entry for a screen position, or `None` outside the
+    /// diff pane, past the last row the window drew (the shortfall region), or
+    /// when the map predates a state change since its render — a click drained
+    /// after a flip/scroll/relayout/relist/view-change in the same input batch
+    /// falls through to the always-safe anchor-only path instead of acting on
+    /// stale row associations (plan 006 §3.6, correctness review finding 1).
+    fn window_hit_at(&self, pos: Position) -> Option<WindowHit> {
+        let diff = self.diff_area.get();
+        if !diff.contains(pos) {
+            return None;
+        }
+        let map = self.window_hits.borrow();
+        if map.epoch != Some(self.window_epoch()) {
+            return None;
+        }
+        let row = (pos.y - diff.y) as usize;
+        map.rows.get(row).cloned()
     }
 
     /// The persisted staging list state; rendering borrows it so the scroll

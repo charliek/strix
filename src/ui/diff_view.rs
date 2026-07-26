@@ -10,7 +10,7 @@ use syntect::parsing::SyntaxReference;
 
 use crate::app::{
     sbs_columns, App, BoxPart, BoxRow, EditorPart, FileHeaderRow, LayoutRow, PairCell,
-    PairEmphasis, RowContent, Seg,
+    PairEmphasis, RowContent, Seg, WindowHit,
 };
 use crate::comments::Side;
 use crate::git::{DiffLine, FileDiff, LineKind};
@@ -139,6 +139,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     // click can't hit them.
     if !is_text && layout.is_empty() && window.rows() == 0 {
         app.set_x_rects(HashMap::new());
+        app.set_window_hits(Vec::new());
         centered_hint(
             frame,
             inner,
@@ -160,6 +161,9 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     // Strip comment boxes render, but record no close rects: `[x]` is anchor-only
     // in v1 (plan 006 §3.4).
     let mut strip_rects: HashMap<u64, Rect> = HashMap::new();
+    // The window hit map (plan 006 §3.6): one entry per row this loop pushes to
+    // `out`, in the same order, so index `k` here lines up with `out[k]`.
+    let mut window_hits: Vec<WindowHit> = Vec::new();
     for segment in &window.segments {
         // Each segment draws from its own file's rows and diff lines, with its own
         // syntax, gutter width, and content width — the same values that file gets
@@ -238,9 +242,15 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
                     .as_ref()
                     .is_some_and(|span| span.contains(&(segment.row_range.start + k)));
             out.push(mark_cursor_row(line, in_cursor, theme));
+            window_hits.push(WindowHit {
+                id: segment.id.clone(),
+                target: row.target,
+                is_anchor,
+            });
         }
     }
     app.set_x_rects(x_rects);
+    app.set_window_hits(window_hits);
 
     // A no-text diff (binary / empty) still surfaces its orphan boxes; the hint
     // follows them when there's vertical room (finding 2), exactly as the old
