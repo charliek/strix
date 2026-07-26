@@ -8,11 +8,12 @@ Each release below is headed by a `## vX.Y.Z` entry added by
 `/release-workflows:release`; `release.yml` turns that section into the GitHub
 Release notes.
 
-## Unreleased
+## v0.0.7 — 2026-07-26
 
-Milestone 11 — continuous cross-file scroll: the arm-then-hop pause is gone.
-Milestone 13 — the cursor can now walk into a following file on its own,
-independent of which file is selected.
+Milestones 11–13 — the diff pane becomes one continuous stream: files flow past
+with their own inline headers, the cursor can walk ahead of the selection into a
+following file, and a neighbouring file's comment boxes are live. Merged via #15,
+#16 and #18.
 
 ### Added
 - **The keyboard walks the stream** — with cross-file scroll (`f`) on,
@@ -48,6 +49,14 @@ independent of which file is selected.
   jumped the view to its top. The click now moves nothing else (no flip, no
   reveal, no selection or title change); the file is only selected once you
   act on it (stage, comment, etc.), consistent with the keyboard walk above.
+
+### Internal
+- **Less cache churn while editing** — the diff pane's per-file section cache is
+  now retired exactly once per mutation. Typing in the comment editor no longer
+  discards every neighbouring file's computed diff and re-reads it on the next
+  frame.
+- Dead click-routing types (`HitRegion`, `LayoutRow.hit`) removed, and test
+  helpers duplicated across ~20 suites consolidated into `tests/common`.
 
 ## v0.0.6 — 2026-07-24
 
