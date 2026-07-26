@@ -224,8 +224,8 @@ Review have a cursor (History reuses the rendering, not the input model). The
 cursor addresses a **logical** `RowTarget` — `Code(diff_index)`,
 `Comment(id)`, or `Orphan(id)` — never a raw row index. A separate, **physical**
 layout (`Vec<LayoutRow>`, each row carrying its `RowTarget`, a `subrow` index,
-an optional side-by-side column, a click `HitRegion`, and its render content)
-is rebuilt from that target list for the current pane width and diff/comments
+an optional side-by-side column, and its render content) is rebuilt from that
+target list for the current pane width and diff/comments
 generation; a code line is exactly one `LayoutRow` when line wrap is off, or
 one per display-wrapped segment when it's on (see **Line wrap** below), and a
 comment box or the in-place editor is several (border / title / body) sharing
@@ -233,7 +233,10 @@ one target either way. Consequences of the split: `j`/`k` move between
 *targets*, crossing a multi-row box — or a wrapped line — in a single step;
 scroll offset and content-height metrics count physical rows; the cursor
 highlight spans every physical row of the selected target; and a resize
-rebuilds the layout while preserving the logical target the cursor was on.
+rebuilds the layout while preserving the logical target the cursor was on. A
+`LayoutRow` carries no click information of its own — a click resolves through
+the per-frame maps the renderer records instead (`HitTarget`/`ClickRegion` for
+the anchor, the `WindowHit` map for strip rows; see **Mouse** below).
 `DiffPaneState` (the cursor, the open in-place editor if any, and the comment
 boxes' `[x]` click rects recorded during render) is owned per view that *has*
 a cursor — Status and Review each get their own; the scroll offset, the
@@ -269,8 +272,8 @@ same-file refresh preserves it, matching `diff_scroll`'s convention.
 
 **Cross-file scroll.** With `cross_file_scroll` on (key `f`; Status and
 Review only — History is excluded and never crossed), every file's layout
-gains a `FileHeaderRow` at row 0 (`RowContent::FileHeader` /
-`RowTarget::FileHeader` / `HitRegion::FileHeader`) — one physical row, always
+gains a `FileHeaderRow` at row 0 (`RowContent::FileHeader`, addressed as
+`RowTarget::FileHeader`) — one physical row, always
 truncated rather than wrapped, never h-shifted — built once from the same
 `stat_spans` core the review/history file lists use, never re-derived per
 frame; `LayoutKey` gains `cross_file`, so toggling `f` rebuilds the layout.
