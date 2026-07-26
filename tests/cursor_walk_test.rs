@@ -22,13 +22,13 @@ use std::time::Instant;
 
 use common::{
     app_for, click, config, ctrl, dump, git, head_oid, init_repo, pane_title, prepare_window,
-    press, render_buffer, seed_store, staged, tab, unstaged, window_of, write,
+    press, render_buffer, seed_store, staged, strix_dir, tab, unstaged, window_of, write,
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
-use strix::app::{App, CursorAddress, FileId, RowTarget};
-use strix::comments::{Comment, Scope, Side, Source};
+use strix::app::{App, CursorAddress, FileId, Modal, RowTarget};
+use strix::comments::{self, Comment, Scope, Side, Source};
 use strix::crossterm::event::MouseEventKind;
 use tempfile::TempDir;
 
@@ -1377,4 +1377,434 @@ fn a_reveal_triggered_flip_keeps_the_very_same_address() {
     assert_eq!(app.selected, 1, "which happened: the anchor moved");
     assert!(!app.cursor_divergent(), "so the address is converged now");
     assert!(title(&app).contains("b.txt"), "{}", title(&app));
+}
+
+// --- flip-then-act convergence (plan 007 §3.3g) -----------------------------
+
+/// A worktree comment on `b.txt`'s first added line — a box in the *strip*, the
+/// only place a divergent cursor can rest on one.
+fn note_on_b(base: &str) -> Comment {
+    Comment {
+        id: 2,
+        file: "b.txt".to_string(),
+        line: 1,
+        context: Some("b one".to_string()),
+        ..note_on_a(base)
+    }
+}
+
+/// The comments recorded for the repo's branch.
+fn stored_notes(repo: &TempDir) -> Vec<Comment> {
+    let store = comments::load(&strix_dir(repo.path())).expect("the store parses");
+    store
+        .branches
+        .get("main")
+        .map(|branch| branch.comments.clone())
+        .unwrap_or_default()
+}
+
+/// Park `app` with a divergent cursor on the comment box `note_on_b` places in
+/// the strip.
+fn diverged_on_bs_note(repo: &TempDir) -> App {
+    let mut app = diff_focused_app(repo);
+    let placed = app.place_cursor(address(unstaged("b.txt"), RowTarget::Comment(2)));
+    assert!(placed, "the note's box is one of b.txt's own rows");
+    app
+}
+
+#[test]
+fn space_stages_the_file_the_cursor_walked_into() {
+    let repo = two_short_files();
+    let mut app = diverged_on_b(&repo);
+    assert_eq!(common::selected_path(&app), "a.txt", "anchored on a.txt");
+
+    press(&mut app, ' ');
+
+    assert!(
+        app.status.staged.iter().any(|entry| entry.path == "b.txt"),
+        "the cursor's file was staged"
+    );
+    assert!(
+        app.status.staged.iter().all(|entry| entry.path != "a.txt"),
+        "the anchor's was not"
+    );
+    assert_eq!(
+        common::selected_path(&app),
+        "b.txt",
+        "and the selection followed the cursor there"
+    );
+    assert!(!app.cursor_divergent(), "converged");
+    assert!(title(&app).contains("b.txt"), "{}", title(&app));
+}
+
+#[test]
+fn s_and_u_both_follow_the_cursor_into_the_strip() {
+    let repo = two_short_files();
+    let mut app = diverged_on_b(&repo);
+
+    press(&mut app, 's');
+    assert!(app.status.staged.iter().any(|entry| entry.path == "b.txt"));
+
+    // The cursor converged on b.txt with the stage, so `u` acts on it too.
+    press(&mut app, 'u');
+    assert!(app.status.staged.is_empty());
+    assert!(app
+        .status
+        .unstaged
+        .iter()
+        .any(|entry| entry.path == "b.txt"));
+}
+
+#[test]
+fn staging_with_a_converged_cursor_is_unchanged() {
+    let repo = two_short_files();
+    let mut app = diff_focused_app(&repo);
+    press(&mut app, 'j'); // move inside the anchor: still converged
+    assert!(!app.cursor_divergent());
+
+    press(&mut app, ' ');
+
+    assert!(
+        app.status.staged.iter().any(|entry| entry.path == "a.txt"),
+        "the selected file, exactly as before the walk existed"
+    );
+    assert_eq!(common::selected_path(&app), "a.txt");
+}
+
+#[test]
+fn a_list_focused_action_after_a_walk_uses_the_list_selection() {
+    let repo = two_short_files();
+    let mut app = diverged_on_b(&repo);
+
+    app.on_key(tab()); // focus leaves the diff — §3.3b sweeps the divergence
+    assert!(!app.cursor_divergent());
+    press(&mut app, ' ');
+
+    assert!(
+        app.status.staged.iter().any(|entry| entry.path == "a.txt"),
+        "the list selection acts, not the file the cursor had walked into"
+    );
+}
+
+#[test]
+fn c_on_a_divergent_code_row_comments_on_that_file_at_that_line() {
+    // The mis-anchor regression: before convergence, `c` paired the cursor's row
+    // index with the *anchor's* path and lines.
+    let repo = two_short_files();
+    let mut app = diverged_on_b(&repo); // b.txt's "b two" row
+
+    press(&mut app, 'c');
+    assert!(app.editor_open(), "the editor opened");
+    assert!(!app.cursor_divergent(), "and only ever opens converged");
+    assert_eq!(common::selected_path(&app), "b.txt");
+
+    for ch in "walked here".chars() {
+        press(&mut app, ch);
+    }
+    app.on_key(common::enter());
+
+    let stored = stored_notes(&repo);
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].text, "walked here");
+    assert_eq!(
+        stored[0].file, "b.txt",
+        "the walked-into file, not the anchor"
+    );
+    assert_eq!(stored[0].line, 2, "at the line the cursor stood on");
+    assert_eq!(stored[0].context.as_deref(), Some("b two"));
+}
+
+#[test]
+fn c_on_an_ineligible_divergent_row_flashes_without_flipping() {
+    let repo = two_short_files();
+    let mut app = diff_focused_app(&repo);
+    let before = body(&app);
+
+    // b.txt's file header and its `@@` row (a `Code` target `anchor_for_line`
+    // refuses): both flash today, so both must flash *without* the view first
+    // reorienting onto b.txt (plan 007 §3.3g step 3).
+    for target in [RowTarget::FileHeader, RowTarget::Code(0)] {
+        assert!(app.place_cursor(address(unstaged("b.txt"), target)));
+        press(&mut app, 'c');
+
+        assert_eq!(
+            app.flash.as_ref().map(|flash| flash.text.as_str()),
+            Some("can't comment here"),
+            "{target:?}"
+        );
+        assert!(!app.editor_open(), "{target:?}");
+        assert!(
+            app.cursor_divergent(),
+            "no flip for an ineligible row: {target:?}"
+        );
+        assert_eq!(common::selected_path(&app), "a.txt", "{target:?}");
+        assert_eq!(app.diff_scroll.get(), 0, "{target:?}");
+        assert_eq!(body(&app), before, "nor any view movement: {target:?}");
+    }
+}
+
+#[test]
+fn c_on_a_divergent_agent_note_flashes_without_flipping() {
+    let repo = two_short_files();
+    let base = head_oid(repo.path());
+    let agent = Comment {
+        source: Source::Agent,
+        ..note_on_b(&base)
+    };
+    seed_store(repo.path(), "main", None, vec![agent]);
+    let mut app = diverged_on_bs_note(&repo);
+    let before = body(&app);
+
+    press(&mut app, 'c');
+
+    assert_eq!(
+        app.flash.as_ref().map(|flash| flash.text.as_str()),
+        Some("agent note — read-only")
+    );
+    assert!(!app.editor_open());
+    assert!(
+        app.cursor_divergent(),
+        "a read-only note never flips the view"
+    );
+    assert_eq!(common::selected_path(&app), "a.txt");
+    assert_eq!(body(&app), before);
+}
+
+#[test]
+fn discard_prompts_for_the_file_under_the_cursor_and_discards_it() {
+    let repo = two_short_files();
+    let mut app = diverged_on_b(&repo);
+
+    press(&mut app, 'x');
+    match app.modal.as_ref() {
+        Some(Modal::ConfirmDiscard { path, .. }) => assert_eq!(path, "b.txt"),
+        other => panic!("expected a discard prompt for b.txt, got {other:?}"),
+    }
+    assert_eq!(
+        common::selected_path(&app),
+        "b.txt",
+        "the view converged before prompting"
+    );
+
+    press(&mut app, 'y');
+    assert!(
+        !repo.path().join("b.txt").exists(),
+        "the cursor's file was discarded"
+    );
+    assert!(repo.path().join("a.txt").exists(), "the anchor's was not");
+}
+
+#[test]
+fn the_discard_gate_reads_the_divergent_cursor_target() {
+    let repo = two_short_files();
+    let base = head_oid(repo.path());
+    seed_store(repo.path(), "main", None, vec![note_on_b(&base)]);
+    let mut app = diverged_on_bs_note(&repo);
+    let before = body(&app);
+
+    press(&mut app, 'x');
+
+    assert!(
+        app.modal.is_none(),
+        "`x` on a comment row is inert wherever that row lives (plan 007 §5-B3)"
+    );
+    assert!(app.cursor_divergent(), "and inert means nothing moved");
+    assert_eq!(common::selected_path(&app), "a.txt");
+    assert_eq!(body(&app), before);
+    assert_eq!(app.status_comment_count("b.txt"), 1, "nor was it deleted");
+}
+
+#[test]
+fn keyboard_delete_converges_on_the_comment_it_removes() {
+    let repo = two_short_files();
+    let base = head_oid(repo.path());
+    seed_store(repo.path(), "main", None, vec![note_on_b(&base)]);
+    let mut app = diverged_on_bs_note(&repo);
+
+    press(&mut app, 'X');
+
+    assert_eq!(app.status_comment_count("b.txt"), 0, "the note is gone");
+    assert!(stored_notes(&repo).is_empty(), "and gone from the store");
+    assert_eq!(
+        common::selected_path(&app),
+        "b.txt",
+        "the view converged onto the file it deleted from"
+    );
+    assert!(!app.cursor_divergent());
+}
+
+#[test]
+fn an_offscreen_divergent_cursor_reveals_before_it_acts() {
+    // Today's two-press rule, extended to an address whose file is in the window
+    // but whose row is below the rows that file draws.
+    let repo = two_tall_files();
+    let mut app = diff_focused_app(&repo);
+    let v = app.diff_area().height as usize;
+    let r_a = app.diff_row_count();
+    app.wheel_scroll_window((r_a - v + 1) as i64); // b.txt's first row enters the window
+    let target = {
+        let window = window_of(&app);
+        let strip = window.segments.last().expect("a strip segment");
+        assert!(!strip.is_anchor(), "b.txt is below the anchor");
+        strip
+            .section
+            .as_ref()
+            .expect("its prepared section")
+            .rows
+            .last()
+            .expect("b.txt has rows")
+            .target
+    };
+    assert!(app.place_cursor(address(unstaged("b.txt"), target)));
+    assert!(
+        app.cursor_window_span().is_none(),
+        "the address names a drawn file but an undrawn row"
+    );
+
+    press(&mut app, ' ');
+    assert!(
+        app.status.staged.is_empty(),
+        "the first press only reveals — it must not act on a row off screen"
+    );
+    assert!(
+        app.cursor_window_span().is_some(),
+        "and the row it names is on screen now"
+    );
+
+    press(&mut app, ' ');
+    assert!(
+        app.status.staged.iter().any(|entry| entry.path == "b.txt"),
+        "the second press acts, on the cursor's file"
+    );
+}
+
+#[test]
+fn the_comment_cycle_is_untouched_by_divergence() {
+    let repo = two_short_files();
+    let base = head_oid(repo.path());
+    seed_store(
+        repo.path(),
+        "main",
+        None,
+        vec![note_on_a(&base), note_on_b(&base)],
+    );
+    let mut app = diverged_on_b(&repo);
+
+    // `]` selects and places its own cursor rather than converging on the current
+    // one, so it lands on the first ordered comment either way (§3.3g).
+    press(&mut app, ']');
+
+    assert_eq!(common::selected_path(&app), "a.txt");
+    assert_eq!(common::cursor_target(&app), Some(RowTarget::Comment(1)));
+    assert!(!app.cursor_divergent(), "and leaves a converged cursor");
+}
+
+#[test]
+fn a_rebuild_whose_content_changed_under_the_cursor_clears_it() {
+    let repo = two_short_files();
+    let base = head_oid(repo.path());
+    seed_store(repo.path(), "main", None, vec![note_on_a(&base)]);
+    let mut app = diff_focused_app(&repo);
+    assert!(app.place_cursor(address(unstaged("b.txt"), RowTarget::Code(2))));
+
+    // b.txt changes on disk with no refresh in between: its rebuilt rows still
+    // *have* a `Code(2)`, but it denotes a different line now. One event — the
+    // delete on a.txt — bumps the generation and rebuilds b.txt's section from
+    // the new bytes, so resolving is not enough to keep the address alive.
+    write(repo.path(), "b.txt", "b one\nb two changed\nb three\n");
+    let close = app.comment_close_rect(1).expect("the note's [x] rect");
+    app.on_mouse_at(click(close.x, close.y), Instant::now());
+
+    assert!(
+        !app.cursor_divergent(),
+        "a target that resolves against different content is not the same target"
+    );
+    assert_eq!(
+        app.cursor_address().map(|a| a.file),
+        Some(unstaged("a.txt")),
+        "it reset to the anchor's top"
+    );
+}
+
+/// A worktree note on the first added line of `two_tall_files`' `b.txt`, with a
+/// body long enough that its box is taller than the viewport.
+fn tall_note_on_b(base: &str, source: Source) -> Comment {
+    let text: Vec<String> = (0..20).map(|i| format!("note line {i}")).collect();
+    Comment {
+        id: 2,
+        source,
+        file: "b.txt".to_string(),
+        line: 1,
+        text: text.join("\n"),
+        context: Some("beta 0".to_string()),
+        ..note_on_a(base)
+    }
+}
+
+/// `two_tall_files` parked with the cursor on `b.txt`'s note box where the
+/// viewport bottom cuts through it: the box's first row is drawn, its tail is
+/// not.
+fn diverged_on_a_clipped_box(repo: &TempDir) -> App {
+    let mut app = diff_focused_app(repo);
+    let v = app.diff_area().height as usize;
+    let r_a = app.diff_row_count();
+    // a.txt's tail plus b.txt's first four rows: header, `@@`, the first added
+    // line, then the box's opening row.
+    app.wheel_scroll_window((r_a - v + 4) as i64);
+    assert!(app.place_cursor(address(unstaged("b.txt"), RowTarget::Comment(2))));
+    assert!(
+        app.cursor_window_span().is_none(),
+        "the box is clipped by the viewport bottom"
+    );
+    app
+}
+
+#[test]
+fn a_bottom_clipped_divergent_box_is_visible_enough_to_act_on() {
+    let repo = two_tall_files();
+    let base = head_oid(repo.path());
+    seed_store(
+        repo.path(),
+        "main",
+        None,
+        vec![tall_note_on_b(&base, Source::Human)],
+    );
+    let mut app = diverged_on_a_clipped_box(&repo);
+
+    press(&mut app, ' ');
+
+    assert!(
+        app.status.staged.iter().any(|entry| entry.path == "b.txt"),
+        "the first press acts: a clipped tail does not make the row unseen"
+    );
+}
+
+#[test]
+fn c_on_a_bottom_clipped_divergent_agent_note_flashes_without_moving_anything() {
+    // The prohibited sequence, pinned: reading the clipped box as off-screen sent
+    // `c` down the reveal-only path, whose reveal renormalizes past the boundary —
+    // reorienting the view for an action that was never eligible.
+    let repo = two_tall_files();
+    let base = head_oid(repo.path());
+    seed_store(
+        repo.path(),
+        "main",
+        None,
+        vec![tall_note_on_b(&base, Source::Agent)],
+    );
+    let mut app = diverged_on_a_clipped_box(&repo);
+    let before = body(&app);
+    let offset = app.diff_scroll.get();
+
+    press(&mut app, 'c');
+
+    assert_eq!(
+        app.flash.as_ref().map(|flash| flash.text.as_str()),
+        Some("agent note — read-only")
+    );
+    assert!(!app.editor_open());
+    assert!(app.cursor_divergent(), "no flip");
+    assert_eq!(common::selected_path(&app), "a.txt");
+    assert_eq!(app.diff_scroll.get(), offset, "no scroll");
+    assert_eq!(body(&app), before, "no view movement at all");
 }

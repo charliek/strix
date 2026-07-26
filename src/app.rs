@@ -568,6 +568,17 @@ impl SectionCache {
         });
     }
 
+    /// The section cached for `id` whatever tag it carries — including a stale one
+    /// the next [`SectionCache::get`] would discard, which is what makes this the
+    /// *outgoing* section right after a `stream_generation` bump. Read-only: no
+    /// LRU stamp and no discard, so inspecting the cache cannot perturb it.
+    fn cached(&self, id: &FileId) -> Option<Rc<FileSection>> {
+        self.entries
+            .iter()
+            .find(|entry| entry.id == *id)
+            .map(|entry| Rc::clone(&entry.section))
+    }
+
     /// Evict least-recently-used entries past [`SECTION_BUDGET`], never one the
     /// current window still needs (`pinned`).
     fn evict(&mut self, pinned: &[FileId]) {
@@ -1700,14 +1711,16 @@ impl App {
             Action::ToggleStage => self.toggle_stage(),
             Action::Stage => self.stage_selected(),
             Action::Unstage => self.unstage_selected(),
-            // `x` discards the selected file's changes — but stays inert (neither
+            // `x` discards the file under the cursor — but stays inert (neither
             // discarding nor deleting) when the *diff pane is focused* and its
             // cursor rests on a comment/orphan row, so it can never be mistaken for
-            // the deletion key (`X`/`Action::DeleteComment`, below). With the file
-            // list focused, `x` discards the list-selected file regardless of where
-            // the hidden diff cursor sits.
+            // the deletion key (`X`/`Action::DeleteComment`, below). The gate reads
+            // the cursor's whole *address* (plan 007 §5-B3): a comment row in a
+            // file the cursor walked into is as inert as one in the anchor. With
+            // the file list focused, `x` discards the list-selected file regardless
+            // of where the hidden diff cursor sits.
             Action::Discard => {
-                if !self.diff_focused() || self.cursor_comment_id().is_none() {
+                if !self.diff_focused() || self.cursor_address_comment_id().is_none() {
                     self.request_discard();
                 }
             }
@@ -2216,15 +2229,27 @@ impl App {
     /// Whether the diff cursor target's first row lies within the visible
     /// viewport, tested against the same clamped offset the renderer paints with
     /// (so a wheel scroll that pushed it offscreen reads as not-visible).
+    ///
+    /// A *divergent* cursor has no row in the anchor's layout at all, so the
+    /// anchor-domain test below would read it as row 0 and call an off-screen
+    /// address visible; it is measured in window rows instead — the screen rows
+    /// its file actually draws (plan 007 §3.3g). Same contract in both branches:
+    /// the target's **first** row decides, so a comment box clipped by the
+    /// viewport bottom is visible, not hidden.
     fn review_cursor_visible(&self) -> bool {
         if self.active_pane().is_none() {
             return false;
         }
-        let cursor = self.review_cursor();
         let viewport = self.diff_viewport.get() as usize;
         if viewport == 0 {
             return false;
         }
+        if let Some(address) = self.divergent_address() {
+            return self
+                .address_window_placement(&address)
+                .is_some_and(|(start, _)| start < viewport);
+        }
+        let cursor = self.review_cursor();
         let top = self.diff_scroll.get().min(self.diff_scroll_limit());
         cursor >= top && cursor < top + viewport
     }
@@ -2240,6 +2265,70 @@ impl App {
         }
         self.review_reveal_cursor();
         false
+    }
+
+    /// Flip-then-act convergence (plan 007 §3.3g): hand the anchor — and with it
+    /// the selection, the title, and every `selected_file()` read downstream — to
+    /// the file the *cursor* names, so a diff-focused action acts on the row the
+    /// user is pointing at rather than on whichever file the list happens to have
+    /// selected. Returns whether the caller may go on to act.
+    ///
+    /// A converged cursor, and any action taken while the file list has focus, is
+    /// today's path untouched: nothing moves and this reports `true` at once.
+    ///
+    /// Callers check their own eligibility *first* and skip this when the action
+    /// would only flash or no-op on the resolved row (step 3) — an ineligible
+    /// target must never reorient the view. The rest of the sequence lives here:
+    /// validating the address (1), the two-press reveal gate (2), the
+    /// cursor-preserving flip (4), and the revalidation the caller acts behind (5).
+    fn converge_on_cursor(&mut self) -> bool {
+        if !self.diff_focused() {
+            return true;
+        }
+        let Some(address) = self.divergent_address() else {
+            return true;
+        };
+        if !self.cursor_address_valid(&address) {
+            // The window stopped holding the file between the last sweep and this
+            // key. Drop the address rather than fall back to the anchor: acting on
+            // a file other than the one under the cursor is the whole hazard.
+            self.write_cursor(None);
+            return false;
+        }
+        if !self.reveal_cursor_before_acting() {
+            return false;
+        }
+        if !self.flip_to_address(&address) {
+            return false;
+        }
+        debug_assert!(
+            !self.cursor_divergent(),
+            "convergence left the cursor pointing away from the anchor"
+        );
+        true
+    }
+
+    /// Step (4) of the convergence: make `address`'s file the anchor with the
+    /// cursor still on it.
+    ///
+    /// The arriving file is installed at offset 0, which is the *minimal*
+    /// reorientation available rather than an arbitrary one: `diff_scroll` counts
+    /// from the new anchor's own first row, a divergent file always begins below
+    /// the pane top, so every legal offset scrolls the view down and 0 scrolls it
+    /// least. The trailing reveal is then the ordinary anchor-domain one — the
+    /// address converged the moment the flip landed — and re-preparing the window
+    /// is what settling would have done had this gone through it (it cannot: the
+    /// end-of-stream clamp would hand a short last file straight back).
+    fn flip_to_address(&mut self, address: &CursorAddress) -> bool {
+        let Some(index) = self.stream_index_of_exact(&address.file) else {
+            return false;
+        };
+        if !self.flip_anchor(index, 0, FlipCursor::Keep) {
+            return false;
+        }
+        self.review_reveal_cursor();
+        self.ensure_diff_window(self.diff_pane_width(), self.diff_viewport.get());
+        true
     }
 
     /// The pane inner width of the last render, the key the physical layout is
@@ -2397,11 +2486,29 @@ impl App {
     /// bump retires every cached section, so the address survives only if the
     /// same event's `ensure_diff_window` re-prepared its file *and* the target
     /// still resolves in the rebuilt rows.
-    fn normalize_cursor(&mut self) {
+    ///
+    /// Resolving is not enough on its own, though: the file may have changed on
+    /// disk since (an agent's edit, not yet seen by a refresh), and a rebuilt
+    /// `Code(i)` denotes a *different line* while indexing just as happily. So the
+    /// rebuilt diff is compared against `outgoing` — what the address last
+    /// resolved against — and any difference drops it. That mirrors the anchor
+    /// cursor, which survives a same-file refresh only because
+    /// `recompute_status_diff` early-returns on an identical diff.
+    fn normalize_cursor(&mut self, outgoing: Option<Rc<FileSection>>) {
         let Some(address) = self.divergent_address() else {
             return;
         };
         if !self.diff_focused() || !self.cursor_address_valid(&address) {
+            self.write_cursor(None);
+            return;
+        }
+        let Some(outgoing) = outgoing else {
+            return;
+        };
+        let changed = self
+            .address_section(&address.file)
+            .is_none_or(|section| section.diff != outgoing.diff);
+        if changed {
             self.write_cursor(None);
         }
     }
@@ -2450,28 +2557,43 @@ impl App {
         target_span(&section.rows, address.target)
     }
 
-    /// `address`'s span in *window* rows — screen rows counted from the top of
-    /// the diff pane: its file's own span shifted by the rows every preceding
-    /// segment draws. `None` when the file isn't in the currently prepared
-    /// window, or when the rows it occupies aren't among the ones drawn (the
-    /// anchor's rows above the offset, or a strip tail past the viewport).
-    fn address_window_span(&self, address: &CursorAddress) -> Option<Range<usize>> {
+    /// Where `address`'s target starts on screen and how many of its rows the
+    /// window actually draws: `(first window row, drawn rows)`, window rows being
+    /// screen rows counted from the top of the diff pane. `None` when the target's
+    /// *first* row isn't drawn at all — its file isn't in the prepared window, or
+    /// that row is among the ones the segment skips (the anchor's rows above the
+    /// offset, or a strip tail past the viewport).
+    ///
+    /// A multi-row target straddling the viewport bottom is a legitimate answer
+    /// with `drawn < span.len()`: the user can see it, which is all the visibility
+    /// test of §3.3g step 2 asks. [`App::address_window_span`] is the stricter
+    /// read, for callers that need the whole target on screen.
+    fn address_window_placement(&self, address: &CursorAddress) -> Option<(usize, usize)> {
         let window = self.diff_window(self.diff_pane_width(), self.diff_viewport.get());
         let mut drawn = 0usize;
         for segment in &window.segments {
             if segment.id.as_ref() == Some(&address.file) {
                 let span = self.address_file_span(address)?;
                 // The segment draws `row_range` of its file's own rows; the span
-                // has to lie inside that to have a screen position at all.
-                if span.start < segment.row_range.start || span.end > segment.row_range.end {
+                // has to start inside that to have a screen position at all.
+                if span.start < segment.row_range.start || span.start >= segment.row_range.end {
                     return None;
                 }
                 let base = drawn + (span.start - segment.row_range.start);
-                return Some(base..base + span.len());
+                return Some((base, span.end.min(segment.row_range.end) - span.start));
             }
             drawn += segment.rows();
         }
         None
+    }
+
+    /// `address`'s span in window rows, when the window draws the target *whole*.
+    /// `None` when any of it is clipped — the caller wanting the visible head of a
+    /// clipped target reads [`App::address_window_placement`] instead.
+    fn address_window_span(&self, address: &CursorAddress) -> Option<Range<usize>> {
+        let span = self.address_file_span(address)?;
+        let (base, drawn) = self.address_window_placement(address)?;
+        (drawn == span.len()).then(|| base..base + span.len())
     }
 
     /// `address`'s span in the **offset domain**: physical rows counted from the
@@ -2579,10 +2701,16 @@ impl App {
     /// The comment id under the cursor in the selected file, or `None` when the
     /// cursor rests on a code/hunk row (so `x` there is a silent no-op).
     fn cursor_comment_id(&self) -> Option<u64> {
-        match self.review_cursor_target()? {
-            RowTarget::Comment(id) | RowTarget::Orphan(id) => Some(id),
-            RowTarget::Code(_) | RowTarget::Editor | RowTarget::FileHeader => None,
-        }
+        target_comment_id(self.review_cursor_target()?)
+    }
+
+    /// The comment id under the cursor **wherever it points** — the divergence-
+    /// aware counterpart of [`App::cursor_comment_id`], a separate accessor rather
+    /// than an overload of it (plan 007 §3.3j). Read by the actions that converge
+    /// before they act; `]`/`[` place their own cursor and keep the anchor-domain
+    /// one.
+    fn cursor_address_comment_id(&self) -> Option<u64> {
+        target_comment_id(self.cursor_address()?.target)
     }
 
     /// The row index of comment `id` in the selected file's active row list, for
@@ -2729,9 +2857,14 @@ impl App {
         if !self.reveal_cursor_before_acting() {
             return;
         }
-        let Some(id) = self.cursor_comment_id() else {
+        // Eligibility before the flip (plan 007 §3.3g step 3): a code/hunk row is
+        // a silent no-op, and a no-op must not hand the anchor to another file.
+        let Some(id) = self.cursor_address_comment_id() else {
             return; // code / hunk row: no-op
         };
+        if !self.converge_on_cursor() {
+            return;
+        }
         self.delete_comment_id(id);
     }
 
@@ -2794,16 +2927,36 @@ impl App {
         if !self.reveal_cursor_before_acting() {
             return;
         }
-        self.open_editor_at_cursor();
+        self.comment_at_cursor();
     }
 
-    /// Open the in-place editor for the row under the (already-revealed) diff
-    /// cursor: edit the human note under it, refuse an agent note, or anchor a new
-    /// comment on a code row (a hunk header or unanchorable row flashes). Shared by
-    /// the status and review comment actions once their per-view gates have run;
-    /// `active_comment`/`cursor_code_anchor` resolve against whichever view is
-    /// active, so `save_comment` scopes the note correctly.
-    fn open_editor_at_cursor(&mut self) {
+    /// The shared tail of `c` in both views (plan 007 §3.3g steps 3–5): decide
+    /// what the row under the cursor would do *before* anything moves, converge on
+    /// its file only when the editor would really open, then open it there.
+    fn comment_at_cursor(&mut self) {
+        let opens = self
+            .cursor_address()
+            .is_some_and(|address| self.editor_opens_at(&address));
+        if opens && !self.converge_on_cursor() {
+            return;
+        }
+        match self.cursor_address() {
+            // Re-resolved after the flip: the pinned address is the authority, not
+            // the one the eligibility check read.
+            Some(address) => self.open_editor_at(&address),
+            // No addressable row at all (an empty diff): the same flash as ever.
+            None => self.flash = Some(Flash::info("can't comment here")),
+        }
+    }
+
+    /// Open the in-place editor for `address`, the row under the (already-revealed
+    /// and converged) diff cursor: edit the human note there, refuse an agent
+    /// note, or anchor a new comment on a code row (a hunk header or unanchorable
+    /// row flashes). Shared by the status and review comment actions once their
+    /// per-view gates have run; `active_comment`/`address_code_anchor` resolve
+    /// against whichever view is active, so `save_comment` scopes the note
+    /// correctly.
+    fn open_editor_at(&mut self, address: &CursorAddress) {
         // Capture the authoring identity *now*, at open: a watcher `reload()` plus
         // an external checkout can move the current branch/HEAD while the editor is
         // open, and the save must land where the note was authored. `None` means
@@ -2812,7 +2965,7 @@ impl App {
             return;
         };
         // A comment/orphan row: edit a human note, or refuse an agent note.
-        if let Some(id) = self.cursor_comment_id() {
+        if let Some(id) = target_comment_id(address.target) {
             match self.active_comment(id) {
                 Some(comment) if comment.source == Source::Human => {
                     let anchor = CommentAnchor {
@@ -2836,7 +2989,7 @@ impl App {
         }
         // A code row: anchor a new comment, unless it's a hunk header (or a
         // binary/submodule file with no text anchor).
-        match self.cursor_code_anchor() {
+        match self.address_code_anchor(address) {
             Some(anchor) => self.set_editor(CommentEdit::new_comment(anchor, identity)),
             None => self.flash = Some(Flash::info("can't comment here")),
         }
@@ -2847,6 +3000,13 @@ impl App {
     /// in a cursor-less view (History), where `authoring_identity` already
     /// returned `None` and this is never reached.
     fn set_editor(&mut self, edit: CommentEdit) {
+        // The editor box renders inline in the *anchor's* rows, so it can only
+        // ever open on a converged cursor — §3.3g's convergence runs before every
+        // open, and this is the one choke point every open goes through.
+        debug_assert!(
+            !self.cursor_divergent(),
+            "the in-place editor opened on a divergent cursor"
+        );
         if let Some(pane) = self.active_pane_mut() {
             pane.editing = Some(edit);
         }
@@ -2899,36 +3059,74 @@ impl App {
         }
         // A conflicted file has no clean HEAD-vs-worktree anchor; binary and
         // submodule files yield no code anchor below (their diff isn't `Text`), so
-        // they fall through to the "can't comment here" flash.
-        if let Some((_, entry)) = self.selected_file() {
-            if entry.change == Change::Conflicted {
-                self.flash = Some(Flash::info("can't comment on a conflicted file"));
-                return;
-            }
+        // they fall through to the "can't comment here" flash. Decided on the
+        // *cursor's* file and before any flip: a flash must not reorient the view
+        // (plan 007 §3.3g step 3).
+        if self.cursor_file_conflicted() {
+            self.flash = Some(Flash::info("can't comment on a conflicted file"));
+            return;
         }
-        self.open_editor_at_cursor();
+        self.comment_at_cursor();
     }
 
-    /// The anchor for a new comment on the code row under the cursor, or `None`
-    /// on a hunk header (or a row with no anchorable line). Per plan §3.4:
-    /// Addition → New/`new_no`, Deletion → Old/`old_no`, Context → New/`new_no`;
-    /// `context` is the line's text. In side-by-side a replaced-line pair anchors
-    /// to its new side when present, else its old side.
-    fn cursor_code_anchor(&self) -> Option<CommentAnchor> {
-        // Resolve the cursor's target and the file path first (owned values), so
-        // the nested cache reads don't overlap the diff-line borrow below. The
-        // file-path source is per-view: review's selected range file, or the
-        // status view's selected changed file (`active_diff_path`).
-        let RowTarget::Code(li) = self.review_cursor_target()? else {
+    /// The anchor for a new comment on `address`'s code row, or `None` on a hunk
+    /// header (or a row with no anchorable line). Per plan §3.4: Addition →
+    /// New/`new_no`, Deletion → Old/`old_no`, Context → New/`new_no`; `context`
+    /// is the line's text. In side-by-side a replaced-line pair anchors to its
+    /// new side when present, else its old side.
+    ///
+    /// Address-aware (plan 007 §3.3j): the anchor's lines come from the live diff,
+    /// a divergent file's from its prepared section, so the line read is always
+    /// the line the user is pointing at — never the same index in another file,
+    /// which is the mis-anchor the pre-007 cursor could produce.
+    fn address_code_anchor(&self, address: &CursorAddress) -> Option<CommentAnchor> {
+        let RowTarget::Code(li) = address.target else {
             return None;
         };
-        let file = self.active_diff_path()?;
-        let FileDiff::Text(lines) = self.active_diff()? else {
+        let section = match self.address_is_anchor(address) {
+            true => None,
+            false => Some(self.address_section(&address.file)?),
+        };
+        let diff = match section.as_deref() {
+            Some(section) => &section.diff,
+            None => self.active_diff()?,
+        };
+        let FileDiff::Text(lines) = diff else {
             return None;
         };
         // A hunk row maps to `Code(index)` too; `anchor_for_line` returns `None`
         // for it, so no explicit hunk guard is needed here.
-        lines.get(li).and_then(|line| anchor_for_line(line, file))
+        lines
+            .get(li)
+            .and_then(|line| anchor_for_line(line, address.file.path().to_string()))
+    }
+
+    /// Whether `c` on `address`'s row would actually open the editor — the
+    /// eligibility half of [`App::open_editor_at`], mirrored so that an agent
+    /// note, a hunk header or a file-header row flashes *without* the view
+    /// flipping to its file first (plan 007 §3.3g step 3).
+    fn editor_opens_at(&self, address: &CursorAddress) -> bool {
+        match target_comment_id(address.target) {
+            Some(id) => self
+                .active_comment(id)
+                .is_some_and(|comment| comment.source == Source::Human),
+            None => self.address_code_anchor(address).is_some(),
+        }
+    }
+
+    /// Whether the file the cursor points at is conflicted — no clean
+    /// HEAD-vs-worktree diff to hang a comment on. Divergence-aware, so `c`
+    /// decides on the row it would act on rather than on the selected file.
+    fn cursor_file_conflicted(&self) -> bool {
+        let Some(address) = self.cursor_address() else {
+            return false;
+        };
+        match &address.file {
+            FileId::Status { section, path } => self
+                .status_entry(*section, path)
+                .is_some_and(|entry| entry.change == Change::Conflicted),
+            FileId::Review { .. } => false,
+        }
     }
 
     /// The active pane's in-place editor, if open — the single read accessor every
@@ -4377,6 +4575,12 @@ impl App {
 
     /// Stage an unstaged file, or unstage a staged one.
     fn toggle_stage(&mut self) {
+        // Converge before reading the section: which way the toggle goes is the
+        // cursor's file's answer, not the previously selected file's (§3.3g).
+        // `run_on_selected` converges too — a no-op once this one has.
+        if !self.converge_on_cursor() {
+            return;
+        }
         let Some((section, _)) = self.selected_section_path() else {
             return;
         };
@@ -4395,16 +4599,27 @@ impl App {
         self.run_on_selected("unstage", Repo::unstage);
     }
 
-    /// Run a path-based git op on the selected file, then refresh.
+    /// Run a path-based git op on the selected file, then refresh. Staging is
+    /// eligible on any file, so the convergence (§3.3g) is unconditional: with the
+    /// cursor walked into a following file, space/`s`/`u` act on *that* file and
+    /// the selection follows it there.
     fn run_on_selected(&mut self, action: &str, op: GitOp) {
+        if !self.converge_on_cursor() {
+            return;
+        }
         let Some((_, path)) = self.selected_section_path() else {
             return;
         };
         self.after_mutation(action, op(&self.repo, &path));
     }
 
-    /// Open the discard confirmation for the selected file.
+    /// Open the discard confirmation for the file under the cursor — which the
+    /// convergence has just made the selected one (§3.3g; the caller's gate has
+    /// already ruled out the ineligible comment-row case).
     fn request_discard(&mut self) {
+        if !self.converge_on_cursor() {
+            return;
+        }
         self.modal = self
             .selected_file()
             .map(|(_, entry)| Modal::ConfirmDiscard {
@@ -5618,6 +5833,13 @@ impl App {
             self.clear_divergent_cursor();
             return;
         };
+        // What a divergent address currently resolves against, read before the
+        // preparation below discards a stale entry and rebuilds it. The sweep
+        // compares the two (plan 007 §3.3b's second corollary): a rebuilt section
+        // can resolve the same target index against *different* content.
+        let outgoing = self
+            .divergent_address()
+            .and_then(|address| self.sections.borrow().cached(&address.file));
         let viewport = height as usize;
         let rows = self.diff_layout(width).len();
         let offset = self.stream_offset(rows, viewport);
@@ -5648,7 +5870,7 @@ impl App {
         self.prune_highlight_cache();
         // Last: the window the address is validated against is the one just
         // prepared and trimmed.
-        self.normalize_cursor();
+        self.normalize_cursor(outgoing);
     }
 
     /// The window to render at `width` × `height`: the anchor's rows from the
@@ -7454,6 +7676,16 @@ fn target_span(rows: &[LayoutRow], target: RowTarget) -> Option<Range<usize>> {
         .take_while(|row| row.target == target)
         .count();
     Some(start..start + len)
+}
+
+/// The comment a [`RowTarget`] names, if it names one at all. File-agnostic, so
+/// the anchor-domain [`App::cursor_comment_id`] and its address-aware
+/// counterpart share one row-kind test.
+fn target_comment_id(target: RowTarget) -> Option<u64> {
+    match target {
+        RowTarget::Comment(id) | RowTarget::Orphan(id) => Some(id),
+        RowTarget::Code(_) | RowTarget::Editor | RowTarget::FileHeader => None,
+    }
 }
 
 /// Record `range` as the branch's reviewed range when it has none yet — a
