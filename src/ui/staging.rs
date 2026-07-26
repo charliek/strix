@@ -1,13 +1,13 @@
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem};
 use ratatui::Frame;
 
 use crate::app::{App, Focus};
-use crate::git::{Change, FileEntry, Section, Status};
+use crate::git::{FileEntry, Section, Status};
 use crate::ui::theme::Theme;
-use crate::ui::{centered_hint, panel_block, selection_style};
+use crate::ui::{centered_hint, panel_block, selection_style, MarkerTone};
 
 /// One row of the staging list, in display order.
 enum Row<'a> {
@@ -116,7 +116,7 @@ fn file_item(
     comments: usize,
     theme: &Theme,
 ) -> ListItem<'static> {
-    let color = marker_color(section, entry.change, theme);
+    let color = MarkerTone::for_status(section, entry.change).color(theme);
     let mut spans = vec![
         Span::styled(
             format!("  {} ", entry.change.marker()),
@@ -133,12 +133,4 @@ fn file_item(
         ));
     }
     ListItem::new(Line::from(spans))
-}
-
-fn marker_color(section: Section, change: Change, theme: &Theme) -> Color {
-    match section {
-        Section::Staged => theme.staged,
-        Section::Unstaged if change == Change::Untracked => theme.untracked,
-        Section::Unstaged => theme.unstaged,
-    }
 }

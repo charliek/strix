@@ -8,6 +8,24 @@ Each release below is headed by a `## vX.Y.Z` entry added by
 `/release-workflows:release`; `release.yml` turns that section into the GitHub
 Release notes.
 
+## Unreleased
+
+Milestone 11 — continuous cross-file scroll: the arm-then-hop pause is gone.
+
+### Changed
+- **Cross-file scroll is now continuous** — with `f` on, scrolling past a
+  file's diff no longer clamps then teleports: the next (or previous) file's
+  header row slides continuously into view, and the border title swaps the
+  moment its header passes one row above the top, with no arm-then-hop pause.
+  Several small files can be visible in the viewport at once, each led by its
+  own inline header (marker, path, `+a −d` or `(binary)`); a short last file
+  still stops the wheel at its edge (classic sticky-header behaviour), and
+  per-file diffs stay lazy — only the files the window actually shows are
+  computed. `j`/`k` now cross a file boundary in a single press too: down
+  lands on the next file's header, up lands on the previous file's last row
+  with its header visible at the bottom edge. Clicking a neighboring file's
+  row in the stream selects that file and places the cursor there.
+
 ## v0.0.6 — 2026-07-24
 
 Milestone 10 — diff-review ergonomics: line wrapping, scrolling across files and

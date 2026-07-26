@@ -13,7 +13,7 @@ These are the defaults. Every binding is remappable — see
 | `Tab`          | Switch focus between panes              |
 | `n`            | Toggle line numbers in the diff gutter (persists) |
 | `w`            | Toggle hard line wrapping in the diff pane (persists) |
-| `f`            | Toggle cross-file scroll — scroll past a diff's edge into the next / previous file (persists) |
+| `f`            | Toggle cross-file scroll — continuously scroll past a diff's edge into the next / previous file (persists) |
 | `t`            | Cycle the theme (presets, then your custom themes; persists) |
 | `m`            | Show / hide the menu bar (persists)     |
 | `b`            | Show / hide the left panel              |
@@ -22,9 +22,9 @@ These are the defaults. Every binding is remappable — see
 | `Esc`          | Close an overlay; leave History view    |
 
 `n`, `w`, `f`, `t`, and `m` work in every view (Status, History, and the review
-view), though cross-file scroll (`f`) only crosses boundaries in Status and
-Review — the History view is excluded. While the discard-confirmation modal is
-open, `n` is consumed as "no"
+view), though cross-file scroll (`f`) only scrolls continuously across file
+boundaries in Status and Review — the History view is excluded. While the
+discard-confirmation modal is open, `n` is consumed as "no"
 (dismiss the modal) rather than toggling line numbers; the global binding
 resumes once the modal closes.
 
@@ -82,7 +82,7 @@ same effect as arrowing to it.
 | `g`, `G`        | Jump to top / bottom of the diff                  |
 | `d`             | Toggle unified / side-by-side mode                |
 | `w`             | Toggle hard line wrapping (long lines wrap instead of truncating) |
-| `f`             | Toggle cross-file scroll (scroll past a diff's edge into the next / previous file) |
+| `f`             | Toggle cross-file scroll (continuously scroll past a diff's edge into the next / previous file) |
 | `c`             | Add a comment on the cursor's line, or edit the comment under it |
 | `X`             | Delete the comment under the cursor (no confirmation) |
 | `]`, `[`        | Jump to the next / previous comment               |
@@ -191,6 +191,7 @@ remapping one never affects the other.
 | Click a pane                  | Focus that pane                                 |
 | Click a commit in the graph   | Select it (and show its details)                |
 | Click a row in the diff pane (Status or Review) | Focus the diff and move the cursor there (a comment box is selected, not opened — double-click or press `c` to edit it) |
+| Click a neighboring file's row in the diff pane (cross-file scroll on) | Select that file and place the cursor on the clicked row; the view reorients like a list click rather than preserving the scroll offset |
 | Double-click a code line in the diff pane | Open the in-place editor there (add a comment); excludes the marker zone and the file list |
 | Double-click a comment box    | Edit it (an agent note flashes read-only instead) |
 | Click a comment box's `[x]`   | Delete that comment, no confirmation             |

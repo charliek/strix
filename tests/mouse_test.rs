@@ -601,7 +601,7 @@ fn a_resize_between_clicks_breaks_the_double_click_chain() {
     let (x, y) = code_pos(&app, "target line");
     let t = Instant::now();
     app.on_mouse_at(click(x, y), t); // stores the code-line target
-    app.on_resize(); // the event loop's resize arm calls this before the redraw
+    app.on_resize(100, 30); // the event loop's resize arm calls this before the redraw
     app.on_mouse_at(click(x, y), t + ms(100)); // same row/target, within the window
     assert!(
         !app.editor_open(),

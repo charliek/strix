@@ -148,6 +148,11 @@ fn pop_kbd_enhancement(w: &mut impl Write, flag: &AtomicBool) -> io::Result<()> 
 }
 
 fn event_loop(terminal: &mut Tui, app: &mut App, watch_rx: Option<Receiver<()>>) -> Result<()> {
+    // Seed the geometry before the first draw: `App::with_config` synced with a
+    // zero-sized pane, so with cross-file scroll on and a short first file the
+    // stream window would otherwise render a shortfall until the first input.
+    let size = terminal.size()?;
+    app.on_resize(size.width, size.height);
     terminal.draw(|frame| ui::draw(frame, app))?;
     let mut grab_pointer = false;
     while !app.should_quit {
@@ -212,8 +217,11 @@ fn handle_event(app: &mut App, event: Event) -> bool {
         }
         // A resize breaks a pending double-click chain before the redraw rebuilds
         // the layout (plan §3.6).
-        Event::Resize(_, _) => {
-            app.on_resize();
+        // The new size is threaded through: the pane rect on record is the
+        // pre-resize one, and the window has to be prepared for the geometry the
+        // next frame will draw (plan 006 §3.3).
+        Event::Resize(cols, rows) => {
+            app.on_resize(cols, rows);
             true
         }
         _ => false,
