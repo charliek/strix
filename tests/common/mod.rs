@@ -25,34 +25,28 @@ pub fn press(app: &mut App, ch: char) {
 }
 
 // --- Key / mouse event builders ---------------------------------------------
+// `key` builds the event without applying it (vs [`press`], which applies).
 
-/// A plain character key event, unapplied (for building sequences or asserting
-/// on the event itself, as opposed to [`press`] which applies it immediately).
 pub fn key(c: char) -> KeyEvent {
     KeyEvent::from(KeyCode::Char(c))
 }
 
-/// A Ctrl-modified character key event.
 pub fn ctrl(c: char) -> KeyEvent {
     KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
 }
 
-/// An Enter key event.
 pub fn enter() -> KeyEvent {
     KeyEvent::from(KeyCode::Enter)
 }
 
-/// An Esc key event.
 pub fn esc() -> KeyEvent {
     KeyEvent::from(KeyCode::Esc)
 }
 
-/// A Tab key event.
 pub fn tab() -> KeyEvent {
     KeyEvent::from(KeyCode::Tab)
 }
 
-/// A mouse event at `(col, row)` with no modifiers.
 pub fn mouse(col: u16, row: u16, kind: MouseEventKind) -> MouseEvent {
     MouseEvent {
         kind,
@@ -62,12 +56,10 @@ pub fn mouse(col: u16, row: u16, kind: MouseEventKind) -> MouseEvent {
     }
 }
 
-/// A plain left-button click at `(col, row)`.
 pub fn click(col: u16, row: u16) -> MouseEvent {
     mouse(col, row, MouseEventKind::Down(MouseButton::Left))
 }
 
-/// A [`Duration`] of `n` milliseconds, for double-click timing windows.
 pub fn ms(n: u64) -> Duration {
     Duration::from_millis(n)
 }
@@ -506,6 +498,11 @@ pub fn head_oid(repo: &Path) -> String {
         .args(["rev-parse", "HEAD"])
         .output()
         .expect("git rev-parse");
+    assert!(
+        out.status.success(),
+        "git rev-parse HEAD failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
