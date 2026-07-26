@@ -268,17 +268,77 @@ Enabling wrap resets the offset to 0 — the two are mutually exclusive — and 
 same-file refresh preserves it, matching `diff_scroll`'s convention.
 
 **Cross-file scroll.** With `cross_file_scroll` on (key `f`; Status and
-Review only — History is excluded), scrolling past a diff's edge is a
-boundary crossing, never a concatenated document: an ordinary selection
-change to the neighboring file plus a placement at its top (scrolling down)
-or bottom (scrolling up). A one-bit `wheel_edge` memory makes the wheel
-"clamp first, cross on a subsequent tick" even for a diff shorter than the
-viewport; the keyboard rule lets `j`/`k` finish scrolling a wrapped target
-taller than the viewport before hopping. The destination is recorded as
-`pending_diff_placement` — a refresh-stable `(SelectionId, Placement)`, not a
-row index a relist could renumber — and consumed unconditionally the next
-time that destination's diff syncs, so per-file diffs stay lazy: a hop
-computes exactly the file it lands on, nothing eagerly.
+Review only — History is excluded and never crossed), every file's layout
+gains a `FileHeaderRow` at row 0 (`RowContent::FileHeader` /
+`RowTarget::FileHeader` / `HitRegion::FileHeader`) — one physical row, always
+truncated rather than wrapped, never h-shifted — built once from the same
+`stat_spans` core the review/history file lists use, never re-derived per
+frame; `LayoutKey` gains `cross_file`, so toggling `f` rebuilds the layout.
+The conceptual document is the concatenation of every file's layout in list
+order, but strix never materializes it: `App::diff_window` renders a
+viewport-sized `DiffWindow` — the selected file (the *anchor*) from the
+current scroll offset, then as many following files' prepared `FileSection`s
+(each a `WindowSegment`) as fit — and `App::ensure_diff_window` prepares
+exactly what that window needs on the event path, never during render.
+
+**Scroll domain and the handoff.** `diff_scroll` stays anchor-relative
+(anchor = the selected file, unchanged single source of truth). Let `R` be
+the anchor's row count (header included) and `V` the viewport height.
+`App::wheel_scroll_window(delta)` — the wheel / list-half-page entry
+whenever cross-file scroll is on — applies the signed delta in `i64`,
+renormalizes across file boundaries via the identity `(file B, o) ≡ (file A,
+R_A + o)`, then applies the end-of-stream clamp discovered by walking the
+window (`App::window_rows`) until it can no longer fill `V` rows: a short
+last file therefore floors before its header passes the top, so the wheel's
+title never flips onto it — classic sticky-header behaviour, still reachable
+by keyboard crossing or a list click. Up-renormalization triggers only at `o
+< 0`, so `(B, 0)` is a legal resting state; the pixel-identical state reached
+scrolling *down* is `(A, R_A)` with the title on `A` — the boundary
+hysteresis is directional by design. `App::flip_anchor(to, new_offset)` — the
+only way the anchor moves — seeds `current_diff`/`diff_key`/`diff_section`
+(or Review's cached-diff slot) and `self.layout` straight from the section
+cache, bumps `layout_generation` and the generation the h-scroll memo keys
+on, and sets `diff_scroll` directly; it never calls `review_reveal_cursor`
+(which would clamp the offset back into the anchor's own domain) and queues
+no placement token — `sync_diff`'s key already matches, so it early-returns.
+Because the border title is already selection-driven, the one-row-past-the-
+top handoff needs no dedicated code path: it falls out of exactly when
+`flip_anchor` runs.
+
+**Section cache and laziness.** Each file's prepared contribution
+(`FileSection { diff, rows }`) lives in a hand-rolled `SectionCache` — no
+`lru` dependency — keyed by file identity (`FileId::Status { section, path }`
+/ `FileId::Review { path }`) and tagged with the `LayoutKey` plus a
+`stream_generation` counter that invalidates on every Status `refresh()` and
+`reload()`, a Review base/head change or relist, and every comment mutation.
+Entries the current window still needs are pinned; everything else LRU-evicts
+past a fixed budget (`SECTION_BUDGET`, 32) — a viewport of header-only binary
+files can legitimately pin more than the budget. `App::prepare_section` is
+the single compute seam every laziness trigger funnels through, so
+`diff_compute_count` still counts exactly the files the window legitimately
+needed: scrolling inside one large file computes nothing, a boundary crossing
+computes exactly the next file, and a large fling renormalizes through
+intermediate files only as far as their row counts are needed to resolve the
+landing anchor. The highlight cache is now per-file sub-maps, evicted
+together with a file's section entry, because strip rows highlight with
+*their own* file's syntax rather than the anchor's.
+
+**Keyboard and mouse crossing.** `review_move_cursor`'s existing hard-edge
+check now calls `App::cross_file_step` instead of stopping: `j` at the last
+target flips to `(next, 0)` in one press, the arriving file's header leading
+the viewport and taking the cursor; `k` at the header flips to the previous
+file bottom-aligned plus one strip row (`R_prev + 1 - V`), so the departed
+file's own header stays visible at the bottom edge, marking where the cursor
+came from. A keypress while the wheel has scrolled into the extended domain
+still act-and-reveals as before, snapping the viewport back to the cursor.
+`list_scroll_half_page` routes through `wheel_scroll_window` too — the file
+list has no cursor to move, so Ctrl-d/u there is a plain continuous tick.
+Strip rows render but stay inert to clicks until resolved through the
+per-frame window hit map (`WindowHit`, recorded by the renderer alongside
+`diff_area`/`x_rects`): `App::strip_click` on a non-anchor hit reuses the
+already-prepared section via `flip_anchor` to select that file and place the
+cursor on the clicked target, reorienting the view like a list click rather
+than preserving the old offset.
 
 **Comment boxes.** A comment renders as a bordered, multi-row box directly
 below its anchored line: a title row (`● you — <file> R<line>` or

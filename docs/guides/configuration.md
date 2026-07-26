@@ -27,7 +27,8 @@ menu_bar = true
 wrap_lines = false
 
 # Cross-file scroll: scrolling (wheel or keyboard) past the end of one file's
-# diff crosses into the next file's diff, past the top into the previous one.
+# diff continues into the next file's diff (and past the top into the
+# previous one) as one continuous stream, each file led by its own header row.
 # Off by default (scrolling clamps at each file's edge); toggle at runtime with
 # `f`. Applies to the Status and Review diff panes; the History view is excluded.
 cross_file_scroll = false
