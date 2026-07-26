@@ -101,9 +101,10 @@ box is still one step regardless. `k` is asymmetric: stepping back past the
 it, since a previous file can never render below the one you started on.
 Any action you take (`c`, `X`, stage/unstage, discard, …) while the cursor
 has walked into another file acts on *that* file — the selection catches up
-to the cursor automatically. Moving the mouse wheel, refreshing, resizing, or
-toggling `w`/`n`/`d`/`f` while the cursor is mid-walk snaps it back to the
-selected file.
+to the cursor automatically. Anything that moves the view or the focus out
+from under a mid-walk cursor snaps it back to the selected file: a wheel
+scroll that crosses a boundary, a refresh, a resize, `g`/`G`, a file-list
+click, switching panes or views, or toggling `w`/`n`/`d`/`f`.
 
 ### Comments (working tree)
 

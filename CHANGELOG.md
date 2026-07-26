@@ -44,11 +44,10 @@ independent of which file is selected.
   per-file diffs stay lazy — only the files the window actually shows are
   computed.
 - **Clicking a neighboring file's row now places the cursor instead of
-  selecting the file** — a behavior change from the click-to-select-and-jump
-  the bullet above originally introduced. The click moves nothing else (no
-  flip, no reveal, no selection or title change); the file is only selected
-  once you act on it (stage, comment, etc.), consistent with the keyboard
-  walk above.
+  selecting the file** — previously such a click selected that file and
+  jumped the view to its top. The click now moves nothing else (no flip, no
+  reveal, no selection or title change); the file is only selected once you
+  act on it (stage, comment, etc.), consistent with the keyboard walk above.
 
 ## v0.0.6 — 2026-07-24
 
