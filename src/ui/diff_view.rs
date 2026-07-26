@@ -159,8 +159,10 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
 
     let mut out: Vec<Line> = Vec::new();
     let mut x_rects: HashMap<u64, Rect> = HashMap::new();
-    // Strip comment boxes render, but record no close rects: `[x]` is anchor-only
-    // in v1 (plan 006 §3.4).
+    // Strip boxes record their close rects too (plan 007 §3.3d), but into their
+    // own map: a dup-path Status file renders the same comment in both its
+    // sections, and the two rects must not race on insertion order. They merge
+    // below under anchor precedence.
     let mut strip_rects: HashMap<u64, Rect> = HashMap::new();
     // The window hit map (plan 006 §3.6): one entry per row this loop pushes to
     // `out`, in the same order, so index `k` here lines up with `out[k]`.
@@ -253,8 +255,16 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
                 id: segment.id.clone(),
                 target: row.target,
                 is_anchor,
+                side: row.side,
             });
         }
+    }
+    // Anchor precedence (plan 007 §3.3d): where one comment id was drawn in both
+    // an anchor row and a strip row, the anchor's rect is the one clicks resolve
+    // against and the strip copy is dropped for this frame. Ids are globally
+    // unique otherwise, so every other strip rect lands.
+    for (id, rect) in strip_rects {
+        x_rects.entry(id).or_insert(rect);
     }
     app.set_x_rects(x_rects);
     app.set_window_hits(window_hits);

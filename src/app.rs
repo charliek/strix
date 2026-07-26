@@ -249,6 +249,11 @@ enum ClickRegion {
     Code(usize),
     Comment(u64),
     Close(u64),
+    /// A file header row, which only a *strip* click can land on: the anchor's
+    /// hit-test rejects headers outright (they are no double-click candidate
+    /// there), while a double-click on a strip header converges on that file —
+    /// the flip is the whole act (plan 007 §3.3e).
+    FileHeader,
 }
 
 /// What a left-click resolved to on the diff pane — the semantic double-click
@@ -667,6 +672,11 @@ pub(crate) struct WindowHit {
     /// The target within `id`'s own layout this row draws.
     pub(crate) target: RowTarget,
     pub(crate) is_anchor: bool,
+    /// The row's side-by-side column, or `None` for a full-width row — the same
+    /// `LayoutRow.side` the anchor path reads through `in_side_column`, carried
+    /// here so a click in a strip box's blank sibling column resolves like the
+    /// anchor equivalent rather than as a click on the box (plan 007 §3.3c).
+    pub(crate) side: Option<Side>,
 }
 
 /// The state signature a [`WindowHit`] map was recorded against. The event
@@ -4055,18 +4065,15 @@ impl App {
             return;
         }
 
-        // A click on a strip row selects that file and places the cursor on
-        // the clicked target (plan 006 §3.6), resolved from the per-frame
-        // window hit map — `diff_row_at`/`hit_target` only ever resolve rows
-        // inside the *anchor's* own layout, which is what keeps a strip row
-        // click-inert otherwise. An anchor-row hit (or no hit at all: outside
-        // the diff pane, History, or the shortfall region) falls through to
-        // the unchanged path below. Never a double-click candidate, so the
-        // tracker is cleared like every other fully-consumed click.
+        // A click on a strip row is handled entirely by `strip_click` (plan 007
+        // §3.3c–e), resolved from the per-frame window hit map —
+        // `diff_row_at`/`hit_target` only ever resolve rows inside the *anchor's*
+        // own layout, so a strip row would otherwise be inert. An anchor-row hit
+        // (or no hit at all: outside the diff pane, History, or the shortfall
+        // region) falls through to the unchanged path below.
         if let Some(hit) = self.window_hit_at(pos) {
             if !hit.is_anchor {
-                self.strip_click(hit);
-                self.last_click = None;
+                self.strip_click(&hit, pos, now);
                 return;
             }
         }
@@ -4216,38 +4223,116 @@ impl App {
         }
     }
 
-    /// Handle a left-click on a strip row (plan 006 §3.6): select that file
-    /// through the same prepared-section path the keyboard cross uses
-    /// (`flip_anchor`) — the row was drawn this frame, so its section is
-    /// already prepared and the flip never recomputes — then place the cursor
-    /// on the clicked target and reveal. A strip click is a jump, not a
-    /// scroll: like a list click, the view reorients around the new cursor
-    /// rather than preserving the old offset.
+    /// Handle a left-click on a strip row — a row of a file below the anchor in
+    /// the prepared window (plan 007 §3.3c–e).
     ///
-    /// Two defensive checks, both for a section that vanished between "the
-    /// row was drawn" and "the click resolved" (a `window_hit_at` epoch
-    /// mismatch already screens out most such staleness, but a same-frame
-    /// invalidation with the epoch still intact is conceivable): a failed
-    /// flip is a full no-op (nothing moved, so acting on `hit.target` would
-    /// resolve against whichever file is still selected); a successful flip
-    /// whose installed layout no longer contains `hit.target` (the file's own
-    /// content changed shape) resets the cursor to the top instead of pinning
-    /// a target that isn't there.
-    fn strip_click(&mut self, hit: WindowHit) {
-        let Some(id) = hit.id else { return };
-        // Exact: the hit carries the strip row's own `FileId`, so a dup-path
-        // status file must not resolve to its sibling section (plan 007 §3.3a).
-        let Some(index) = self.stream_index_of_exact(&id) else {
+    /// A single click is **pure cursor placement**: it pins a divergent
+    /// [`CursorAddress`] at the clicked target and does nothing else — no flip,
+    /// no reveal, no selection or title change, zero view movement. (Focusing the
+    /// diff pane is not movement, and `place_cursor` requires it; an anchor click
+    /// focuses the same way.) Because the frame stays put, the clicked row is
+    /// still under the pointer for a second click, which is what makes the
+    /// double-click of §3.3(e) pair naturally — the flip-and-reveal this used to
+    /// do moved the row out from under it.
+    ///
+    /// The `[x]` close cell is checked first and is target-qualified: the clicked
+    /// row must itself be that comment's box, in that box's column, with the
+    /// recorded rect under the pointer — never "some rect happens to cover this
+    /// coordinate". A dup-path Status file can render one comment in both
+    /// sections; the renderer keeps the *anchor's* rect (§3.3d), so the strip
+    /// copy's `[x]` simply isn't clickable that frame and the click places the
+    /// cursor instead.
+    fn strip_click(&mut self, hit: &WindowHit, pos: Position, now: Instant) {
+        let Some(file) = hit.id.clone() else {
+            self.last_click = None;
             return;
         };
-        if !self.flip_anchor(index, 0, FlipCursor::Reset) {
+        if let Some(id) = self.strip_close_click(hit, pos) {
+            self.delete_comment_id(id);
+            self.last_click = None;
             return;
         }
+        let target = self.strip_hit_target(hit, pos);
+        let double = target
+            .as_ref()
+            .is_some_and(|t| is_double_click(self.last_click.as_ref(), now, t));
         self.focus_active_diff();
-        let target_resolves = self.review_index_of(hit.target).is_some();
-        self.set_cursor_on_anchor(target_resolves.then_some(hit.target));
-        self.review_reveal_cursor();
-        self.ensure_diff_window(self.diff_pane_width(), self.diff_viewport.get());
+        // A section that vanished between "the row was drawn" and "the click
+        // resolved" (the epoch guard screens out most such staleness, but a
+        // same-frame invalidation is conceivable) leaves the address invalid, and
+        // placing is then a full no-op rather than a cursor pointing nowhere.
+        if !self.place_cursor(CursorAddress {
+            file,
+            target: hit.target,
+        }) {
+            self.last_click = None;
+            return;
+        }
+        if double {
+            self.strip_double_click(hit.target);
+            // Reset the tracker so a triple-click's third press can't re-fire.
+            self.last_click = None;
+        } else {
+            self.last_click = target.map(|t| (now, t));
+        }
+    }
+
+    /// The comment a strip click deletes: the id of the box its row draws, when
+    /// the click also fell in that box's column and on that box's recorded `[x]`
+    /// rect — the target-qualified, column-qualified test of §3.3(d).
+    fn strip_close_click(&self, hit: &WindowHit, pos: Position) -> Option<u64> {
+        let id = target_comment_id(hit.target)?;
+        let hit_close = self.in_side_column(pos, hit.side)
+            && self.comment_close_rect(id).is_some_and(|r| r.contains(pos));
+        hit_close.then_some(id)
+    }
+
+    /// The double-click key for a strip-row click (plan 007 §3.3e) — the strip
+    /// counterpart of [`App::hit_target`], which resolves against the anchor's
+    /// layout and so can't see these rows. Same `HitTarget` shape, with two
+    /// differences the strip domain forces: `file` is the *clicked* file's path
+    /// (no flip happened, so `active_diff_path` still names the anchor), and a
+    /// file header is a real region here rather than a rejection.
+    ///
+    /// `None` where the row can't pair into a double-click at all: the blank
+    /// sibling column of a side-by-side box (mirroring the anchor hit-test), or
+    /// the in-place editor.
+    fn strip_hit_target(&self, hit: &WindowHit, pos: Position) -> Option<HitTarget> {
+        let region = match hit.target {
+            RowTarget::Code(line) => ClickRegion::Code(line),
+            RowTarget::Comment(id) | RowTarget::Orphan(id) => {
+                if !self.in_side_column(pos, hit.side) {
+                    return None;
+                }
+                ClickRegion::Comment(id)
+            }
+            RowTarget::FileHeader => ClickRegion::FileHeader,
+            RowTarget::Editor => return None,
+        };
+        Some(HitTarget {
+            generation: self.layout_generation.get(),
+            view: self.view,
+            file: hit.id.as_ref().map(|id| id.path().to_string()),
+            region,
+        })
+    }
+
+    /// Act on a recognized double-click whose first press placed the cursor on a
+    /// strip row (plan 007 §3.3e): converge-then-act through §3.3(g)'s machinery,
+    /// which the cursor now addresses. A code row or a human note opens the editor
+    /// exactly as `c` would; an agent note flashes read-only *without* flipping
+    /// (eligibility before the flip); a file header only converges — selecting the
+    /// file is the whole act there.
+    fn strip_double_click(&mut self, target: RowTarget) {
+        if target == RowTarget::FileHeader {
+            self.converge_on_cursor();
+            return;
+        }
+        match self.view {
+            ViewMode::Status => self.status_comment_action(),
+            ViewMode::Review => self.review_comment_action(),
+            ViewMode::History => {}
+        }
     }
 
     /// Route a left-button press that isn't consumed by the editor: grab a split
