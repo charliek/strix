@@ -3,9 +3,9 @@
 //! and `stream_generation` invalidation, and the `DiffWindow` the renderer
 //! consumes in C3.
 //!
-//! Nothing here is wired into the event loop yet — C2 is infrastructure, so the
-//! tests drive `ensure_diff_window` (the event-path fill) and `diff_window` (the
-//! read-only assembly) directly, exactly the way C3's wheel path will.
+//! The tests drive `ensure_diff_window` (the event-path fill) and `diff_window`
+//! (the read-only assembly) directly, exactly the way the wheel path does since
+//! C3 wired them into the event loop.
 
 mod common;
 

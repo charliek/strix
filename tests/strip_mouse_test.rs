@@ -378,8 +378,9 @@ fn x_click_on_a_strip_box_does_not_delete_it() {
     let (_repo, mut app) = review_with_strip_comment_box();
     let (screen_row, _file_local_row, comment_id) = find_strip_box_title(&app);
 
-    // The exact column an anchor `[x]` would occupy: `box_w - 4` from the box's
-    // left edge (`box_title_spans`), full-width since the box is unified.
+    // An anchor box's `[x]` cell starts at `box_w - 4` from the box's left edge
+    // (`box_title_spans`); clicking `box_w - 3` lands on its `x`. Full-width
+    // since the box is unified.
     let diff = app.diff_area();
     let box_w = diff.width as usize;
     let close_x = diff.x + (box_w - 3) as u16;
