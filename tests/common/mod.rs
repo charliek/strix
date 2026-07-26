@@ -10,12 +10,13 @@ use std::time::Duration;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
-use strix::app::{App, DiffWindow, RowTarget};
+use strix::app::{App, DiffWindow, FileId, RowTarget};
 use strix::comments::{Branch, Comment, Store};
 use strix::config::Config;
 use strix::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use strix::git::Section;
 use strix::terminal::dump_frame;
 use tempfile::TempDir;
 
@@ -514,6 +515,23 @@ pub fn head_oid(repo: &Path) -> String {
 
 /// The fixed pane width both suites render at.
 const STREAM_W: u16 = 120;
+
+/// A working-tree status file's stream identity.
+pub fn unstaged(path: &str) -> FileId {
+    FileId::Status {
+        section: Section::Unstaged,
+        path: path.to_string(),
+    }
+}
+
+/// An index status file's stream identity — the *other* entry a path modified
+/// both in the index and in the working tree occupies.
+pub fn staged(path: &str) -> FileId {
+    FileId::Status {
+        section: Section::Staged,
+        path: path.to_string(),
+    }
+}
 
 /// Cursor's resolved [`RowTarget`] at the anchor's current layout, if any.
 pub fn cursor_target(app: &App) -> Option<RowTarget> {

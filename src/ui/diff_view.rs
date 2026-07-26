@@ -108,10 +108,11 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(block, area);
     app.set_diff_area(inner);
 
-    // The `[start, end)` physical rows of the cursor target to paint with the
-    // selection background — `None` outside a cursor-bearing view or while its
-    // file list is focused (plan §3.4). A comment box spans several rows.
-    let cursor = app.review_cursor_highlight();
+    // The file the cursor addresses and the `[start, end)` rows of its target in
+    // *that file's own* layout, to paint with the selection background — `None`
+    // outside a cursor-bearing view or while its file list is focused (plan §3.4).
+    // A comment box spans several rows.
+    let cursor = app.cursor_highlight_span();
 
     // The physical layout drives both the row count (metrics) and rendering; a
     // code line is one row, a comment box several. Built for this pane width, so a
@@ -158,8 +159,10 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
 
     let mut out: Vec<Line> = Vec::new();
     let mut x_rects: HashMap<u64, Rect> = HashMap::new();
-    // Strip comment boxes render, but record no close rects: `[x]` is anchor-only
-    // in v1 (plan 006 §3.4).
+    // Strip boxes record their close rects too (plan 007 §3.3d), but into their
+    // own map: a dup-path Status file renders the same comment in both its
+    // sections, and the two rects must not race on insertion order. They merge
+    // below under anchor precedence.
     let mut strip_rects: HashMap<u64, Rect> = HashMap::new();
     // The window hit map (plan 006 §3.6): one entry per row this loop pushes to
     // `out`, in the same order, so index `k` here lines up with `out[k]`.
@@ -179,6 +182,14 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
             ),
         };
         let is_anchor = segment.is_anchor();
+        // Per-segment resolution (plan 007 §3.3i): the highlight belongs to the
+        // file the cursor addresses, matched by identity rather than by "is this
+        // the anchor?" — which is what lets it paint a strip row while the anchor
+        // stays put. Resolved once per segment; the rows below only test the span.
+        let cursor_span = cursor
+            .as_ref()
+            .filter(|(file, _)| segment.id.as_ref() == Some(file))
+            .map(|(_, span)| span);
         let syntax = syntax_for(&segment.path);
         let number_width = line_number_width(seg_lines);
         let content_width =
@@ -235,19 +246,25 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
                     file_header_line(header, theme, inner.width as usize)
                 }
             };
-            // The cursor addresses the anchor file only, so an outgoing file's
-            // highlight goes with it once its rows become strip rows (plan §3.2f).
-            let in_cursor = is_anchor
-                && cursor
-                    .as_ref()
-                    .is_some_and(|span| span.contains(&(segment.row_range.start + k)));
+            // `row_range.start + k` is the row's index in its file's own layout,
+            // the domain the span is in.
+            let in_cursor =
+                cursor_span.is_some_and(|span| span.contains(&(segment.row_range.start + k)));
             out.push(mark_cursor_row(line, in_cursor, theme));
             window_hits.push(WindowHit {
                 id: segment.id.clone(),
                 target: row.target,
                 is_anchor,
+                side: row.side,
             });
         }
+    }
+    // Anchor precedence (plan 007 §3.3d): where one comment id was drawn in both
+    // an anchor row and a strip row, the anchor's rect is the one clicks resolve
+    // against and the strip copy is dropped for this frame. Ids are globally
+    // unique otherwise, so every other strip rect lands.
+    for (id, rect) in strip_rects {
+        x_rects.entry(id).or_insert(rect);
     }
     app.set_x_rects(x_rects);
     app.set_window_hits(window_hits);

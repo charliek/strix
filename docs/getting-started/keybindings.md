@@ -88,6 +88,24 @@ same effect as arrowing to it.
 | `]`, `[`        | Jump to the next / previous comment               |
 | `h`, `←`        | Focus the Changes pane                            |
 
+### Crossing files (cross-file scroll on)
+
+With `f` on, `j`/`k` and Ctrl-d/u walk the cursor across file boundaries
+instead of stopping at the current file's edge. `j` past the last row steps
+the cursor into the next file — through however many short files a single
+press's residual reaches — while the file list's selection and the border
+title stay put until the view actually scrolls past the boundary; a comment
+box is still one step regardless. `k` is asymmetric: stepping back past the
+*first* row of the selected file immediately switches to the previous file
+(selection, title, and cursor all move together) rather than walking through
+it, since a previous file can never render below the one you started on.
+Any action you take (`c`, `X`, stage/unstage, discard, …) while the cursor
+has walked into another file acts on *that* file — the selection catches up
+to the cursor automatically. Anything that moves the view or the focus out
+from under a mid-walk cursor snaps it back to the selected file: a wheel
+scroll that crosses a boundary, a refresh, a resize, `g`/`G`, a file-list
+click, switching panes or views, or toggling `w`/`n`/`d`/`f`.
+
 ### Comments (working tree)
 
 The diff pane's cursor above also addresses comments — worktree notes on the
@@ -191,10 +209,10 @@ remapping one never affects the other.
 | Click a pane                  | Focus that pane                                 |
 | Click a commit in the graph   | Select it (and show its details)                |
 | Click a row in the diff pane (Status or Review) | Focus the diff and move the cursor there (a comment box is selected, not opened — double-click or press `c` to edit it) |
-| Click a neighboring file's row in the diff pane (cross-file scroll on) | Select that file and place the cursor on the clicked row; the view reorients like a list click rather than preserving the scroll offset |
-| Double-click a code line in the diff pane | Open the in-place editor there (add a comment); excludes the marker zone and the file list |
-| Double-click a comment box    | Edit it (an agent note flashes read-only instead) |
-| Click a comment box's `[x]`   | Delete that comment, no confirmation             |
+| Click a neighboring file's row in the diff pane (cross-file scroll on) | Place the cursor there — nothing else moves. No flip, no reveal, no selection or title change; the file is only selected once you act (stage, comment, etc.) on it |
+| Double-click a code line in the diff pane | Open the in-place editor there (add a comment); on a neighboring file's row, selects that file first, then opens the editor; excludes the marker zone and the file list |
+| Double-click a comment box    | Edit it (an agent note flashes read-only instead — a read-only flash on a neighboring file's box doesn't select that file either) |
+| Click a comment box's `[x]`   | Delete that comment, no confirmation (a neighboring file's box deletes without selecting that file) |
 | Drag the vertical split bar   | Resize the left column vs the diff              |
 | Drag the horizontal split bar | Resize Committed Changes vs Graph (History view)|
 | Scroll wheel                  | Scroll the pane under the cursor; in the diff pane this moves the viewport only — the cursor stays put |

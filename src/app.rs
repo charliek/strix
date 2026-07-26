@@ -249,6 +249,11 @@ enum ClickRegion {
     Code(usize),
     Comment(u64),
     Close(u64),
+    /// A file header row, which only a *strip* click can land on: the anchor's
+    /// hit-test rejects headers outright (they are no double-click candidate
+    /// there), while a double-click on a strip header converges on that file —
+    /// the flip is the whole act (plan 007 §3.3e).
+    FileHeader,
 }
 
 /// What a left-click resolved to on the diff pane — the semantic double-click
@@ -475,6 +480,38 @@ impl FileId {
     }
 }
 
+/// Where the diff cursor is: which file of the current view's stream it
+/// addresses, and which of *that file's own* [`RowTarget`]s it rests on (plan
+/// 007 §3.3a). Carrying the file alongside the target is what lets the cursor
+/// stand on a strip row — a file below the anchor in the stream — without the
+/// target being silently reinterpreted against the anchor's layout, which a bare
+/// `RowTarget` would be.
+///
+/// An address whose `file` is the anchor is *converged* (every write site before
+/// plan 007 produces one); anything else is *divergent* and lives under the
+/// divergence invariant (§3.3b): its file must be in the prepared window with
+/// the diff pane focused, or the cursor drops back to `None`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CursorAddress {
+    pub file: FileId,
+    pub target: RowTarget,
+}
+
+/// What happens to the diff cursor when the anchor flips under it
+/// ([`App::flip_anchor`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FlipCursor {
+    /// 006 §3.2d's contract: the arriving anchor starts with no cursor at all.
+    /// The wheel's mode — and the firewall that keeps mouse scrolling from
+    /// inheriting an address the keyboard walked to.
+    Reset,
+    /// Plan 007 §3.3h: the address survives the flip, captured before the
+    /// selection moves and re-installed after it. The mode every flip a *cursor*
+    /// movement triggered uses, so the row the user is pointing at is still the
+    /// row they are pointing at once the title has changed.
+    Keep,
+}
+
 /// One file's prepared contribution to the stream: the diff computed for it and
 /// the physical rows built from that diff. Named `FileSection` because `Section`
 /// alone is the staged/unstaged enum (`git::Section`).
@@ -534,6 +571,17 @@ impl SectionCache {
             used: self.clock,
             section,
         });
+    }
+
+    /// The section cached for `id` whatever tag it carries — including a stale one
+    /// the next [`SectionCache::get`] would discard, which is what makes this the
+    /// *outgoing* section right after a `stream_generation` bump. Read-only: no
+    /// LRU stamp and no discard, so inspecting the cache cannot perturb it.
+    fn cached(&self, id: &FileId) -> Option<Rc<FileSection>> {
+        self.entries
+            .iter()
+            .find(|entry| entry.id == *id)
+            .map(|entry| Rc::clone(&entry.section))
     }
 
     /// Evict least-recently-used entries past [`SECTION_BUDGET`], never one the
@@ -624,6 +672,11 @@ pub(crate) struct WindowHit {
     /// The target within `id`'s own layout this row draws.
     pub(crate) target: RowTarget,
     pub(crate) is_anchor: bool,
+    /// The row's side-by-side column, or `None` for a full-width row — the same
+    /// `LayoutRow.side` the anchor path reads through `in_side_column`, carried
+    /// here so a click in a strip box's blank sibling column resolves like the
+    /// anchor equivalent rather than as a click on the box (plan 007 §3.3c).
+    pub(crate) side: Option<Side>,
 }
 
 /// The state signature a [`WindowHit`] map was recorded against. The event
@@ -894,14 +947,18 @@ impl CommentEdit {
 }
 
 /// A diff pane's cursor + editor state, owned by each view that has a cursor.
-/// The cursor names a [`RowTarget`] (logical), not a physical row: `None` is the
-/// reset state (top of the layout), resolved to physical row 0 once the layout
-/// exists — a file change or mode toggle resets before the new layout is built,
-/// so the concrete target isn't yet known. Scroll/metrics/row caches stay
-/// App-global (History shares them and has no cursor).
+/// The cursor names a [`CursorAddress`] — a file plus one of its logical
+/// [`RowTarget`]s, never a physical row: `None` is the reset state (the anchor's
+/// first target), resolved once the layout exists — a file change or mode toggle
+/// resets before the new layout is built, so the concrete target isn't yet known.
+/// Scroll/metrics/row caches stay App-global (History shares them and has no
+/// cursor).
+///
+/// The field is written **only** by `App::write_cursor` and the setters above it
+/// (plan 007 §3.3a); nothing else assigns it.
 #[derive(Debug, Default)]
 struct DiffPaneState {
-    cursor: Option<RowTarget>,
+    cursor: Option<CursorAddress>,
     /// The in-place editor slot: `Some` while a comment is being authored/edited
     /// in this pane (plan §3.5). Keys route here before the keymap; the layout
     /// expands to show the editor box, recomputed from the edit's anchor.
@@ -1411,6 +1468,10 @@ impl App {
     /// section and path) when it survives, and forcing the open diff to
     /// recompute — its content may have changed in place even if its path did not.
     pub fn refresh(&mut self) {
+        // A re-read can renumber, re-section, or drop the file a divergent cursor
+        // names; it snaps back to the anchor rather than chasing it (plan 007
+        // §3.3b — the deliberate "watcher tick mid-walk" trade).
+        self.clear_divergent_cursor();
         let previous = self.selected_section_path();
         match self.repo.status() {
             Ok(status) => {
@@ -1660,14 +1721,16 @@ impl App {
             Action::ToggleStage => self.toggle_stage(),
             Action::Stage => self.stage_selected(),
             Action::Unstage => self.unstage_selected(),
-            // `x` discards the selected file's changes — but stays inert (neither
+            // `x` discards the file under the cursor — but stays inert (neither
             // discarding nor deleting) when the *diff pane is focused* and its
             // cursor rests on a comment/orphan row, so it can never be mistaken for
-            // the deletion key (`X`/`Action::DeleteComment`, below). With the file
-            // list focused, `x` discards the list-selected file regardless of where
-            // the hidden diff cursor sits.
+            // the deletion key (`X`/`Action::DeleteComment`, below). The gate reads
+            // the cursor's whole *address* (plan 007 §5-B3): a comment row in a
+            // file the cursor walked into is as inert as one in the anchor. With
+            // the file list focused, `x` discards the list-selected file regardless
+            // of where the hidden diff cursor sits.
             Action::Discard => {
-                if !self.diff_focused() || self.cursor_comment_id().is_none() {
+                if !self.diff_focused() || self.cursor_address_comment_id().is_none() {
                     self.request_discard();
                 }
             }
@@ -1871,7 +1934,7 @@ impl App {
         let count = self.review_row_count();
         let idx = if bottom { count.saturating_sub(1) } else { 0 };
         let target = self.review_target_at(idx);
-        self.set_review_cursor(target);
+        self.set_cursor_on_anchor(target);
         self.review_reveal_cursor();
     }
 
@@ -1880,34 +1943,46 @@ impl App {
     /// leaves the cursor and scroll untouched — resetting only the cursor would
     /// strand it above the preserved viewport. The one caller that must *not*
     /// reset on a real change (comment navigation, which places the cursor on a
-    /// specific row) sets `selected`/`cursor` directly.
+    /// specific row) moves `selected` itself and then places its own cursor.
     fn select_review_file(&mut self, idx: usize) {
-        if let Some(review) = self.review.as_mut() {
-            if review.selected != idx {
-                review.selected = idx;
-                // `None` is the top-of-layout reset; the new file's layout doesn't
-                // exist yet (it's built by the trailing `sync_active`).
-                review.pane.cursor = None;
-            }
+        let Some(review) = self.review.as_mut() else {
+            return;
+        };
+        if review.selected == idx {
+            return;
+        }
+        review.selected = idx;
+        // `None` is the top-of-layout reset; the new file's layout doesn't exist
+        // yet (it's built by the trailing `sync_active`).
+        self.set_cursor_on_anchor(None);
+    }
+
+    /// Move the diff cursor by `step` physical rows, then scroll the viewport so
+    /// it stays visible ("act-and-reveal", plan §3.4).
+    ///
+    /// With a stream below the pane the movement is the **walk** (plan 007
+    /// §3.3f); without one it is today's single-file clamp.
+    fn review_move_cursor(&mut self, down: bool, step: usize) {
+        if self.strip_anchor().is_some() {
+            self.walk_cursor(down, step);
+        } else {
+            self.move_cursor_in_anchor(down, step);
         }
     }
 
-    /// Move the diff cursor by `step` physical rows (clamped), then scroll the
-    /// viewport so it stays visible ("act-and-reveal", plan §3.4). The cursor is
-    /// re-pinned to the [`RowTarget`] at the new physical row. A multi-row comment
-    /// box shares one target across N physical rows, so a downward step never
-    /// stalls inside the current box: it starts past the box's own last row, which
-    /// makes `j`/`k` cross a whole box in one step (plan §3.0).
-    fn review_move_cursor(&mut self, down: bool, step: usize) {
+    /// The pre-stream cursor move: `step` physical rows clamped to the anchor's
+    /// own row list. The path taken with cross-file scroll off, while the in-place
+    /// editor is open (the strip is collapsed for its duration), and in any view
+    /// without a stream.
+    ///
+    /// A multi-row comment box shares one target across N physical rows, so a
+    /// downward step never stalls inside the current box: it starts past the box's
+    /// own last row, which makes `j`/`k` cross a whole box in one step (plan §3.0).
+    fn move_cursor_in_anchor(&mut self, down: bool, step: usize) {
         let count = self.review_row_count();
         if count == 0 {
-            // Only reachable with cross-file scroll off: with it on, the file-header
-            // row makes an empty or binary file a normal one-stop section rather
-            // than a rowless one (plan 006 §3.5), so crossing off it goes through
-            // the ordinary no-advance path below.
             return;
         }
-        let current = self.review_cursor_target();
         let (start, end) = self
             .review_cursor_span()
             .map_or((0, 1), |span| (span.start, span.end));
@@ -1919,26 +1994,136 @@ impl App {
             start.saturating_sub(step)
         };
         let target = self.review_target_at(next);
-        // A step that leaves the cursor on the same target is a "no advance": the
-        // cursor is already on the last (down) or first (up) target. With
-        // cross-file scroll on, either scroll within a taller-than-viewport target
-        // or, once the viewport is pinned at the hard edge, cross into the
-        // neighbouring file in one press (plan 006 §3.5) — the residual step past
-        // the boundary is discarded. With it off, or at the first/last file, this
-        // falls through to the plain reveal — today's clamping.
-        if target == current && self.cross_file_scroll && !self.editing() {
-            if !self.at_hard_edge(down) {
-                // Step within the tall target (cursor unchanged); Ctrl-d/u clamps
-                // toward the edge first, a later press then crosses.
-                self.scroll_diff(down, step.min(u16::MAX as usize) as u16);
-                return;
-            }
-            if self.cross_file_step(down) {
-                return;
-            }
-        }
-        self.set_review_cursor(target);
+        self.set_cursor_on_anchor(target);
         self.review_reveal_cursor();
+    }
+
+    /// The keyboard walk (plan 007 §3.3f).
+    ///
+    /// Movement is defined on the **flattened target stream** — every stream
+    /// file's physical rows concatenated in list order — and starts from wherever
+    /// the *cursor* is, which may be a file below the anchor. A step that runs off
+    /// the end of the cursor's file keeps its residual and spends it in the next
+    /// one, so `j` walks a stop at a time through however many short files it
+    /// meets while the anchor stays put, and Ctrl-d moves a full half page across
+    /// boundaries instead of pausing at each. The residual is discarded only at
+    /// the two ends of the stream, where there is nothing left to spend it on.
+    ///
+    /// The anchor follows only when the reveal below renormalizes past the
+    /// boundary (`o > R_anchor`, 006's strict hysteresis — the same threshold the
+    /// wheel flips at), except upward, where a destination *above* the anchor
+    /// renormalizes on the spot: previous files cannot render below the anchor, so
+    /// there is no divergent state to walk through (§3.3f's pinned asymmetry).
+    fn walk_cursor(&mut self, down: bool, step: usize) {
+        let width = self.diff_pane_width();
+        let Some(address) = self.cursor_address() else {
+            return; // no file, or a layout with no rows at all
+        };
+        let Some(index) = self.stream_index_of_exact(&address.file) else {
+            return;
+        };
+        let Some(span) = self.address_file_span(&address) else {
+            return;
+        };
+        // The tall-target rule (plan 006 §3.5), unchanged and checked before any
+        // crossing: when the step cannot advance within the cursor's own file but
+        // the viewport still has room to move, scroll inside the target rather
+        // than stepping off content the user hasn't seen yet.
+        //
+        // Converged cursors only, because `at_hard_edge` is anchor-domain: a
+        // divergent cursor implies the anchor is pinned at its *lower* edge
+        // (§3.3b's first corollary) but says nothing about the upper one, and its
+        // own file's rows are not the anchor's to measure anyway. That leaves the
+        // rule firing exactly where it did before the walk existed.
+        let stuck = self.address_is_anchor(&address)
+            && if down {
+                span.end >= self.stream_rows(index, width)
+            } else {
+                span.start == 0
+            };
+        if stuck && !self.at_hard_edge(down) {
+            self.scroll_diff(down, step.min(u16::MAX as usize) as u16);
+            return;
+        }
+        let Some((file, row)) = self.walk_step(index, &span, down, step, width) else {
+            return;
+        };
+        let Some(destination) = self.stream_address_at(file, row, width) else {
+            return;
+        };
+        let target = destination.target;
+        if self.address_is_anchor(&destination) {
+            self.set_cursor_on_anchor(Some(target));
+            self.review_reveal_cursor();
+            return;
+        }
+        // Reveal *before* pinning: walking into a file is what brings it into the
+        // window, and `place_cursor` deliberately refuses an address the window
+        // doesn't hold yet. The reveal may hand the anchor over to the very file
+        // being walked into (always, going up), which converges the address.
+        self.reveal_address(&destination);
+        if self.address_is_anchor(&destination) {
+            self.set_cursor_on_anchor(Some(target));
+        } else {
+            // A rejected placement — the window still doesn't hold the file
+            // because a section vanished under the walk — leaves the cursor where
+            // it was rather than pinning a dangling address.
+            self.place_cursor(destination);
+        }
+    }
+
+    /// Where `step` physical rows from `span` in stream file `index` lands, as
+    /// `(file, row)` in the flattened stream. Files crossed on the way are
+    /// prepared here — the walk's laziness trigger (plan 007 §3.4).
+    fn walk_step(
+        &mut self,
+        index: usize,
+        span: &Range<usize>,
+        down: bool,
+        step: usize,
+        width: u16,
+    ) -> Option<(usize, usize)> {
+        let mut file = index;
+        if down {
+            // `.max(span.end)` skips the rest of a multi-row target, so one press
+            // crosses a whole comment box.
+            let mut row = (span.start + step).max(span.end);
+            loop {
+                let rows = self.stream_rows(file, width);
+                if row < rows {
+                    return Some((file, row));
+                }
+                if file + 1 >= self.stream_len() {
+                    return Some((file, rows.checked_sub(1)?)); // last file: clamp
+                }
+                row -= rows;
+                file += 1;
+            }
+        } else {
+            let mut row = span.start as i64 - step as i64;
+            while row < 0 {
+                if file == 0 {
+                    return Some((0, 0)); // first file: clamp
+                }
+                file -= 1;
+                row += self.stream_rows(file, width) as i64;
+            }
+            Some((file, row as usize))
+        }
+    }
+
+    /// The address physical `row` of stream file `index` names: that file's
+    /// identity paired with the [`RowTarget`] its rows carry there — read from the
+    /// live layout when it is the anchor (the one file whose rows can carry the
+    /// in-place editor), from its prepared section otherwise.
+    fn stream_address_at(&mut self, index: usize, row: usize, width: u16) -> Option<CursorAddress> {
+        let file = self.stream_file_id(index)?;
+        let target = if Some(index) == self.stream_position() {
+            self.review_target_at(row)?
+        } else {
+            self.prepare_section(index, width)?.rows.get(row)?.target
+        };
+        Some(CursorAddress { file, target })
     }
 
     /// Half-page in review: the diff pane moves the cursor (act-and-reveal); the
@@ -1977,6 +2162,13 @@ impl App {
     /// fully shown, so it top-aligns to the box's first row rather than looping
     /// (plan §3.4).
     fn review_reveal_cursor(&mut self) {
+        if let Some(address) = self.divergent_address() {
+            // A divergent cursor has no row in the anchor's layout at all, so the
+            // anchor-domain arithmetic below would reveal the wrong rows (or
+            // none): §3.3h's window-aware reveal owns this case.
+            self.reveal_address(&address);
+            return;
+        }
         if self.active_pane().is_none() {
             return;
         }
@@ -2007,18 +2199,67 @@ impl App {
         self.diff_scroll.set(new_top.min(max_top));
     }
 
+    /// Scroll so `address` is visible, measured over the whole **stream** rather
+    /// than one file's rows (plan 007 §3.3h). Same rule as the anchor-domain
+    /// reveal above — already visible is a no-op, above the viewport top-aligns,
+    /// below pulls the last row in, a span taller than the viewport top-aligns —
+    /// but the top it computes is an extended-domain offset, settled through the
+    /// stream renormalizer. A top past the anchor's last row (`o > R_anchor`,
+    /// 006's strict hysteresis and the same threshold the wheel flips at) hands
+    /// the anchor over instead of clamping the address off screen; a negative one
+    /// hands it back to a previous file.
+    ///
+    /// The flip that settling may trigger is cursor-PRESERVING: an address being
+    /// revealed is an address the user is still pointing at. The wheel's resetting
+    /// flip is 006's contract and stays exactly as it was.
+    fn reveal_address(&mut self, address: &CursorAddress) {
+        let Some(anchor) = self.strip_anchor() else {
+            return;
+        };
+        let viewport = self.diff_viewport.get() as i64;
+        if viewport == 0 {
+            return;
+        }
+        let Some(span) = self.address_stream_span(address) else {
+            return;
+        };
+        let width = self.diff_pane_width();
+        let anchor_rows = self.diff_layout(width).len();
+        let top = self.paint_offset(anchor_rows, viewport as usize) as i64;
+        let new_top = if span.start < top || span.end - span.start >= viewport {
+            span.start
+        } else if span.end > top + viewport {
+            span.end - viewport
+        } else {
+            top
+        };
+        self.settle_stream_offset(anchor, new_top, FlipCursor::Keep);
+    }
+
     /// Whether the diff cursor target's first row lies within the visible
     /// viewport, tested against the same clamped offset the renderer paints with
     /// (so a wheel scroll that pushed it offscreen reads as not-visible).
+    ///
+    /// A *divergent* cursor has no row in the anchor's layout at all, so the
+    /// anchor-domain test below would read it as row 0 and call an off-screen
+    /// address visible; it is measured in window rows instead — the screen rows
+    /// its file actually draws (plan 007 §3.3g). Same contract in both branches:
+    /// the target's **first** row decides, so a comment box clipped by the
+    /// viewport bottom is visible, not hidden.
     fn review_cursor_visible(&self) -> bool {
         if self.active_pane().is_none() {
             return false;
         }
-        let cursor = self.review_cursor();
         let viewport = self.diff_viewport.get() as usize;
         if viewport == 0 {
             return false;
         }
+        if let Some(address) = self.divergent_address() {
+            return self
+                .address_window_placement(&address)
+                .is_some_and(|(start, _)| start < viewport);
+        }
+        let cursor = self.review_cursor();
         let top = self.diff_scroll.get().min(self.diff_scroll_limit());
         cursor >= top && cursor < top + viewport
     }
@@ -2034,6 +2275,70 @@ impl App {
         }
         self.review_reveal_cursor();
         false
+    }
+
+    /// Flip-then-act convergence (plan 007 §3.3g): hand the anchor — and with it
+    /// the selection, the title, and every `selected_file()` read downstream — to
+    /// the file the *cursor* names, so a diff-focused action acts on the row the
+    /// user is pointing at rather than on whichever file the list happens to have
+    /// selected. Returns whether the caller may go on to act.
+    ///
+    /// A converged cursor, and any action taken while the file list has focus, is
+    /// today's path untouched: nothing moves and this reports `true` at once.
+    ///
+    /// Callers check their own eligibility *first* and skip this when the action
+    /// would only flash or no-op on the resolved row (step 3) — an ineligible
+    /// target must never reorient the view. The rest of the sequence lives here:
+    /// validating the address (1), the two-press reveal gate (2), the
+    /// cursor-preserving flip (4), and the revalidation the caller acts behind (5).
+    fn converge_on_cursor(&mut self) -> bool {
+        if !self.diff_focused() {
+            return true;
+        }
+        let Some(address) = self.divergent_address() else {
+            return true;
+        };
+        if !self.cursor_address_valid(&address) {
+            // The window stopped holding the file between the last sweep and this
+            // key. Drop the address rather than fall back to the anchor: acting on
+            // a file other than the one under the cursor is the whole hazard.
+            self.write_cursor(None);
+            return false;
+        }
+        if !self.reveal_cursor_before_acting() {
+            return false;
+        }
+        if !self.flip_to_address(&address) {
+            return false;
+        }
+        debug_assert!(
+            !self.cursor_divergent(),
+            "convergence left the cursor pointing away from the anchor"
+        );
+        true
+    }
+
+    /// Step (4) of the convergence: make `address`'s file the anchor with the
+    /// cursor still on it.
+    ///
+    /// The arriving file is installed at offset 0, which is the *minimal*
+    /// reorientation available rather than an arbitrary one: `diff_scroll` counts
+    /// from the new anchor's own first row, a divergent file always begins below
+    /// the pane top, so every legal offset scrolls the view down and 0 scrolls it
+    /// least. The trailing reveal is then the ordinary anchor-domain one — the
+    /// address converged the moment the flip landed — and re-preparing the window
+    /// is what settling would have done had this gone through it (it cannot: the
+    /// end-of-stream clamp would hand a short last file straight back).
+    fn flip_to_address(&mut self, address: &CursorAddress) -> bool {
+        let Some(index) = self.stream_index_of_exact(&address.file) else {
+            return false;
+        };
+        if !self.flip_anchor(index, 0, FlipCursor::Keep) {
+            return false;
+        }
+        self.review_reveal_cursor();
+        self.ensure_diff_window(self.diff_pane_width(), self.diff_viewport.get());
+        true
     }
 
     /// The pane inner width of the last render, the key the physical layout is
@@ -2075,29 +2380,292 @@ impl App {
     /// and the box-crossing move. `None` when nothing is selectable.
     fn review_cursor_span(&self) -> Option<Range<usize>> {
         let target = self.review_cursor_target()?;
-        let layout = self.diff_layout(self.diff_pane_width());
-        let start = layout.iter().position(|row| row.target == target)?;
-        let len = layout[start..]
-            .iter()
-            .take_while(|row| row.target == target)
-            .count();
-        Some(start..start + len)
+        target_span(&self.diff_layout(self.diff_pane_width()), target)
     }
 
-    /// The target the cursor rests on: the pinned one, or (when unset after a
-    /// reset) the target at the top of the current layout.
+    /// The target the cursor rests on **in the anchor's layout**: the pinned
+    /// address's target when it is the anchor's, or (when unset after a reset)
+    /// the target at the top of the current layout.
+    ///
+    /// A *divergent* address has no anchor-domain answer at all — reinterpreting
+    /// its target against the anchor's rows is exactly the confusion
+    /// [`CursorAddress`] exists to prevent — so this reports `None` and the
+    /// address-aware accessors below serve those callers (plan 007 §3.3j).
     fn review_cursor_target(&self) -> Option<RowTarget> {
-        let pinned = self.active_pane()?.cursor;
-        pinned.or_else(|| self.review_target_at(0))
+        match self.active_pane()?.cursor.as_ref() {
+            Some(address) => self.address_is_anchor(address).then_some(address.target),
+            None => self.review_target_at(0),
+        }
     }
 
-    /// Pin the diff cursor to `target` (the write-side mirror of the read seam);
-    /// `None` resets it to the top of the layout. A no-op in a view with no cursor
-    /// (History).
-    fn set_review_cursor(&mut self, target: Option<RowTarget>) {
+    // --- The cursor write seam (plan 007 §3.3a) ---
+    //
+    // One setter family owns every mutation of `DiffPaneState.cursor`. Nothing
+    // else assigns the field, so an address can never be half-written (a target
+    // moved without the file it belongs to), and the divergence sweep below has
+    // exactly one place to hook.
+
+    /// The one place the cursor field is assigned. A no-op in a view with no
+    /// cursor (History).
+    fn write_cursor(&mut self, address: Option<CursorAddress>) {
         if let Some(pane) = self.active_pane_mut() {
-            pane.cursor = target;
+            pane.cursor = address;
         }
+    }
+
+    /// Pin the diff cursor to `target` **in the anchor's own file** — the
+    /// converged write every pre-007 seam does (`None` resets it to the top of
+    /// the anchor's layout). Divergence, if any, ends here: the address is
+    /// rebuilt around the current anchor rather than carried over.
+    fn set_cursor_on_anchor(&mut self, target: Option<RowTarget>) {
+        let address = target
+            .zip(self.active_file_id())
+            .map(|(target, file)| CursorAddress { file, target });
+        self.write_cursor(address);
+    }
+
+    /// Place the cursor at `address`, which may name a file other than the
+    /// anchor (plan 007 §3.3a). Returns whether it was placed: the address has to
+    /// satisfy the divergence invariant *now* — the diff pane focused, its file in
+    /// the prepared window, its target resolving in that file's rows — so no
+    /// caller can install a dangling highlight, a target that means nothing, or a
+    /// divergence the next sweep would immediately undo. The keyboard walk and
+    /// strip clicks are the production callers (both act on the focused diff);
+    /// B1 drives it from tests.
+    pub fn place_cursor(&mut self, address: CursorAddress) -> bool {
+        if !self.diff_focused()
+            || self.active_pane().is_none()
+            || !self.cursor_address_valid(&address)
+        {
+            return false;
+        }
+        self.write_cursor(Some(address));
+        true
+    }
+
+    /// Re-point a cursor that was converged on the stream row the selection just
+    /// *left* at the row it landed on, keeping its target — the same-path
+    /// staged↔unstaged move, where one file occupies two stream rows drawing the
+    /// same net HEAD→worktree diff (see [`FileId`]). Without this the address
+    /// would still name the row we left, read as divergent, and be swept to the
+    /// top: a regression against the bare-`RowTarget` cursor, which simply
+    /// survived the move (plan 007 §3.3a).
+    ///
+    /// Same path only, and only from `previous`: a genuinely divergent cursor on
+    /// the *other* section's row is left alone (selecting that row converges it
+    /// on its own), and a move to a different path resets through `sync_diff`'s
+    /// file-changed branch as it always did.
+    fn rebind_cursor_across_sections(&mut self, previous: Option<Section>) {
+        let Some(anchor) = self.active_file_id() else {
+            return;
+        };
+        let Some(address) = self.pinned_address() else {
+            return;
+        };
+        let FileId::Status { section, path } = &address.file else {
+            return;
+        };
+        if Some(*section) != previous || path != anchor.path() {
+            return;
+        }
+        let target = address.target;
+        self.write_cursor(Some(CursorAddress {
+            file: anchor,
+            target,
+        }));
+    }
+
+    /// Drop a *divergent* cursor back to `None` — both fields, never a foreign
+    /// target reinterpreted against the anchor (plan 007 §3.3b). An anchor cursor
+    /// is untouched, which is what keeps every trigger below behaviour-identical
+    /// for the converged case: refresh / reload / relist, resize, the `w`/`n`/`d`/
+    /// `f` layout toggles, a view change, a list click.
+    fn clear_divergent_cursor(&mut self) {
+        if self.cursor_divergent() {
+            self.write_cursor(None);
+        }
+    }
+
+    /// Enforce the divergence invariant wherever the window is (re)prepared: a
+    /// cursor may name a file other than the anchor only while the diff pane is
+    /// focused and that file is still in the prepared window with its target
+    /// resolving. Anything else drops it to `None`.
+    ///
+    /// This is also how a `stream_generation` bump re-validates the address
+    /// (§3.3b's second corollary), structurally rather than by enumeration: the
+    /// bump retires every cached section, so the address survives only if the
+    /// same event's `ensure_diff_window` re-prepared its file *and* the target
+    /// still resolves in the rebuilt rows.
+    ///
+    /// Resolving is not enough on its own, though: the file may have changed on
+    /// disk since (an agent's edit, not yet seen by a refresh), and a rebuilt
+    /// `Code(i)` denotes a *different line* while indexing just as happily. So the
+    /// rebuilt diff is compared against `outgoing` — what the address last
+    /// resolved against — and any difference drops it. That mirrors the anchor
+    /// cursor, which survives a same-file refresh only because
+    /// `recompute_status_diff` early-returns on an identical diff.
+    fn normalize_cursor(&mut self, outgoing: Option<Rc<FileSection>>) {
+        let Some(address) = self.divergent_address() else {
+            return;
+        };
+        if !self.diff_focused() || !self.cursor_address_valid(&address) {
+            self.write_cursor(None);
+            return;
+        }
+        let Some(outgoing) = outgoing else {
+            return;
+        };
+        let changed = self
+            .address_section(&address.file)
+            .is_none_or(|section| section.diff != outgoing.diff);
+        if changed {
+            self.write_cursor(None);
+        }
+    }
+
+    // --- Address-aware resolution (plan 007 §3.3j) ---
+    //
+    // Separate accessors, never an overload of the anchor-domain ones above:
+    // `review_index_of` / `review_target_at` / `comment_row_index` keep meaning
+    // exactly what their anchor-context callers (`place_diff_cursor`,
+    // `hit_target`, click routing) need.
+
+    /// The pinned address, if the cursor is pinned at all.
+    fn pinned_address(&self) -> Option<&CursorAddress> {
+        self.active_pane()?.cursor.as_ref()
+    }
+
+    /// The pinned target when it is the anchor's — the read the pre-007 code
+    /// spelled `pane.cursor` directly. `None` while unset *or* divergent.
+    fn pinned_anchor_target(&self) -> Option<RowTarget> {
+        let address = self.pinned_address()?;
+        self.address_is_anchor(address).then_some(address.target)
+    }
+
+    /// Whether `address` names the anchor (the selected file).
+    fn address_is_anchor(&self, address: &CursorAddress) -> bool {
+        self.active_file_id().as_ref() == Some(&address.file)
+    }
+
+    /// The pinned address when it is divergent (names a file other than the
+    /// anchor). Cloned: callers act on it while mutating the app — the ones that
+    /// only ask *whether* read [`App::cursor_divergent`].
+    fn divergent_address(&self) -> Option<CursorAddress> {
+        let address = self.pinned_address()?;
+        (!self.address_is_anchor(address)).then(|| address.clone())
+    }
+
+    /// `address`'s `[start, end)` span in *its own file's* row list: the live
+    /// layout when it names the anchor (the one file whose rows can carry the
+    /// in-place editor), its prepared section otherwise. `None` when the file
+    /// isn't resolvable or the target isn't in its rows.
+    fn address_file_span(&self, address: &CursorAddress) -> Option<Range<usize>> {
+        if self.address_is_anchor(address) {
+            return target_span(&self.diff_layout(self.diff_pane_width()), address.target);
+        }
+        let section = self.address_section(&address.file)?;
+        target_span(&section.rows, address.target)
+    }
+
+    /// Where `address`'s target starts on screen and how many of its rows the
+    /// window actually draws: `(first window row, drawn rows)`, window rows being
+    /// screen rows counted from the top of the diff pane. `None` when the target's
+    /// *first* row isn't drawn at all — its file isn't in the prepared window, or
+    /// that row is among the ones the segment skips (the anchor's rows above the
+    /// offset, or a strip tail past the viewport).
+    ///
+    /// A multi-row target straddling the viewport bottom is a legitimate answer
+    /// with `drawn < span.len()`: the user can see it, which is all the visibility
+    /// test of §3.3g step 2 asks. [`App::address_window_span`] is the stricter
+    /// read, for callers that need the whole target on screen.
+    fn address_window_placement(&self, address: &CursorAddress) -> Option<(usize, usize)> {
+        let window = self.diff_window(self.diff_pane_width(), self.diff_viewport.get());
+        let mut drawn = 0usize;
+        for segment in &window.segments {
+            if segment.id.as_ref() == Some(&address.file) {
+                let span = self.address_file_span(address)?;
+                // The segment draws `row_range` of its file's own rows; the span
+                // has to start inside that to have a screen position at all.
+                if span.start < segment.row_range.start || span.start >= segment.row_range.end {
+                    return None;
+                }
+                let base = drawn + (span.start - segment.row_range.start);
+                return Some((base, span.end.min(segment.row_range.end) - span.start));
+            }
+            drawn += segment.rows();
+        }
+        None
+    }
+
+    /// `address`'s span in window rows, when the window draws the target *whole*.
+    /// `None` when any of it is clipped — the caller wanting the visible head of a
+    /// clipped target reads [`App::address_window_placement`] instead.
+    fn address_window_span(&self, address: &CursorAddress) -> Option<Range<usize>> {
+        let span = self.address_file_span(address)?;
+        let (base, drawn) = self.address_window_placement(address)?;
+        (drawn == span.len()).then(|| base..base + span.len())
+    }
+
+    /// `address`'s span in the **offset domain**: physical rows counted from the
+    /// anchor file's own row 0, which is where `diff_scroll` lives (plan 006
+    /// §3.2a's extended domain, plus its mirror image above the anchor). This is
+    /// what [`App::reveal_address`] does its arithmetic in — [`App::
+    /// address_window_span`]'s screen rows move with the offset, so they cannot
+    /// express where the offset should go.
+    ///
+    /// Signed, because a file *before* the anchor sits at negative offsets: the
+    /// position the renormalizer turns back into a (previous file, offset) pair,
+    /// which is exactly how the upward walk flips. Files between the anchor and
+    /// the address are prepared on the way (§3.4).
+    fn address_stream_span(&mut self, address: &CursorAddress) -> Option<Range<i64>> {
+        let anchor = self.stream_position()?;
+        let index = self.stream_index_of_exact(&address.file)?;
+        let width = self.diff_pane_width();
+        if index != anchor {
+            // The address's own rows have to be readable before its span resolves;
+            // a walk upward reaches files the window never prepared.
+            self.prepare_section(index, width)?;
+        }
+        let span = self.address_file_span(address)?;
+        let mut base = 0i64;
+        if index >= anchor {
+            for file in anchor..index {
+                base += self.stream_rows(file, width) as i64;
+            }
+        } else {
+            for file in index..anchor {
+                base -= self.stream_rows(file, width) as i64;
+            }
+        }
+        Some(base + span.start as i64..base + span.end as i64)
+    }
+
+    /// The prepared section `file` resolves through, by exact identity — never
+    /// the anchor (whose rows are the live layout).
+    fn address_section(&self, file: &FileId) -> Option<Rc<FileSection>> {
+        let index = self.stream_index_of_exact(file)?;
+        let key = self.layout_key(self.diff_pane_width());
+        let (_, section) = self.prepared_section(index, key, self.stream_generation.get())?;
+        Some(section)
+    }
+
+    /// Whether `address` still resolves: an anchor address needs only its target
+    /// in the anchor's layout; a divergent one needs its file in the prepared
+    /// window (which is what makes the boundary visible in the first place) and
+    /// its target in that file's rows.
+    fn cursor_address_valid(&self, address: &CursorAddress) -> bool {
+        if self.address_is_anchor(address) {
+            return self.review_index_of(address.target).is_some();
+        }
+        self.window_holds(&address.file) && self.address_file_span(address).is_some()
+    }
+
+    /// Whether the currently prepared window draws any of `file`'s rows.
+    fn window_holds(&self, file: &FileId) -> bool {
+        self.diff_window(self.diff_pane_width(), self.diff_viewport.get())
+            .segments
+            .iter()
+            .any(|segment| segment.id.as_ref() == Some(file))
     }
 
     /// The active view's diff-pane cursor/editor state: the status view's own
@@ -2124,8 +2692,11 @@ impl App {
     /// list: keep the pinned target when it still resolves, else snap to the last
     /// physical row's target (top when the list is empty).
     fn clamp_review_cursor(&mut self) {
-        let Some(pinned) = self.active_pane().and_then(|pane| pane.cursor) else {
-            return; // unset already means "top"; nothing to clamp
+        // Anchor-domain only: an unset cursor already means "top", and a divergent
+        // one is the sweep's business (`normalize_cursor`), not this clamp's — its
+        // target indexes another file's rows entirely (plan 007 §3.3b).
+        let Some(pinned) = self.pinned_anchor_target() else {
+            return;
         };
         if self.review_index_of(pinned).is_some() {
             return; // still resolves
@@ -2134,16 +2705,22 @@ impl App {
         // empty: `review_target_at` of an empty layout is `None`).
         let count = self.review_row_count();
         let target = self.review_target_at(count.saturating_sub(1));
-        self.set_review_cursor(target);
+        self.set_cursor_on_anchor(target);
     }
 
     /// The comment id under the cursor in the selected file, or `None` when the
     /// cursor rests on a code/hunk row (so `x` there is a silent no-op).
     fn cursor_comment_id(&self) -> Option<u64> {
-        match self.review_cursor_target()? {
-            RowTarget::Comment(id) | RowTarget::Orphan(id) => Some(id),
-            RowTarget::Code(_) | RowTarget::Editor | RowTarget::FileHeader => None,
-        }
+        target_comment_id(self.review_cursor_target()?)
+    }
+
+    /// The comment id under the cursor **wherever it points** — the divergence-
+    /// aware counterpart of [`App::cursor_comment_id`], a separate accessor rather
+    /// than an overload of it (plan 007 §3.3j). Read by the actions that converge
+    /// before they act; `]`/`[` place their own cursor and keep the anchor-domain
+    /// one.
+    fn cursor_address_comment_id(&self) -> Option<u64> {
+        target_comment_id(self.cursor_address()?.target)
     }
 
     /// The row index of comment `id` in the selected file's active row list, for
@@ -2237,7 +2814,7 @@ impl App {
         self.sync_active();
         if let Some(row) = self.comment_row_index(target) {
             let cursor = self.review_target_at(row);
-            self.set_review_cursor(cursor);
+            self.set_cursor_on_anchor(cursor);
         }
         self.review_reveal_cursor();
     }
@@ -2290,9 +2867,14 @@ impl App {
         if !self.reveal_cursor_before_acting() {
             return;
         }
-        let Some(id) = self.cursor_comment_id() else {
+        // Eligibility before the flip (plan 007 §3.3g step 3): a code/hunk row is
+        // a silent no-op, and a no-op must not hand the anchor to another file.
+        let Some(id) = self.cursor_address_comment_id() else {
             return; // code / hunk row: no-op
         };
+        if !self.converge_on_cursor() {
+            return;
+        }
         self.delete_comment_id(id);
     }
 
@@ -2355,16 +2937,36 @@ impl App {
         if !self.reveal_cursor_before_acting() {
             return;
         }
-        self.open_editor_at_cursor();
+        self.comment_at_cursor();
     }
 
-    /// Open the in-place editor for the row under the (already-revealed) diff
-    /// cursor: edit the human note under it, refuse an agent note, or anchor a new
-    /// comment on a code row (a hunk header or unanchorable row flashes). Shared by
-    /// the status and review comment actions once their per-view gates have run;
-    /// `active_comment`/`cursor_code_anchor` resolve against whichever view is
-    /// active, so `save_comment` scopes the note correctly.
-    fn open_editor_at_cursor(&mut self) {
+    /// The shared tail of `c` in both views (plan 007 §3.3g steps 3–5): decide
+    /// what the row under the cursor would do *before* anything moves, converge on
+    /// its file only when the editor would really open, then open it there.
+    fn comment_at_cursor(&mut self) {
+        let opens = self
+            .cursor_address()
+            .is_some_and(|address| self.editor_opens_at(&address));
+        if opens && !self.converge_on_cursor() {
+            return;
+        }
+        match self.cursor_address() {
+            // Re-resolved after the flip: the pinned address is the authority, not
+            // the one the eligibility check read.
+            Some(address) => self.open_editor_at(&address),
+            // No addressable row at all (an empty diff): the same flash as ever.
+            None => self.flash = Some(Flash::info("can't comment here")),
+        }
+    }
+
+    /// Open the in-place editor for `address`, the row under the (already-revealed
+    /// and converged) diff cursor: edit the human note there, refuse an agent
+    /// note, or anchor a new comment on a code row (a hunk header or unanchorable
+    /// row flashes). Shared by the status and review comment actions once their
+    /// per-view gates have run; `active_comment`/`address_code_anchor` resolve
+    /// against whichever view is active, so `save_comment` scopes the note
+    /// correctly.
+    fn open_editor_at(&mut self, address: &CursorAddress) {
         // Capture the authoring identity *now*, at open: a watcher `reload()` plus
         // an external checkout can move the current branch/HEAD while the editor is
         // open, and the save must land where the note was authored. `None` means
@@ -2373,7 +2975,7 @@ impl App {
             return;
         };
         // A comment/orphan row: edit a human note, or refuse an agent note.
-        if let Some(id) = self.cursor_comment_id() {
+        if let Some(id) = target_comment_id(address.target) {
             match self.active_comment(id) {
                 Some(comment) if comment.source == Source::Human => {
                     let anchor = CommentAnchor {
@@ -2397,7 +2999,7 @@ impl App {
         }
         // A code row: anchor a new comment, unless it's a hunk header (or a
         // binary/submodule file with no text anchor).
-        match self.cursor_code_anchor() {
+        match self.address_code_anchor(address) {
             Some(anchor) => self.set_editor(CommentEdit::new_comment(anchor, identity)),
             None => self.flash = Some(Flash::info("can't comment here")),
         }
@@ -2408,6 +3010,13 @@ impl App {
     /// in a cursor-less view (History), where `authoring_identity` already
     /// returned `None` and this is never reached.
     fn set_editor(&mut self, edit: CommentEdit) {
+        // The editor box renders inline in the *anchor's* rows, so it can only
+        // ever open on a converged cursor — §3.3g's convergence runs before every
+        // open, and this is the one choke point every open goes through.
+        debug_assert!(
+            !self.cursor_divergent(),
+            "the in-place editor opened on a divergent cursor"
+        );
         if let Some(pane) = self.active_pane_mut() {
             pane.editing = Some(edit);
         }
@@ -2460,36 +3069,74 @@ impl App {
         }
         // A conflicted file has no clean HEAD-vs-worktree anchor; binary and
         // submodule files yield no code anchor below (their diff isn't `Text`), so
-        // they fall through to the "can't comment here" flash.
-        if let Some((_, entry)) = self.selected_file() {
-            if entry.change == Change::Conflicted {
-                self.flash = Some(Flash::info("can't comment on a conflicted file"));
-                return;
-            }
+        // they fall through to the "can't comment here" flash. Decided on the
+        // *cursor's* file and before any flip: a flash must not reorient the view
+        // (plan 007 §3.3g step 3).
+        if self.cursor_file_conflicted() {
+            self.flash = Some(Flash::info("can't comment on a conflicted file"));
+            return;
         }
-        self.open_editor_at_cursor();
+        self.comment_at_cursor();
     }
 
-    /// The anchor for a new comment on the code row under the cursor, or `None`
-    /// on a hunk header (or a row with no anchorable line). Per plan §3.4:
-    /// Addition → New/`new_no`, Deletion → Old/`old_no`, Context → New/`new_no`;
-    /// `context` is the line's text. In side-by-side a replaced-line pair anchors
-    /// to its new side when present, else its old side.
-    fn cursor_code_anchor(&self) -> Option<CommentAnchor> {
-        // Resolve the cursor's target and the file path first (owned values), so
-        // the nested cache reads don't overlap the diff-line borrow below. The
-        // file-path source is per-view: review's selected range file, or the
-        // status view's selected changed file (`active_diff_path`).
-        let RowTarget::Code(li) = self.review_cursor_target()? else {
+    /// The anchor for a new comment on `address`'s code row, or `None` on a hunk
+    /// header (or a row with no anchorable line). Per plan §3.4: Addition →
+    /// New/`new_no`, Deletion → Old/`old_no`, Context → New/`new_no`; `context`
+    /// is the line's text. In side-by-side a replaced-line pair anchors to its
+    /// new side when present, else its old side.
+    ///
+    /// Address-aware (plan 007 §3.3j): the anchor's lines come from the live diff,
+    /// a divergent file's from its prepared section, so the line read is always
+    /// the line the user is pointing at — never the same index in another file,
+    /// which is the mis-anchor the pre-007 cursor could produce.
+    fn address_code_anchor(&self, address: &CursorAddress) -> Option<CommentAnchor> {
+        let RowTarget::Code(li) = address.target else {
             return None;
         };
-        let file = self.active_diff_path()?;
-        let FileDiff::Text(lines) = self.active_diff()? else {
+        let section = match self.address_is_anchor(address) {
+            true => None,
+            false => Some(self.address_section(&address.file)?),
+        };
+        let diff = match section.as_deref() {
+            Some(section) => &section.diff,
+            None => self.active_diff()?,
+        };
+        let FileDiff::Text(lines) = diff else {
             return None;
         };
         // A hunk row maps to `Code(index)` too; `anchor_for_line` returns `None`
         // for it, so no explicit hunk guard is needed here.
-        lines.get(li).and_then(|line| anchor_for_line(line, file))
+        lines
+            .get(li)
+            .and_then(|line| anchor_for_line(line, address.file.path().to_string()))
+    }
+
+    /// Whether `c` on `address`'s row would actually open the editor — the
+    /// eligibility half of [`App::open_editor_at`], mirrored so that an agent
+    /// note, a hunk header or a file-header row flashes *without* the view
+    /// flipping to its file first (plan 007 §3.3g step 3).
+    fn editor_opens_at(&self, address: &CursorAddress) -> bool {
+        match target_comment_id(address.target) {
+            Some(id) => self
+                .active_comment(id)
+                .is_some_and(|comment| comment.source == Source::Human),
+            None => self.address_code_anchor(address).is_some(),
+        }
+    }
+
+    /// Whether the file the cursor points at is conflicted — no clean
+    /// HEAD-vs-worktree diff to hang a comment on. Divergence-aware, so `c`
+    /// decides on the row it would act on rather than on the selected file.
+    fn cursor_file_conflicted(&self) -> bool {
+        let Some(address) = self.cursor_address() else {
+            return false;
+        };
+        match &address.file {
+            FileId::Status { section, path } => self
+                .status_entry(*section, path)
+                .is_some_and(|entry| entry.change == Change::Conflicted),
+            FileId::Review { .. } => false,
+        }
     }
 
     /// The active pane's in-place editor, if open — the single read accessor every
@@ -2687,7 +3334,7 @@ impl App {
                         let target = self
                             .comment_row_index(id)
                             .and_then(|row| self.review_target_at(row));
-                        self.set_review_cursor(target);
+                        self.set_cursor_on_anchor(target);
                     }
                 }
                 self.flash = Some(flash);
@@ -2840,27 +3487,78 @@ impl App {
     /// `0` outside a review session or when the cursor is at the top. The cursor
     /// itself names a [`RowTarget`]; this projects it onto the current layout.
     /// Exposed for tests and comment navigation.
+    ///
+    /// Anchor domain: a divergent cursor has no row in *this* layout, so it reads
+    /// as `0` here — the address-aware readers ([`App::cursor_address`],
+    /// [`App::cursor_window_span`]) are what resolve one (plan 007 §3.3j).
     pub fn review_cursor(&self) -> usize {
         self.review_cursor_target()
             .and_then(|target| self.review_index_of(target))
             .unwrap_or(0)
     }
 
-    /// The `[start, end)` physical-row span to highlight while rendering — `Some`
-    /// only in a cursor-bearing view (status or review) with the diff pane focused
-    /// (plan §3.4); `None` otherwise, so the highlight never shows while the file
-    /// list is focused or in History. A comment box spans several rows, so the
-    /// whole box is highlighted, not just its first row.
+    /// Whether the cursor highlight is painted at all: only in a cursor-bearing
+    /// view (status or review) with the diff pane focused (plan §3.4), so it
+    /// never shows while the file list is focused or in History — and never while
+    /// the in-place editor is open, whose box shows a caret instead (the row
+    /// underneath it isn't highlighted either).
+    fn cursor_highlight_visible(&self) -> bool {
+        !self.editing() && self.diff_focused() && self.active_pane().is_some()
+    }
+
+    /// The `[start, end)` physical-row span to highlight while rendering, in the
+    /// anchor's layout; `None` when the highlight isn't visible (see
+    /// [`App::cursor_highlight_visible`]) or the cursor is divergent. A comment
+    /// box spans several rows, so the whole box is highlighted, not just its
+    /// first row.
     pub fn review_cursor_highlight(&self) -> Option<Range<usize>> {
-        // While the in-place editor is open its box shows a caret, not the box
-        // selection highlight — so the anchor row isn't highlighted underneath it.
-        if self.editing() {
-            None
-        } else if self.diff_focused() && self.active_pane().is_some() {
-            self.review_cursor_span()
-        } else {
-            None
+        if !self.cursor_highlight_visible() {
+            return None;
         }
+        self.review_cursor_span()
+    }
+
+    /// The cursor highlight as `(file, span)`: which stream file to paint it in,
+    /// and the `[start, end)` rows of its target in *that file's own* layout
+    /// (plan 007 §3.3i). The renderer matches this per window segment, so a
+    /// divergent cursor highlights its strip row while the anchor stays put; for
+    /// an anchor cursor it is [`App::review_cursor_highlight`] plus the anchor's
+    /// identity, and the same gates apply (nothing while the editor is open, the
+    /// file list is focused, or in History).
+    pub fn cursor_highlight_span(&self) -> Option<(FileId, Range<usize>)> {
+        if !self.cursor_highlight_visible() {
+            return None;
+        }
+        let address = self.cursor_address()?;
+        let span = self.address_file_span(&address)?;
+        Some((address.file, span))
+    }
+
+    /// The address the cursor resolves to right now: the pinned one, or — when
+    /// unset — the anchor's own first target (`None`'s meaning, §3.3a). Also the
+    /// test/observability accessor for the divergence invariant.
+    pub fn cursor_address(&self) -> Option<CursorAddress> {
+        match self.pinned_address() {
+            Some(address) => Some(address.clone()),
+            None => Some(CursorAddress {
+                file: self.active_file_id()?,
+                target: self.review_target_at(0)?,
+            }),
+        }
+    }
+
+    /// Whether the cursor addresses a file other than the anchor.
+    pub fn cursor_divergent(&self) -> bool {
+        self.pinned_address()
+            .is_some_and(|address| !self.address_is_anchor(address))
+    }
+
+    /// The cursor's span in *window* rows — screen rows from the top of the diff
+    /// pane — or `None` when its file isn't in the prepared window (see
+    /// [`App::address_window_span`]).
+    pub fn cursor_window_span(&self) -> Option<Range<usize>> {
+        let address = self.cursor_address()?;
+        self.address_window_span(&address)
     }
 
     /// The review view's focused sub-pane (List when there is no review session).
@@ -2903,6 +3601,10 @@ impl App {
     }
 
     fn enter_history(&mut self) {
+        // Before the view changes, while the home pane is still the active one:
+        // History has no cursor pane, so a divergent address left behind would be
+        // unreachable by the sweep until the user came back (plan 007 §3.3b).
+        self.clear_divergent_cursor();
         if self.commits.is_empty() {
             self.load_history();
         }
@@ -2926,6 +3628,10 @@ impl App {
     fn exit_history(&mut self) {
         // Return to the session's home view (status or review), not always status.
         self.view = self.home_view();
+        // The stream is re-scoped; the home pane's cursor converges (plan 007
+        // §3.3b). Belt to `enter_history`'s braces — a session can also start in
+        // History, whose exit is the home view's first activation.
+        self.clear_divergent_cursor();
         // The stream is the home view's file list now, not History's nothing.
         self.bump_stream_generation();
         self.last_click = None; // a view change resets the double-click tracker (§3.6)
@@ -3099,6 +3805,10 @@ impl App {
     /// Called from the event loop's resize arm.
     pub fn on_resize(&mut self, cols: u16, rows: u16) {
         self.last_click = None;
+        // A resize re-keys every section and re-cuts the window; the file a
+        // divergent cursor names may not be in the new one, and its rows are
+        // rebuilt regardless (plan 007 §3.3b).
+        self.clear_divergent_cursor();
         // A resize changes the window's geometry: prepare the sections the new
         // viewport needs, on the event path (plan 006 §3.3). The recorded pane
         // rect is still the *pre-resize* one and its width keys both the layout
@@ -3355,18 +4065,15 @@ impl App {
             return;
         }
 
-        // A click on a strip row selects that file and places the cursor on
-        // the clicked target (plan 006 §3.6), resolved from the per-frame
-        // window hit map — `diff_row_at`/`hit_target` only ever resolve rows
-        // inside the *anchor's* own layout, which is what keeps a strip row
-        // click-inert otherwise. An anchor-row hit (or no hit at all: outside
-        // the diff pane, History, or the shortfall region) falls through to
-        // the unchanged path below. Never a double-click candidate, so the
-        // tracker is cleared like every other fully-consumed click.
+        // A click on a strip row is handled entirely by `strip_click` (plan 007
+        // §3.3c–e), resolved from the per-frame window hit map —
+        // `diff_row_at`/`hit_target` only ever resolve rows inside the *anchor's*
+        // own layout, so a strip row would otherwise be inert. An anchor-row hit
+        // (or no hit at all: outside the diff pane, History, or the shortfall
+        // region) falls through to the unchanged path below.
         if let Some(hit) = self.window_hit_at(pos) {
             if !hit.is_anchor {
-                self.strip_click(hit);
-                self.last_click = None;
+                self.strip_click(&hit, pos, now);
                 return;
             }
         }
@@ -3512,40 +4219,120 @@ impl App {
         };
         if row < self.review_row_count() {
             let target = self.review_target_at(row);
-            self.set_review_cursor(target);
+            self.set_cursor_on_anchor(target);
         }
     }
 
-    /// Handle a left-click on a strip row (plan 006 §3.6): select that file
-    /// through the same prepared-section path the keyboard cross uses
-    /// (`flip_anchor`) — the row was drawn this frame, so its section is
-    /// already prepared and the flip never recomputes — then place the cursor
-    /// on the clicked target and reveal. A strip click is a jump, not a
-    /// scroll: like a list click, the view reorients around the new cursor
-    /// rather than preserving the old offset.
+    /// Handle a left-click on a strip row — a row of a file below the anchor in
+    /// the prepared window (plan 007 §3.3c–e).
     ///
-    /// Two defensive checks, both for a section that vanished between "the
-    /// row was drawn" and "the click resolved" (a `window_hit_at` epoch
-    /// mismatch already screens out most such staleness, but a same-frame
-    /// invalidation with the epoch still intact is conceivable): a failed
-    /// flip is a full no-op (nothing moved, so acting on `hit.target` would
-    /// resolve against whichever file is still selected); a successful flip
-    /// whose installed layout no longer contains `hit.target` (the file's own
-    /// content changed shape) resets the cursor to the top instead of pinning
-    /// a target that isn't there.
-    fn strip_click(&mut self, hit: WindowHit) {
-        let Some(id) = hit.id else { return };
-        let Some(index) = self.stream_index_of(&id) else {
+    /// A single click is **pure cursor placement**: it pins a divergent
+    /// [`CursorAddress`] at the clicked target and does nothing else — no flip,
+    /// no reveal, no selection or title change, zero view movement. (Focusing the
+    /// diff pane is not movement, and `place_cursor` requires it; an anchor click
+    /// focuses the same way.) Because the frame stays put, the clicked row is
+    /// still under the pointer for a second click, which is what makes the
+    /// double-click of §3.3(e) pair naturally — the flip-and-reveal this used to
+    /// do moved the row out from under it.
+    ///
+    /// The `[x]` close cell is checked first and is target-qualified: the clicked
+    /// row must itself be that comment's box, in that box's column, with the
+    /// recorded rect under the pointer — never "some rect happens to cover this
+    /// coordinate". A dup-path Status file can render one comment in both
+    /// sections; the renderer keeps the *anchor's* rect (§3.3d), so the strip
+    /// copy's `[x]` simply isn't clickable that frame and the click places the
+    /// cursor instead.
+    fn strip_click(&mut self, hit: &WindowHit, pos: Position, now: Instant) {
+        let Some(file) = hit.id.clone() else {
+            self.last_click = None;
             return;
         };
-        if !self.flip_anchor(index, 0) {
+        if let Some(id) = self.strip_close_click(hit, pos) {
+            self.delete_comment_id(id);
+            self.last_click = None;
             return;
         }
+        let target = self.strip_hit_target(hit, pos);
+        let double = target
+            .as_ref()
+            .is_some_and(|t| is_double_click(self.last_click.as_ref(), now, t));
         self.focus_active_diff();
-        let target_resolves = self.review_index_of(hit.target).is_some();
-        self.set_review_cursor(target_resolves.then_some(hit.target));
-        self.review_reveal_cursor();
-        self.ensure_diff_window(self.diff_pane_width(), self.diff_viewport.get());
+        // A section that vanished between "the row was drawn" and "the click
+        // resolved" (the epoch guard screens out most such staleness, but a
+        // same-frame invalidation is conceivable) leaves the address invalid, and
+        // placing is then a full no-op rather than a cursor pointing nowhere.
+        if !self.place_cursor(CursorAddress {
+            file,
+            target: hit.target,
+        }) {
+            self.last_click = None;
+            return;
+        }
+        if double {
+            self.strip_double_click(hit.target);
+            // Reset the tracker so a triple-click's third press can't re-fire.
+            self.last_click = None;
+        } else {
+            self.last_click = target.map(|t| (now, t));
+        }
+    }
+
+    /// The comment a strip click deletes: the id of the box its row draws, when
+    /// the click also fell in that box's column and on that box's recorded `[x]`
+    /// rect — the target-qualified, column-qualified test of §3.3(d).
+    fn strip_close_click(&self, hit: &WindowHit, pos: Position) -> Option<u64> {
+        let id = target_comment_id(hit.target)?;
+        let hit_close = self.in_side_column(pos, hit.side)
+            && self.comment_close_rect(id).is_some_and(|r| r.contains(pos));
+        hit_close.then_some(id)
+    }
+
+    /// The double-click key for a strip-row click (plan 007 §3.3e) — the strip
+    /// counterpart of [`App::hit_target`], which resolves against the anchor's
+    /// layout and so can't see these rows. Same `HitTarget` shape, with two
+    /// differences the strip domain forces: `file` is the *clicked* file's path
+    /// (no flip happened, so `active_diff_path` still names the anchor), and a
+    /// file header is a real region here rather than a rejection.
+    ///
+    /// `None` where the row can't pair into a double-click at all: the blank
+    /// sibling column of a side-by-side box (mirroring the anchor hit-test), or
+    /// the in-place editor.
+    fn strip_hit_target(&self, hit: &WindowHit, pos: Position) -> Option<HitTarget> {
+        let region = match hit.target {
+            RowTarget::Code(line) => ClickRegion::Code(line),
+            RowTarget::Comment(id) | RowTarget::Orphan(id) => {
+                if !self.in_side_column(pos, hit.side) {
+                    return None;
+                }
+                ClickRegion::Comment(id)
+            }
+            RowTarget::FileHeader => ClickRegion::FileHeader,
+            RowTarget::Editor => return None,
+        };
+        Some(HitTarget {
+            generation: self.layout_generation.get(),
+            view: self.view,
+            file: hit.id.as_ref().map(|id| id.path().to_string()),
+            region,
+        })
+    }
+
+    /// Act on a recognized double-click whose first press placed the cursor on a
+    /// strip row (plan 007 §3.3e): converge-then-act through §3.3(g)'s machinery,
+    /// which the cursor now addresses. A code row or a human note opens the editor
+    /// exactly as `c` would; an agent note flashes read-only *without* flipping
+    /// (eligibility before the flip); a file header only converges — selecting the
+    /// file is the whole act there.
+    fn strip_double_click(&mut self, target: RowTarget) {
+        if target == RowTarget::FileHeader {
+            self.converge_on_cursor();
+            return;
+        }
+        match self.view {
+            ViewMode::Status => self.status_comment_action(),
+            ViewMode::Review => self.review_comment_action(),
+            ViewMode::History => {}
+        }
     }
 
     /// Route a left-button press that isn't consumed by the editor: grab a split
@@ -3670,18 +4457,19 @@ impl App {
     fn review_click(&mut self, pos: Position) {
         let list = self.review_list_area();
         if list.contains(pos) {
-            let row = self
-                .review
-                .as_ref()
-                .map(|review| review.list_state.borrow().offset() + (pos.y - list.y) as usize)
-                .unwrap_or(0);
-            if let Some(review) = self.review.as_mut() {
-                review.focus = ReviewFocus::List;
-                if row < review.files.len() {
-                    review.selected = row;
-                    review.pane.cursor = None; // a new file starts at its first row
-                }
+            let Some(review) = self.review.as_mut() else {
+                return;
+            };
+            review.focus = ReviewFocus::List;
+            let row = review.list_state.borrow().offset() + (pos.y - list.y) as usize;
+            if row >= review.files.len() {
+                return;
             }
+            review.selected = row;
+            // A new file starts at its first row; a list click also ends any
+            // divergence, both by this reset and by leaving the diff pane
+            // (plan 007 §3.3b).
+            self.set_cursor_on_anchor(None);
         } else if let Some(row) = self.diff_row_at(pos) {
             // Focus the diff and move the cursor to the clicked row. A click below
             // the last row just focuses (no cursor move); wheel scroll never moves
@@ -3692,7 +4480,7 @@ impl App {
             let count = self.review_row_count();
             if row < count {
                 let target = self.review_target_at(row);
-                self.set_review_cursor(target);
+                self.set_cursor_on_anchor(target);
             }
         }
     }
@@ -3816,61 +4604,6 @@ impl App {
         }
     }
 
-    /// Cross one file boundary with the keyboard, in one press (plan 006 §3.5).
-    /// Returns `false` at the first/last file (the caller clamps as before) and in
-    /// any view without a stream.
-    ///
-    /// Down lands `(next, 0)`: the arriving file's header row leads the viewport
-    /// and takes the cursor, which is the whole transition marker. Up lands the
-    /// previous file bottom-aligned **plus one strip row** — `R_prev + 1 - V`,
-    /// held to `R_prev` for a file shorter than the viewport — so the departed
-    /// file's own header row stays visible at the bottom edge, marking where the
-    /// cursor came from. That offset is legal only in the extended domain, so it
-    /// is set directly through `flip_anchor`; `review_reveal_cursor` would clamp
-    /// the strip row back off.
-    fn cross_file_step(&mut self, down: bool) -> bool {
-        let Some(anchor) = self.strip_anchor() else {
-            return false;
-        };
-        let Some(to) = neighbour_index(anchor, self.stream_len(), down) else {
-            return false; // first/last file → clamp, no wraparound
-        };
-        let width = self.diff_pane_width();
-        let height = self.diff_viewport.get();
-        // Laziness trigger: a keyboard cross needs exactly the destination
-        // (plan 006 §3.3), which `flip_anchor` then requires to be prepared.
-        let Some(section) = self.prepare_section(to, width) else {
-            return false;
-        };
-        let rows = section.rows.len();
-        let offset = if down {
-            0
-        } else {
-            rows.saturating_add(1)
-                .saturating_sub(height as usize)
-                .min(rows)
-        };
-        if !self.flip_anchor(to, offset) {
-            // The section prepared above vanished before the flip could seed it
-            // (an invalidation drained in between) — stay put rather than pin a
-            // cursor against whichever file is still selected.
-            return false;
-        }
-        // `flip_anchor` resets the cursor (a wheel flip carries none), so the
-        // keyboard's own landing is pinned afterwards — against the layout the flip
-        // installed, which is why the row index resolves to the arriving file's
-        // targets rather than the departed file's.
-        let row = if down {
-            0
-        } else {
-            self.review_row_count().saturating_sub(1)
-        };
-        let target = self.review_target_at(row);
-        self.set_review_cursor(target);
-        self.ensure_diff_window(width, height);
-        true
-    }
-
     fn history_scroll(&mut self, pos: Position, down: bool) {
         if self.graph_area.get().contains(pos) {
             self.history_focus = HistoryFocus::Graph;
@@ -3927,6 +4660,12 @@ impl App {
 
     /// Stage an unstaged file, or unstage a staged one.
     fn toggle_stage(&mut self) {
+        // Converge before reading the section: which way the toggle goes is the
+        // cursor's file's answer, not the previously selected file's (§3.3g).
+        // `run_on_selected` converges too — a no-op once this one has.
+        if !self.converge_on_cursor() {
+            return;
+        }
         let Some((section, _)) = self.selected_section_path() else {
             return;
         };
@@ -3945,16 +4684,27 @@ impl App {
         self.run_on_selected("unstage", Repo::unstage);
     }
 
-    /// Run a path-based git op on the selected file, then refresh.
+    /// Run a path-based git op on the selected file, then refresh. Staging is
+    /// eligible on any file, so the convergence (§3.3g) is unconditional: with the
+    /// cursor walked into a following file, space/`s`/`u` act on *that* file and
+    /// the selection follows it there.
     fn run_on_selected(&mut self, action: &str, op: GitOp) {
+        if !self.converge_on_cursor() {
+            return;
+        }
         let Some((_, path)) = self.selected_section_path() else {
             return;
         };
         self.after_mutation(action, op(&self.repo, &path));
     }
 
-    /// Open the discard confirmation for the selected file.
+    /// Open the discard confirmation for the file under the cursor — which the
+    /// convergence has just made the selected one (§3.3g; the caller's gate has
+    /// already ruled out the ineligible comment-row case).
     fn request_discard(&mut self) {
+        if !self.converge_on_cursor() {
+            return;
+        }
         self.modal = self
             .selected_file()
             .map(|(_, entry)| Modal::ConfirmDiscard {
@@ -4025,19 +4775,35 @@ impl App {
     /// The flattened selection index of `path`, preferring `section` but falling
     /// back to the other one (a file can move between staged/unstaged); `None`
     /// if it's no longer listed. Mirrors the staged-first order of `selected_file`.
+    ///
+    /// **Selection-only.** The fallback is what keeps the *selection* on a file
+    /// the user just staged (its row moves sections under it), and it is wrong
+    /// for anything that names one exact stream row — a strip click, a cursor
+    /// address — which resolve through [`App::stream_index_of_exact`] instead
+    /// (plan 007 §3.3a).
     fn index_of(&self, section: Section, path: &str) -> Option<usize> {
+        let other = match section {
+            Section::Staged => Section::Unstaged,
+            Section::Unstaged => Section::Staged,
+        };
+        self.index_of_exact(section, path)
+            .or_else(|| self.index_of_exact(other, path))
+    }
+
+    /// The flattened index of exactly `(section, path)`, no cross-section
+    /// fallback — the staged list first, so an unstaged hit is offset by its
+    /// length. The lookup [`App::stream_index_of_exact`] needs, and the half
+    /// [`App::index_of`] adds its selection-survival fallback to.
+    fn index_of_exact(&self, section: Section, path: &str) -> Option<usize> {
         let staged = &self.status.staged;
-        let in_staged = || staged.iter().position(|e| e.path == path);
-        let in_unstaged = || {
-            self.status
+        match section {
+            Section::Staged => staged.iter().position(|e| e.path == path),
+            Section::Unstaged => self
+                .status
                 .unstaged
                 .iter()
                 .position(|e| e.path == path)
-                .map(|i| staged.len() + i)
-        };
-        match section {
-            Section::Staged => in_staged().or_else(in_unstaged),
-            Section::Unstaged => in_unstaged().or_else(in_staged),
+                .map(|i| staged.len() + i),
         }
     }
 
@@ -4054,6 +4820,10 @@ impl App {
         // same syntax) stays warm.
         let section = self.selected_file().map(|(section, _)| section);
         if section != self.diff_section {
+            // The cursor's address named the row being left; carry a converged one
+            // over to the row we landed on before `diff_section` moves under it
+            // (plan 007 §3.3a).
+            self.rebind_cursor_across_sections(self.diff_section);
             self.diff_section = section;
             *self.layout.borrow_mut() = None;
         }
@@ -4090,7 +4860,7 @@ impl App {
             self.diff_hscroll = 0;
             // The new file's layout doesn't exist yet; reset the diff cursor to its
             // top (`None`), resolved to row 0 by the render.
-            self.status_pane.cursor = None;
+            self.set_cursor_on_anchor(None);
         }
         // The cached row layout describes the previous diff; drop it so the new one
         // is recomputed lazily on next render. Highlights are per-file (keyed by
@@ -4154,6 +4924,9 @@ impl App {
     /// A resolution failure after startup (e.g. the branch was deleted) flashes an
     /// error and keeps the stale list; the next good refresh recovers.
     fn refresh_review(&mut self) {
+        // Same trade as the status refresh: a re-resolve can relist the range out
+        // from under a divergent cursor, so it snaps back (plan 007 §3.3b).
+        self.clear_divergent_cursor();
         let Some(review) = self.review.as_ref() else {
             return;
         };
@@ -4926,12 +5699,18 @@ impl App {
         self.stream_file_id(self.stream_position()?)
     }
 
-    /// The stream index of `id` — the reverse of `stream_file_id`, and what
-    /// lets a strip click (identified by [`FileId`], plan 006 §3.6) find the
-    /// index `flip_anchor` takes.
-    fn stream_index_of(&self, id: &FileId) -> Option<usize> {
+    /// The stream index of **exactly** `id` — the reverse of `stream_file_id`,
+    /// and what lets a strip hit or a cursor address (both identified by
+    /// [`FileId`]) find the row they name.
+    ///
+    /// No staged/unstaged fallback, deliberately (plan 007 §3.3a): a path that is
+    /// both staged and modified is *two* stream entries, and answering with the
+    /// other one would resolve a cursor or a click against a file the user never
+    /// pointed at. The fallback belongs to selection survival alone — see
+    /// [`App::index_of`].
+    fn stream_index_of_exact(&self, id: &FileId) -> Option<usize> {
         match id {
-            FileId::Status { section, path } => self.index_of(*section, path),
+            FileId::Status { section, path } => self.index_of_exact(*section, path),
             FileId::Review { path } => self
                 .review_files()
                 .iter()
@@ -5130,11 +5909,22 @@ impl App {
     /// and each file's highlight sub-map goes with its section.
     pub fn ensure_diff_window(&mut self, width: u16, height: u16) {
         if self.editing() {
+            // The editor collapses the strip, so nothing below the anchor is
+            // addressable while it is open (plan 007 §3.3b).
+            self.clear_divergent_cursor();
             return;
         }
         let Some(anchor) = self.strip_anchor() else {
+            self.clear_divergent_cursor();
             return;
         };
+        // What a divergent address currently resolves against, read before the
+        // preparation below discards a stale entry and rebuilds it. The sweep
+        // compares the two (plan 007 §3.3b's second corollary): a rebuilt section
+        // can resolve the same target index against *different* content.
+        let outgoing = self
+            .divergent_address()
+            .and_then(|address| self.sections.borrow().cached(&address.file));
         let viewport = height as usize;
         let rows = self.diff_layout(width).len();
         let offset = self.stream_offset(rows, viewport);
@@ -5148,11 +5938,24 @@ impl App {
             index += 1;
         }
         // Everything the window touches — the anchor plus the strip just walked.
-        let pinned: Vec<FileId> = (anchor..index)
+        let mut pinned: Vec<FileId> = (anchor..index)
             .filter_map(|file| self.stream_file_id(file))
             .collect();
+        // A divergent cursor resolves *through* its file's section, so that
+        // section outranks the LRU budget for as long as the cursor names it
+        // (plan 007 §3.3b). It is normally in the walk above already; pinning it
+        // explicitly is what keeps the address from being invalidated by cache
+        // pressure rather than by a real state change.
+        if let Some(address) = self.divergent_address() {
+            if !pinned.contains(&address.file) {
+                pinned.push(address.file);
+            }
+        }
         self.sections.borrow_mut().evict(&pinned);
         self.prune_highlight_cache();
+        // Last: the window the address is validated against is the one just
+        // prepared and trimmed.
+        self.normalize_cursor(outgoing);
     }
 
     /// The window to render at `width` × `height`: the anchor's rows from the
@@ -5202,13 +6005,8 @@ impl App {
 
     /// A wheel tick in the extended stream domain (plan 006 §3.2a–b) — the wheel
     /// entry whenever cross-file scroll is on and the pane isn't editing. `delta`
-    /// is a signed physical-row count.
-    ///
-    /// Three steps, in order: **renormalize** the offset across file boundaries
-    /// (`(B, o) ≡ (A, R_A + o)`), **fill** the window from where that landed, and
-    /// **clamp** by any shortfall so the viewport bottom never passes the last row
-    /// the stream offers. All arithmetic is `i64`: an up-tick legitimately goes
-    /// negative before renormalization moves the anchor, and a `usize` would wrap.
+    /// is a signed physical-row count, applied to what the last frame painted and
+    /// settled by [`App::settle_stream_offset`].
     ///
     /// `pub` for the same reason as [`App::diff_window`]: the renormalizer's
     /// property test drives exact deltas, which a synthetic wheel event (fixed at
@@ -5219,18 +6017,39 @@ impl App {
             return;
         };
         let width = self.diff_pane_width();
-        let height = self.diff_viewport.get();
-        let viewport = height as usize;
+        let viewport = self.diff_viewport.get() as usize;
         if viewport == 0 {
             return;
         }
-        let mut index = anchor;
         // Build the layout before reading the offset: a relayout queued earlier in
         // this batch re-anchors `diff_scroll`, and the tick must move from the
         // settled value. Starting from `paint_offset` — what the last frame drew —
         // is what makes a tick continuous with the picture on screen.
         let anchor_rows = self.diff_layout(width).len();
-        let mut offset = self.paint_offset(anchor_rows, viewport) as i64 + delta;
+        let offset = self.paint_offset(anchor_rows, viewport) as i64 + delta;
+        // A wheel flip carries no cursor: 006 §3.2d's contract, and the firewall
+        // that keeps mouse scrolling from inheriting a walked-to address.
+        self.settle_stream_offset(anchor, offset, FlipCursor::Reset);
+    }
+
+    /// Install `offset` — a signed position in the stream domain, anchored on file
+    /// `anchor` — as the pane's scroll state, renormalizing and clamping it into a
+    /// legal `(anchor, offset)` pair first. The shared tail of every stream-domain
+    /// move: the wheel tick above and §3.3h's window-aware reveal both land here,
+    /// differing only in what a flip does to the cursor.
+    ///
+    /// Two steps, in order: **renormalize** the offset across file boundaries
+    /// (`(B, o) ≡ (A, R_A + o)`), then **clamp** by whatever shortfall filling the
+    /// window from there reveals, so the viewport bottom never passes the last row
+    /// the stream offers. All arithmetic is `i64`: an upward move legitimately
+    /// goes negative before renormalization moves the anchor, and a `usize` would
+    /// wrap.
+    fn settle_stream_offset(&mut self, anchor: usize, offset: i64, cursor: FlipCursor) {
+        let width = self.diff_pane_width();
+        let height = self.diff_viewport.get();
+        let viewport = height as usize;
+        let mut index = anchor;
+        let mut offset = offset;
 
         // Renormalize. Each step moves the anchor one file and rebases the offset
         // on that file's row count, so the *rendered* top row never moves — the
@@ -5283,7 +6102,7 @@ impl App {
         let offset = offset.max(0) as usize;
         if index == anchor {
             self.diff_scroll.set(offset);
-        } else if !self.flip_anchor(index, offset) {
+        } else if !self.flip_anchor(index, offset, cursor) {
             // The destination's section vanished between the fill loop above
             // and here — stay on the current anchor rather than half-apply.
             return;
@@ -5295,8 +6114,9 @@ impl App {
     /// section — no recompute, no scroll reset, no placement token (plan 006
     /// §3.2d). `sync_diff`/`sync_review_diff` early-return afterwards because the
     /// diff key (and, for Status, the section) already match and nothing is dirty.
-    /// A wheel flip carries no cursor; the border title follows the selection, so
-    /// the one-row-past-the-top handoff falls out of *when* this is called.
+    /// The border title follows the selection, so the one-row-past-the-top handoff
+    /// falls out of *when* this is called; `cursor` decides what the cursor does
+    /// while it happens.
     ///
     /// Returns `false` — a no-op, nothing touched — if `to` has no prepared
     /// section under the current key/generation; callers ensure first, but
@@ -5304,12 +6124,20 @@ impl App {
     /// "flip" (a queued invalidation drained in between), and installing the
     /// caller's cursor/offset against whichever file is still selected would
     /// silently resolve against the wrong layout.
-    fn flip_anchor(&mut self, to: usize, new_offset: usize) -> bool {
+    fn flip_anchor(&mut self, to: usize, new_offset: usize, cursor: FlipCursor) -> bool {
         let width = self.diff_pane_width();
         let key = self.layout_key(width);
         let generation = self.stream_generation.get();
         let Some((id, section)) = self.prepared_section(to, key, generation) else {
             return false;
+        };
+        // §3.3h's capture rule: read the address BEFORE the selection moves. Every
+        // seam below (`set_cursor_on_anchor` for Status, `select_review_file` for
+        // Review) rewrites the cursor against whichever file is selected at the
+        // time, so a kept address has to be lifted out first and put back after.
+        let carried = match cursor {
+            FlipCursor::Keep => self.pinned_address().cloned(),
+            FlipCursor::Reset => None,
         };
         // Retire the file being left into the cache *before* the selection moves,
         // so scrolling back across the boundary re-reads it instead of recomputing
@@ -5325,7 +6153,7 @@ impl App {
                 // snapshot replacement bumps `stream_generation`, so a section old
                 // enough to predate the flag could not have been handed out here.
                 self.diff_dirty = false;
-                self.set_review_cursor(None);
+                self.set_cursor_on_anchor(None);
             }
             FileId::Review { path } => {
                 self.select_review_file(to);
@@ -5355,6 +6183,16 @@ impl App {
         // redraw, must clamp against the new file's bounds.
         self.set_diff_metrics(self.diff_viewport.get(), section.rows.len());
         self.prune_highlight_cache();
+        if cursor == FlipCursor::Keep {
+            // Put the captured address back verbatim. If it names the arriving
+            // file it is simply converged now (its target came from that file's
+            // rows, which are the layout just installed); if it names one further
+            // down it stays divergent, and the caller's trailing
+            // `ensure_diff_window` re-validates it against the window the flip
+            // produced — including dropping it if the flip left it *above* the
+            // anchor, where nothing renders.
+            self.write_cursor(carried);
+        }
         true
     }
 
@@ -6152,7 +6990,7 @@ impl App {
         // The two modes have different row lists (a `Code` index means a
         // different physical row), so the cursor doesn't carry over — reset to
         // the top (plan §3.4).
-        self.set_review_cursor(None);
+        self.set_cursor_on_anchor(None);
         self.reprepare_diff_window();
     }
 
@@ -6164,6 +7002,9 @@ impl App {
     /// render time, so it never needs invalidating.
     fn toggle_line_numbers(&mut self) {
         self.show_line_numbers = !self.show_line_numbers;
+        // A layout-key change rebuilds every section, so a divergent address
+        // can't be carried across it (plan 007 §3.3b).
+        self.clear_divergent_cursor();
         self.reprepare_diff_window();
     }
 
@@ -6179,6 +7020,9 @@ impl App {
         if self.wrap_lines {
             self.diff_hscroll = 0;
         }
+        // Wrap is a layout-key input: every section is rebuilt, so a divergent
+        // address doesn't survive the toggle (plan 007 §3.3b).
+        self.clear_divergent_cursor();
         self.reprepare_diff_window();
     }
 
@@ -6193,9 +7037,13 @@ impl App {
     ///   drained-batch rule [`App::flip_anchor`] follows).
     fn set_cross_file_scroll(&mut self, on: bool) {
         self.cross_file_scroll = on;
-        if !on && self.active_pane().and_then(|pane| pane.cursor) == Some(RowTarget::FileHeader) {
-            self.set_review_cursor(None);
+        if !on && self.pinned_anchor_target() == Some(RowTarget::FileHeader) {
+            self.set_cursor_on_anchor(None);
         }
+        // Turning the mode off retires the strip a divergent cursor lives on;
+        // turning it on rebuilds every section under a new layout key. Either way
+        // the address can't carry over (plan 007 §3.3b).
+        self.clear_divergent_cursor();
         let width = self.diff_pane_width();
         let count = self.diff_layout(width).len();
         self.set_diff_metrics(self.diff_viewport.get(), count);
@@ -6902,17 +7750,26 @@ fn col_at_display(line: &str, target: usize) -> usize {
     col
 }
 
-/// The neighbouring selection index in `[0, total)`: the next one going down, the
-/// previous going up. `None` at the boundary (last going down, first going up) or
-/// an empty list — a keyboard cross clamps there rather than wrapping (plan §3.4).
-fn neighbour_index(current: usize, total: usize, down: bool) -> Option<usize> {
-    if total == 0 {
-        return None;
-    }
-    if down {
-        (current + 1 < total).then(|| current + 1)
-    } else {
-        (current > 0).then(|| current - 1)
+/// The `[start, end)` run of `rows` sharing `target`: its first row through the
+/// last consecutive row with the same target (a code line is one row, a comment
+/// box is N). File-agnostic, so the anchor's live layout and any prepared
+/// section resolve a target the same way (plan 007 §3.3j).
+fn target_span(rows: &[LayoutRow], target: RowTarget) -> Option<Range<usize>> {
+    let start = rows.iter().position(|row| row.target == target)?;
+    let len = rows[start..]
+        .iter()
+        .take_while(|row| row.target == target)
+        .count();
+    Some(start..start + len)
+}
+
+/// The comment a [`RowTarget`] names, if it names one at all. File-agnostic, so
+/// the anchor-domain [`App::cursor_comment_id`] and its address-aware
+/// counterpart share one row-kind test.
+fn target_comment_id(target: RowTarget) -> Option<u64> {
+    match target {
+        RowTarget::Comment(id) | RowTarget::Orphan(id) => Some(id),
+        RowTarget::Code(_) | RowTarget::Editor | RowTarget::FileHeader => None,
     }
 }
 
