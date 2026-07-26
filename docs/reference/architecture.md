@@ -297,16 +297,19 @@ title never flips onto it — classic sticky-header behaviour, still reachable
 by keyboard crossing or a list click. Up-renormalization triggers only at `o
 < 0`, so `(B, 0)` is a legal resting state; the pixel-identical state reached
 scrolling *down* is `(A, R_A)` with the title on `A` — the boundary
-hysteresis is directional by design. `App::flip_anchor(to, new_offset)` — the
-only way the anchor moves — seeds `current_diff`/`diff_key`/`diff_section`
-(or Review's cached-diff slot) and `self.layout` straight from the section
-cache, bumps `layout_generation` and the generation the h-scroll memo keys
-on, and sets `diff_scroll` directly; it never calls `review_reveal_cursor`
-(which would clamp the offset back into the anchor's own domain) and queues
-no placement token — `sync_diff`'s key already matches, so it early-returns.
-Because the border title is already selection-driven, the one-row-past-the-
-top handoff needs no dedicated code path: it falls out of exactly when
-`flip_anchor` runs.
+hysteresis is directional by design. `App::flip_anchor(to, new_offset,
+cursor)` — the only way the anchor moves — seeds `current_diff`/`diff_key`/
+`diff_section` (or Review's cached-diff slot) and `self.layout` straight from
+the section cache, bumps `layout_generation` and the generation the h-scroll
+memo keys on, and sets `diff_scroll` directly; it never calls
+`review_reveal_cursor` (which would clamp the offset back into the anchor's
+own domain). Because the border title is already selection-driven, the
+one-row-past-the-top handoff needs no dedicated code path: it falls out of
+exactly when `flip_anchor` runs. The wheel and list-scroll paths pass
+`FlipCursor::Reset` (the cursor resets, as it always has — `sync_diff`'s key
+already matches, so it early-returns and queues no placement token); a
+cursor-driven flip passes `FlipCursor::Keep` instead (see **The keyboard
+walk** below).
 
 **Section cache and laziness.** Each file's prepared contribution
 (`FileSection { diff, rows }`) lives in a hand-rolled `SectionCache` — no
@@ -326,22 +329,106 @@ landing anchor. The highlight cache is now per-file sub-maps, evicted
 together with a file's section entry, because strip rows highlight with
 *their own* file's syntax rather than the anchor's.
 
-**Keyboard and mouse crossing.** `review_move_cursor`'s existing hard-edge
-check now calls `App::cross_file_step` instead of stopping: `j` at the last
-target flips to `(next, 0)` in one press, the arriving file's header leading
-the viewport and taking the cursor; `k` at the header flips to the previous
-file bottom-aligned plus one strip row (`R_prev + 1 - V`), so the departed
-file's own header stays visible at the bottom edge, marking where the cursor
-came from. A keypress while the wheel has scrolled into the extended domain
-still act-and-reveals as before, snapping the viewport back to the cursor.
-`list_scroll_half_page` routes through `wheel_scroll_window` too — the file
-list has no cursor to move, so Ctrl-d/u there is a plain continuous tick.
-Strip rows render but stay inert to clicks until resolved through the
-per-frame window hit map (`WindowHit`, recorded by the renderer alongside
-`diff_area`/`x_rects`): `App::strip_click` on a non-anchor hit reuses the
-already-prepared section via `flip_anchor` to select that file and place the
-cursor on the clicked target, reorienting the view like a list click rather
-than preserving the old offset.
+**CursorAddress and divergence.** The diff cursor is `Option<CursorAddress>`
+(`CursorAddress { file: FileId, target: RowTarget }`), not a bare `RowTarget`
+— carrying the file is what lets the cursor stand on a strip row (a file
+below the anchor in the stream) without its target being silently
+reinterpreted against the anchor's own layout. `None` keeps its pre-007
+meaning (the anchor's first target). An address whose `file` equals the
+anchor is *converged*; anything else is *divergent*, and every write goes
+through one setter family (`App::write_cursor`, and the higher-level
+`set_cursor_on_anchor`/`place_cursor` built on it) — no seam assigns
+`DiffPaneState.cursor` directly. `place_cursor` is the only way to install a
+divergent address, and only does so live: the diff pane must be focused and
+the address must satisfy the **divergence invariant** — its file in the
+prepared window, its target resolving in that file's own rows — or the call
+is a no-op. Two production paths create one: the keyboard walk and a strip
+click.
+
+Anything that could strand a divergent address clears it back to `None`
+(both fields — a foreign target is never reinterpreted against the anchor):
+refresh/reload/relist, a wheel flip (`FlipCursor::Reset`, below), any scroll
+that pushes the file out of the prepared window, resize, every layout-key
+toggle (`w`/`n`/`d`/`f`), a view change, `gg`/`G`, a list click, and focus
+leaving the diff pane. `App::normalize_cursor` is where a `stream_generation`
+bump specifically re-validates: the bump retires every cached section, so a
+divergent address survives only if the same event's `ensure_diff_window`
+re-prepared its file, the target still resolves, *and* the rebuilt diff is
+identical to the one the address last resolved against (an unseen on-disk
+edit changing what `Code(i)` denotes still drops it, mirroring the anchor
+cursor's own same-diff-survives-refresh rule). One corollary is load-bearing
+for the rest of this section: divergence implies the anchor sits at its hard
+edge (`o > R_anchor`), since strip rows render only when the window overruns
+the anchor — so `at_hard_edge`/`diff_max_scroll`/`diff_content_rows` keep
+their anchor-domain meaning unchanged throughout. The renderer's cursor
+highlight is resolved per segment, by matching each `WindowSegment`'s file
+identity against the address — replacing an earlier `is_anchor &&` gate —
+which is what lets a divergent cursor paint its span on a strip row while
+the anchor's own rows render unhighlighted.
+
+**The keyboard walk.** `App::walk_cursor` (driving `j`/`k` and Ctrl-d/u)
+moves on the **flattened target stream** — every stream file's physical rows
+concatenated in list order — starting from the *cursor's* position, not the
+anchor's. A step that runs off the end of the cursor's file spends its
+residual in the next one, so `j` walks a stop at a time through however many
+short files it meets, entering each as a divergent `CursorAddress`, while the
+anchor keeps the scroll offset and the border title. Ctrl-d/u move by the
+full residual in flattened physical rows, with the cursor still
+target-granular — a multi-row comment box is one stop, so a half-page step
+never row-round-trips through one, byte-identical to the pre-walk behaviour.
+The anchor only follows once a reveal renormalizes past the boundary — the
+same strict `o > R_anchor` threshold the wheel flips at (006's hysteresis) —
+via a **cursor-preserving flip** (`FlipCursor::Keep`: `App::flip_anchor`
+captures the resolved address before the selection moves and re-installs it
+after, versus the wheel's `FlipCursor::Reset`, which drops the cursor as it
+always has). Upward is asymmetric and pinned so: a `k` that would move above
+the anchor's first stop flips *immediately* rather than walking into
+divergence — previous files cannot render below the anchor — landing
+converged on the previous file's last target with a minimal one-row view
+move; a `k` from an already-divergent cursor just walks back down-stream
+toward the anchor.
+
+**Flip-then-act convergence.** Diff-focused actions (`c`, discard,
+stage/unstage/toggle, keyboard comment delete, double-click actions) that
+find a divergent cursor run `App::converge_on_cursor` before acting, so they
+act on the file the user is pointing at rather than whichever the list has
+selected: (1) validate the address against the current window — a file the
+window stopped holding drops the cursor to `None` outright rather than
+falling back to the anchor; (2) if the target is offscreen, reveal only and
+return (`reveal_cursor_before_acting`'s existing two-press rule, unchanged);
+(3) the caller checks the resolved row's eligibility for the action *before*
+calling this at all — an ineligible target flashes or no-ops without ever
+reorienting the view; (4) `App::flip_to_address` makes the cursor's file the
+anchor via a cursor-preserving `flip_anchor` at offset 0 (the minimal
+reorientation, since a divergent file's rows always begin below the pane
+top); (5) the caller re-validates and acts on the now-converged anchor. List-
+focused actions, comment cycling, `gg`/`G`, `]`/`[`, and the wheel are
+untouched — `]`/`[` keep their own land-directly behaviour with no
+pre-convergence.
+
+**Strip mouse.** A click on a strip row resolves through the per-frame
+window hit map (`WindowHit`, recorded by the renderer alongside
+`diff_area`/`x_rects` — it now also carries the row's SBS `side`, so a click
+in a comment box's blank sibling column can't be mistaken for the box) and
+is handled by `App::strip_click`, which is **pure cursor placement**: it
+pins a divergent `CursorAddress` at the clicked target and does nothing
+else — no flip, no reveal, no selection or title change, zero view movement.
+This replaces C5's click-to-select-and-jump; selection now follows only when
+an action runs (flip-then-act, above), never from the click itself. Because
+the frame doesn't move, the clicked row is still under the pointer for a
+second click, which is what makes the double-click below pair naturally.
+`[x]` on a strip box is checked first and is target- and column-qualified —
+the clicked row's own target must be that comment's, in that box's column,
+under its recorded rect — and deletes by id with no flip. Strip close-rects
+are recorded into their own map (`strip_rects`, distinct from the anchor's
+`x_rects`) because a dup-path Status file can render the same comment in
+both its sections; the two rects merge under **anchor precedence** — the
+anchor's rect wins the collision and the strip copy simply isn't clickable
+that frame, falling through to plain cursor placement instead. A double-click
+on a strip row converges via `converge_on_cursor` and then acts exactly like
+`c`: a code row or an own comment opens the editor, an agent note flashes
+read-only without flipping, and a file header only converges (selecting the
+file is the whole act there).
 
 **Comment boxes.** A comment renders as a bordered, multi-row box directly
 below its anchored line: a title row (`● you — <file> R<line>` or

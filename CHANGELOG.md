@@ -11,6 +11,27 @@ Release notes.
 ## Unreleased
 
 Milestone 11 — continuous cross-file scroll: the arm-then-hop pause is gone.
+Milestone 13 — the cursor can now walk into a following file on its own,
+independent of which file is selected.
+
+### Added
+- **The keyboard walks the stream** — with cross-file scroll (`f`) on,
+  `j`/`k` and Ctrl-d/u no longer stop at a file's edge: they step the cursor
+  into the next (or previous) file directly, through however many short
+  files a single press's residual reaches, while the file list's selection
+  and the border title stay on the original file until the view actually
+  scrolls past the boundary — the boundary itself stays visible rather than
+  teleporting. Stepping back past the *first* row of the selected file flips
+  immediately to the previous file instead (a previous file can never render
+  below the one you started on).
+- **Actions follow the cursor's file** — `c`, `X`, stage/unstage/toggle, and
+  discard now act on whichever file the cursor is actually on, converging
+  the selection to it first if you've walked or clicked into a neighboring
+  file. An ineligible target (a hunk header, a binary file, …) still just
+  flashes, without moving the selection.
+- **Strip comment boxes are fully interactive** — a neighboring file's
+  comment boxes in the stream now support `[x]` delete and double-click
+  edit, matching the selected file's boxes.
 
 ### Changed
 - **Cross-file scroll is now continuous** — with `f` on, scrolling past a
@@ -21,10 +42,13 @@ Milestone 11 — continuous cross-file scroll: the arm-then-hop pause is gone.
   own inline header (marker, path, `+a −d` or `(binary)`); a short last file
   still stops the wheel at its edge (classic sticky-header behaviour), and
   per-file diffs stay lazy — only the files the window actually shows are
-  computed. `j`/`k` now cross a file boundary in a single press too: down
-  lands on the next file's header, up lands on the previous file's last row
-  with its header visible at the bottom edge. Clicking a neighboring file's
-  row in the stream selects that file and places the cursor there.
+  computed.
+- **Clicking a neighboring file's row now places the cursor instead of
+  selecting the file** — a behavior change from the click-to-select-and-jump
+  the bullet above originally introduced. The click moves nothing else (no
+  flip, no reveal, no selection or title change); the file is only selected
+  once you act on it (stage, comment, etc.), consistent with the keyboard
+  walk above.
 
 ## v0.0.6 — 2026-07-24
 
