@@ -88,12 +88,12 @@ Adding a dependency: name the constraint, prefer pure-Rust, keep wrappers small.
 
 ## Toolchain
 
-Rust **1.96.0**, pinned in `rust-toolchain.toml` and `.mise.toml`. `.cargo/config.toml`
+Rust **1.97.1**, pinned in `rust-toolchain.toml` and `.mise.toml`. `.cargo/config.toml`
 enables the MSRV-aware resolver (`incompatible-rust-versions = "fallback"`).
 
 > Note: the project initially pinned 1.85.0 (mirroring roost) but the mid-2026
 > ecosystem — gix 0.84, etc. — needs a newer compiler, so strix tracks current
-> stable. `mise install` / rustup will fetch 1.96.0 automatically.
+> stable. `mise install` / rustup will fetch 1.97.1 automatically.
 
 ## Style
 

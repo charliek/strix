@@ -2,7 +2,7 @@
 
 ## Toolchain
 
-strix pins Rust **1.96.0** in `rust-toolchain.toml` (and `.mise.toml`). With
+strix pins Rust **1.97.1** in `rust-toolchain.toml` (and `.mise.toml`). With
 `mise` or `rustup` the right toolchain installs on demand:
 
 ```bash

@@ -5,7 +5,7 @@ name = "strix"
 # first `/release-workflows:release v0.0.1` moves this to 0.0.1.
 version = "0.0.7"
 edition = "2021"
-rust-version = "1.96"
+rust-version = "1.97"
 description = "A focused, polished TUI for staging changes and viewing diffs"
 license = "MIT"
 repository = "https://github.com/charliek/strix"

@@ -48,7 +48,7 @@ sudo apt install -y "./strix_${VERSION}_${ARCH}.deb"
 ## Build from source
 
 strix is written in Rust and pins its toolchain in `rust-toolchain.toml`
-(currently **1.96.0**). With [`mise`](https://mise.jdx.dev/) or `rustup`, the
+(currently **1.97.1**). With [`mise`](https://mise.jdx.dev/) or `rustup`, the
 correct toolchain installs automatically.
 
 ```bash
@@ -64,7 +64,7 @@ install -m 0755 target/release/strix ~/.local/bin/strix
 |-------------|-------|
 | `git` on `PATH` | Required at runtime — strix shells out to `git` for staging mutations (stage / unstage / reset). The apt and Homebrew packages declare this dependency. |
 | A truecolor terminal | Themes use 24-bit RGB. Ghostty, iTerm2, Alacritty, WezTerm, and most modern terminals qualify. |
-| Rust 1.96.0 | **Only when building from source.** Pinned via `rust-toolchain.toml`; rustup/mise auto-install it. The prebuilt binaries have no build-time requirement. |
+| Rust 1.97.1 | **Only when building from source.** Pinned via `rust-toolchain.toml`; rustup/mise auto-install it. The prebuilt binaries have no build-time requirement. |
 
 ## Verify
 
