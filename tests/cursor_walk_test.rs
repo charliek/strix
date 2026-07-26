@@ -9,9 +9,11 @@
 //! §3.3(b): the diff pane focused, the file in the prepared window, the target
 //! still resolving — or the cursor drops back to `None`, both fields at once.
 //!
-//! B1 has no keyboard walk yet, so divergence is constructed through
-//! `App::place_cursor` (the same validated setter the walk and strip clicks
-//! will use).
+//! The address seam is driven two ways here: directly through
+//! `App::place_cursor` (the validated setter), and — from the `the walk` section
+//! down — by the keyboard walk of §3.3(f), which moves on the flattened target
+//! stream from wherever the cursor is and pulls the viewport after it through
+//! §3.3(h)'s window-aware reveal.
 
 mod common;
 
@@ -19,8 +21,8 @@ use std::ops::Range;
 use std::time::Instant;
 
 use common::{
-    app_for, click, config, dump, git, head_oid, init_repo, prepare_window, press, render_buffer,
-    seed_store, tab, window_of, write,
+    app_for, click, config, ctrl, dump, git, head_oid, init_repo, pane_title, prepare_window,
+    press, render_buffer, seed_store, staged, tab, unstaged, window_of, write,
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -28,7 +30,6 @@ use ratatui::style::Color;
 use strix::app::{App, CursorAddress, FileId, RowTarget};
 use strix::comments::{Comment, Scope, Side, Source};
 use strix::crossterm::event::MouseEventKind;
-use strix::git::Section;
 use tempfile::TempDir;
 
 const W: u16 = 120;
@@ -72,20 +73,6 @@ fn dup_path_repo() -> TempDir {
 }
 
 // --- helpers ----------------------------------------------------------------
-
-fn unstaged(path: &str) -> FileId {
-    FileId::Status {
-        section: Section::Unstaged,
-        path: path.to_string(),
-    }
-}
-
-fn staged(path: &str) -> FileId {
-    FileId::Status {
-        section: Section::Staged,
-        path: path.to_string(),
-    }
-}
 
 fn address(file: FileId, target: RowTarget) -> CursorAddress {
     CursorAddress { file, target }
@@ -669,4 +656,725 @@ fn an_anchor_cursor_is_not_swept_by_the_layout_toggles() {
     assert_eq!(app.cursor_address(), before, "wrap likewise");
     app.on_resize(W, H);
     assert_eq!(app.cursor_address(), before, "and a resize");
+}
+
+// --- the walk (plan 007 §3.3f/h) --------------------------------------------
+
+/// Three short files: the whole stream fits one viewport, so the cursor can walk
+/// A→B→C without the anchor ever having to move.
+fn three_short_files() -> TempDir {
+    let repo = init_repo();
+    write(repo.path(), "a.txt", "a one\na two\n");
+    write(repo.path(), "b.txt", "b one\n");
+    write(repo.path(), "c.txt", "c one\n");
+    repo
+}
+
+/// The diff pane's body glyphs, row by row.
+fn body(app: &App) -> Vec<String> {
+    let area = app.diff_area();
+    let buf = render_buffer(app, W, H);
+    (area.y..area.y + area.height)
+        .map(|y| diff_row_text(&buf, area, y))
+        .collect()
+}
+
+/// The pane's border title.
+fn title(app: &App) -> String {
+    let buf = render_buffer(app, W, H);
+    pane_title(&buf, app.diff_area())
+}
+
+/// §3.2f's continuity rule for a *keyboard* step: after moving down by `step`
+/// rows every row still on screen holds the content it did before. Glyphs only —
+/// the walk moves the cursor highlight as well as the view, so the styling of the
+/// row the cursor left (and the one it arrived on) legitimately changes.
+fn assert_shift_down(before: &[String], after: &[String], step: usize) {
+    for y in 0..before.len().saturating_sub(step) {
+        assert_eq!(
+            after[y],
+            before[y + step],
+            "body row {y} after the step should be row {} from before it",
+            y + step
+        );
+    }
+}
+
+/// The mirror image, for an upward step.
+fn assert_shift_up(before: &[String], after: &[String], step: usize) {
+    for y in 0..before.len().saturating_sub(step) {
+        assert_eq!(
+            after[y + step],
+            before[y],
+            "body row {} after the step should be row {y} from before it",
+            y + step
+        );
+    }
+}
+
+#[test]
+fn the_cursor_walks_through_two_files_while_the_first_stays_anchored() {
+    let repo = three_short_files();
+    let mut app = diff_focused_app(&repo);
+    let rows = app.diff_row_count(); // a.txt: header, hunk, two code rows
+    let before = body(&app);
+
+    // Off the end of a.txt: the next press is the boundary, and every press after
+    // it walks the *cursor* alone — the stream already fits the viewport, so
+    // there is nothing for the anchor to follow (plan 007 §3.3f). Nothing scrolls
+    // either, so the highlight itself advances one screen row per press, right
+    // through the boundary.
+    for press_no in 1..=rows {
+        press(&mut app, 'j');
+        assert_eq!(
+            cursor_screen_row(&app),
+            app.diff_area().y + press_no as u16,
+            "press {press_no}: one row down"
+        );
+    }
+    assert_eq!(
+        app.cursor_address(),
+        Some(address(unstaged("b.txt"), RowTarget::FileHeader))
+    );
+    assert_eq!(common::selected_path(&app), "a.txt");
+
+    let b_rows = window_of(&app).segments[1].rows();
+    for press_no in 1..=b_rows {
+        press(&mut app, 'j');
+        assert_eq!(
+            cursor_screen_row(&app),
+            app.diff_area().y + (rows + press_no) as u16,
+            "press {press_no} of the second boundary"
+        );
+    }
+    assert_eq!(
+        app.cursor_address(),
+        Some(address(unstaged("c.txt"), RowTarget::FileHeader)),
+        "the walk carried on into the third file"
+    );
+    assert_eq!(
+        common::selected_path(&app),
+        "a.txt",
+        "with a.txt anchored the whole way"
+    );
+    assert!(title(&app).contains("a.txt"), "{}", title(&app));
+    assert_eq!(app.diff_scroll.get(), 0, "and nothing scrolled");
+    assert_eq!(body(&app), before, "the same rows, start to finish");
+}
+
+#[test]
+fn a_walk_across_a_boundary_scrolls_a_row_per_press_and_flips_at_the_threshold() {
+    let repo = two_tall_files();
+    let mut app = diff_focused_app(&repo);
+    let v = app.diff_area().height as usize;
+    let r_a = app.diff_row_count();
+    press(&mut app, 'G'); // a.txt's last stop, revealed at its hard edge
+    assert_eq!(app.diff_scroll.get(), r_a - v);
+    let mut before = body(&app);
+
+    // Each press walks one stop into b.txt and pulls the view down exactly one
+    // row: the boundary stays on screen (a.txt's tail above, b.txt's head below)
+    // instead of the whole viewport teleporting.
+    for press_no in 1..=v {
+        press(&mut app, 'j');
+        let after = body(&app);
+        assert_shift_down(&before, &after, 1);
+        if press_no == 1 {
+            // The boundary frame: a.txt's tail still fills the pane, with b.txt's
+            // header arriving on the bottom row under the cursor.
+            assert!(
+                after[v - 1].contains("b.txt"),
+                "the arriving header: {}",
+                after[v - 1]
+            );
+            assert!(
+                after[v - 2].contains("alpha"),
+                "the departed tail above it: {}",
+                after[v - 2]
+            );
+        }
+        before = after;
+        assert_eq!(app.selected, 0, "press {press_no}: the anchor stays put");
+        assert!(
+            title(&app).contains("a.txt"),
+            "press {press_no}: {}",
+            title(&app)
+        );
+        assert_eq!(app.diff_scroll.get(), r_a - v + press_no);
+        assert_eq!(
+            app.cursor_address().map(|a| a.file),
+            Some(unstaged("b.txt")),
+            "press {press_no}: the cursor is in the file below"
+        );
+        assert_eq!(
+            cursor_screen_row(&app),
+            app.diff_area().y + v as u16 - 1,
+            "press {press_no}: riding the bottom edge"
+        );
+    }
+
+    // Press V + 1 is the first whose reveal puts the top past R_anchor — 006's
+    // strict hysteresis, the same threshold the wheel flips at.
+    press(&mut app, 'j');
+    let after = body(&app);
+    assert_shift_down(&before, &after, 1);
+    assert_eq!(app.selected, 1, "the anchor flipped on press {}", v + 1);
+    assert!(title(&app).contains("b.txt"), "{}", title(&app));
+    assert_eq!(app.diff_scroll.get(), 1, "(B, 1): one row past the top");
+    // The flip is cursor-preserving: the walk carried on from where it was, and
+    // did not restart at the arriving file's first row the way a wheel flip does.
+    assert!(!app.cursor_divergent(), "the address converged on the flip");
+    assert_eq!(
+        app.review_cursor(),
+        v,
+        "the cursor kept walking rather than resetting to row 0"
+    );
+}
+
+#[test]
+fn k_walks_back_down_stream_then_flips_on_the_stop_above_the_anchor() {
+    let repo = two_tall_files();
+    let mut app = diff_focused_app(&repo);
+    let v = app.diff_area().height as usize;
+    let r_a = app.diff_row_count();
+    press(&mut app, 'j'); // off the header so the cursor has somewhere to come back to
+    press(&mut app, 'G');
+    for _ in 0..=v {
+        press(&mut app, 'j'); // walk into b.txt and past the flip threshold
+    }
+    assert_eq!(app.selected, 1);
+
+    // Back up through b.txt: ordinary in-file moves, no flip until the cursor
+    // reaches b.txt's own first stop.
+    for _ in 0..v {
+        press(&mut app, 'k');
+        assert_eq!(app.selected, 1, "still walking inside b.txt");
+    }
+    assert_eq!(app.review_cursor(), 0, "at b.txt's first stop");
+    assert_eq!(app.diff_scroll.get(), 0);
+    let before = body(&app);
+
+    press(&mut app, 'k');
+    // Previous files cannot render below the anchor, so this one press is the
+    // whole flip: anchor, selection and title move, the cursor converges on
+    // a.txt's last target, and the view moves by exactly the one row that target
+    // occupies (§3.3f's pinned asymmetry).
+    assert_eq!(app.selected, 0);
+    assert!(title(&app).contains("a.txt"), "{}", title(&app));
+    assert!(!app.cursor_divergent());
+    assert_eq!(app.review_cursor(), r_a - 1, "a.txt's last target");
+    assert_eq!(app.diff_scroll.get(), r_a - 1, "top-aligned on it");
+    assert_shift_up(&before, &body(&app), 1);
+}
+
+#[test]
+fn the_wheel_boundary_state_and_the_walk_share_one_threshold() {
+    // Plan 007 §3.3(j): wheel to exactly `(A, R_A)` — the position where b.txt's
+    // header leads the pane but the title still reads a.txt — and then walk. The
+    // walk must read that same position as "not past the top": it steps the cursor
+    // into b.txt without moving the view or the anchor.
+    let repo = two_tall_files();
+    let mut app = diff_focused_app(&repo);
+    let v = app.diff_area().height as usize;
+    let r_a = app.diff_row_count();
+    press(&mut app, 'G');
+    app.wheel_scroll_window((r_a - app.diff_scroll.get()) as i64);
+    assert_eq!((app.selected, app.diff_scroll.get()), (0, r_a), "(A, R_A)");
+    assert!(title(&app).contains("a.txt"), "{}", title(&app));
+    let parked = body(&app);
+
+    press(&mut app, 'j');
+    assert_eq!(
+        app.cursor_address(),
+        Some(address(unstaged("b.txt"), RowTarget::FileHeader)),
+        "the cursor entered b.txt"
+    );
+    assert_eq!(
+        (app.selected, app.diff_scroll.get()),
+        (0, r_a),
+        "and nothing moved: the cursor's row is already the top one"
+    );
+    assert_eq!(body(&app), parked, "frame-identical, highlight aside");
+
+    // From here the cursor walks down the visible strip with the view still, and
+    // the anchor changes hands only when the reveal has to push past R_anchor.
+    for press_no in 2..=v {
+        press(&mut app, 'j');
+        assert_eq!(app.selected, 0, "press {press_no}");
+        assert_eq!(
+            app.diff_scroll.get(),
+            r_a,
+            "press {press_no}: no scroll while the cursor still fits"
+        );
+        assert!(app.cursor_divergent(), "press {press_no}");
+    }
+
+    // The cursor has reached the bottom row of the viewport; the next press is
+    // the first whose reveal has to push the top past `R_A`.
+    press(&mut app, 'j');
+    assert_eq!(app.selected, 1, "the anchor flipped one row past the top");
+    assert_eq!(app.diff_scroll.get(), 1, "(B, 1)");
+    assert!(title(&app).contains("b.txt"), "{}", title(&app));
+}
+
+#[test]
+fn a_non_flipping_wheel_keeps_divergence_and_a_flipping_one_resets_it() {
+    let repo = two_tall_files();
+    let mut app = diverged_on_b(&repo);
+    let address_before = app.cursor_address();
+
+    // A tick that only deepens the strip leaves the address alone: its file is
+    // still in the prepared window, so the invariant holds.
+    wheel_down(&mut app);
+    assert!(
+        app.cursor_divergent(),
+        "a non-flipping tick does not touch the cursor"
+    );
+    assert_eq!(app.cursor_address(), address_before);
+
+    // A tick that hands the anchor over does reset it — 006's contract, and the
+    // firewall between mouse scrolling and the keyboard's address (§3.3b).
+    wheel_past_the_boundary(&mut app);
+    assert!(!app.cursor_divergent());
+    assert_eq!(app.review_cursor(), 0);
+}
+
+#[test]
+fn ctrl_d_spends_its_whole_residual_across_the_boundary_and_ctrl_u_returns_it() {
+    let repo = two_tall_files();
+    let mut app = diff_focused_app(&repo);
+    let half = (app.diff_area().height as usize / 2).max(1);
+    let r_a = app.diff_row_count();
+
+    // Half a page at a time down a.txt, until one press has to spend its residual
+    // in b.txt: the walk crosses with the leftover rows intact rather than
+    // stopping at the boundary for a second press (plan 007 §3.3f).
+    let mut flat = 0usize;
+    while flat + half < r_a {
+        app.on_key(ctrl('d'));
+        flat += half;
+        assert!(!app.cursor_divergent(), "still inside a.txt at row {flat}");
+        assert_eq!(app.review_cursor(), flat);
+    }
+    let landed = flat + half;
+    app.on_key(ctrl('d'));
+    assert!(app.cursor_divergent(), "the residual carried into b.txt");
+    let expected = window_of(&app).segments[1]
+        .section
+        .as_ref()
+        .expect("b.txt's section")
+        .rows[landed - r_a]
+        .target;
+    assert_eq!(
+        app.cursor_address(),
+        Some(address(unstaged("b.txt"), expected)),
+        "exactly {half} rows past row {flat} in the flattened stream"
+    );
+    assert_eq!(app.selected, 0, "without the anchor having to follow");
+
+    app.on_key(ctrl('u'));
+    assert!(
+        !app.cursor_divergent(),
+        "and straight back over the boundary"
+    );
+    assert_eq!(app.review_cursor(), flat, "the same residual, in reverse");
+}
+
+/// One 40-line file with a five-line note anchored to its tenth line, so the
+/// comment box is a single target spanning several physical rows well below the
+/// top of the layout.
+fn boxed_repo() -> TempDir {
+    let repo = init_repo();
+    let text: String = (0..40).map(|i| format!("line {i}\n")).collect();
+    write(repo.path(), "a.txt", &text);
+    let base = head_oid(repo.path());
+    seed_store(
+        repo.path(),
+        "main",
+        None,
+        vec![Comment {
+            scope: Scope::WorkTree,
+            id: 1,
+            source: Source::Human,
+            file: "a.txt".to_string(),
+            side: Side::New,
+            line: 10,
+            text: "note one\nnote two\nnote three\nnote four\nnote five".to_string(),
+            context: Some("line 9".to_string()),
+            orphaned: false,
+            created_at: 1_700_000_000,
+            base: Some(base),
+            stale: false,
+        }],
+    );
+    repo
+}
+
+#[test]
+fn a_half_page_into_a_comment_box_resumes_from_the_boxs_first_row() {
+    // The cursor is target-granular: a comment box is ONE stop, however many
+    // physical rows it draws, so the walk canonicalises any landing inside it to
+    // the box's `span.start`. A half page down into the middle of a box therefore
+    // does not remember which of its rows it arrived on, and the half page back up
+    // is measured from the box's first row — landing *above* where the pair
+    // started. That is deliberate, and it is byte-identical to the pre-walk
+    // arithmetic this replaced (`(start + step).max(end)` down, `start - step` up):
+    // the walk generalised those two expressions across files without touching
+    // their granularity.
+    let repo = boxed_repo();
+    let mut app = diff_focused_app(&repo);
+    let width = app.diff_area().width;
+    let half = (app.diff_area().height as usize / 2).max(1);
+    let boxed = RowTarget::Comment(1);
+    let box_start = app
+        .diff_layout(width)
+        .iter()
+        .position(|row| row.target == boxed)
+        .expect("the seeded note's box is in the layout");
+    let box_rows = app.diff_layout(width)[box_start..]
+        .iter()
+        .take_while(|row| row.target == boxed)
+        .count();
+    assert!(
+        box_rows >= 5,
+        "a box of {box_rows} rows is tall enough to land inside"
+    );
+
+    // Park two rows short of a half page above the box, so the step lands *inside*
+    // it rather than on its first row — the only way the canonicalisation shows.
+    let parked = box_start + 2 - half;
+    assert!(parked > 0, "the box sits far enough down the layout");
+    for _ in 0..parked {
+        press(&mut app, 'j');
+    }
+    let before = app.cursor_address();
+    assert_eq!(app.review_cursor(), parked);
+    assert_ne!(
+        before.as_ref().map(|a| a.target),
+        Some(RowTarget::Comment(1)),
+        "and it starts on a plain code row"
+    );
+
+    app.on_key(ctrl('d'));
+    assert_eq!(
+        app.cursor_address(),
+        Some(address(unstaged("a.txt"), boxed)),
+        "a half page lands on the box — physical row {}, its third of {box_rows}",
+        parked + half
+    );
+    assert_eq!(
+        app.review_cursor(),
+        box_start,
+        "and the cursor reads as the whole box, from its first row"
+    );
+
+    app.on_key(ctrl('u'));
+    assert_eq!(
+        app.review_cursor(),
+        box_start - half,
+        "the way back is measured from the box's first row, not from the row the \
+         step happened to land on"
+    );
+    assert_ne!(
+        app.cursor_address(),
+        before,
+        "so the pair does not round-trip while the box is taller than one row"
+    );
+    assert_eq!(
+        app.review_cursor() + 2,
+        parked,
+        "it lands exactly the box's own two rows higher"
+    );
+}
+
+// --- the (file, target) oracle ----------------------------------------------
+//
+// The walk is *defined* on the flattened target stream, so the reference model is
+// that stream written out: one entry per physical row of the whole file list,
+// plus the two scroll rules (§3.3h's stream reveal for a divergent destination,
+// today's anchor-domain clamp for a converged one). The model is written in
+// representation-independent flat coordinates — a single row index into the whole
+// stream — so agreeing with the app's `(anchor, offset)` pair is a real
+// constraint, not a restatement of the implementation.
+
+/// A stream whose four entries cover the awkward cases in one fixture: a path
+/// listed twice (staged *and* modified, two entries that differ only by
+/// [`FileId`]) and a binary file whose header row is its whole section.
+fn oracle_repo() -> TempDir {
+    let repo = dup_path_repo();
+    write(repo.path(), "bin.dat", "a\0b\0c\n"); // NUL bytes → a binary diff
+    write(repo.path(), "z.txt", "z one\nz two\n");
+    repo
+}
+
+/// The flattened stream: per-file row counts, and the `(file, target)` every
+/// physical row belongs to. Measured by selecting each file in turn — a file's
+/// layout when selected *is* its section (006 C2's parity guarantee).
+fn flatten(repo: &TempDir, h: u16) -> (Vec<usize>, Vec<(FileId, RowTarget)>) {
+    let mut app = app_for(repo, config(true, false));
+    dump(&app, W, h);
+    let mut rows = Vec::new();
+    let mut flat = Vec::new();
+    for index in 0..app.status.total() {
+        common::select(&mut app, index, h);
+        let id = app.active_file_id().expect("a selected file");
+        let layout = app.diff_layout(app.diff_area().width);
+        rows.push(layout.len());
+        flat.extend(layout.iter().map(|row| (id.clone(), row.target)));
+    }
+    (rows, flat)
+}
+
+/// The reference model: where the cursor and the viewport are, in flat rows.
+struct Oracle {
+    rows: Vec<usize>,
+    flat: Vec<(FileId, RowTarget)>,
+    viewport: usize,
+    anchor: usize,
+    top: usize,
+    cursor: usize,
+}
+
+impl Oracle {
+    fn new(rows: Vec<usize>, flat: Vec<(FileId, RowTarget)>, viewport: usize) -> Self {
+        Oracle {
+            rows,
+            flat,
+            viewport,
+            anchor: 0,
+            top: 0,
+            cursor: 0,
+        }
+    }
+
+    fn total(&self) -> usize {
+        self.flat.len()
+    }
+
+    fn start_of(&self, file: usize) -> usize {
+        self.rows[..file].iter().sum()
+    }
+
+    fn file_of(&self, row: usize) -> usize {
+        let mut base = 0;
+        for (index, rows) in self.rows.iter().enumerate() {
+            base += rows;
+            if row < base {
+                return index;
+            }
+        }
+        self.rows.len() - 1
+    }
+
+    /// The run of rows sharing the cursor row's `(file, target)` — the model's
+    /// half of `target_span`.
+    fn span(&self, row: usize) -> Range<usize> {
+        let key = &self.flat[row];
+        let mut start = row;
+        while start > 0 && self.flat[start - 1] == *key {
+            start -= 1;
+        }
+        let mut end = row + 1;
+        while end < self.total() && self.flat[end] == *key {
+            end += 1;
+        }
+        start..end
+    }
+
+    /// Where a reveal wants the top, given the destination's `[start, end)`.
+    /// `top` and `span` must be in the same domain — flat rows for the stream
+    /// reveal, the anchor file's own rows for the anchor-domain one.
+    fn reveal(&self, top: i64, span: &Range<i64>) -> i64 {
+        let viewport = self.viewport as i64;
+        if span.start < top || span.end - span.start >= viewport {
+            span.start
+        } else if span.end > top + viewport {
+            span.end - viewport
+        } else {
+            top
+        }
+    }
+
+    fn step(&mut self, down: bool, step: usize) {
+        // Both directions measure from the cursor target's `span.start`, never
+        // from the physical row the last step happened to land on: the cursor is
+        // target-granular — a comment box is one stop however many rows it draws —
+        // so a landing inside a multi-row target canonicalises to its first row.
+        // That is the deliberate contract (and the pre-walk arithmetic verbatim),
+        // not a shortcut in the model; see
+        // `a_half_page_into_a_comment_box_resumes_from_the_boxs_first_row`.
+        let span = self.span(self.cursor);
+        let destination = if down {
+            (span.start + step).max(span.end).min(self.total() - 1)
+        } else {
+            span.start.saturating_sub(step)
+        };
+        self.cursor = destination;
+        let span = self.span(destination);
+        let file = self.file_of(destination);
+        if file == self.anchor {
+            // Converged: today's anchor-domain reveal, clamped to the anchor's own
+            // last page (§3.3h keeps this verbatim).
+            let base = self.start_of(file);
+            let local = (span.start - base) as i64..(span.end - base) as i64;
+            let new_top = self.reveal((self.top - base) as i64, &local).max(0) as usize;
+            let max_top = self.rows[file].saturating_sub(self.viewport);
+            self.top = base + new_top.min(max_top);
+            return;
+        }
+        // Divergent (or above the anchor): the stream reveal, then the
+        // renormalization + end-of-stream clamp the settle does.
+        let raw = self.reveal(self.top as i64, &(span.start as i64..span.end as i64));
+        let mut anchor = self.anchor;
+        while raw > self.start_of(anchor) as i64 + self.rows[anchor] as i64
+            && anchor + 1 < self.rows.len()
+        {
+            anchor += 1;
+        }
+        while raw < self.start_of(anchor) as i64 && anchor > 0 {
+            anchor -= 1;
+        }
+        let top = raw.clamp(0, self.total().saturating_sub(self.viewport) as i64) as usize;
+        while top < self.start_of(anchor) && anchor > 0 {
+            anchor -= 1;
+        }
+        self.anchor = anchor;
+        self.top = top;
+    }
+
+    /// Assert `app` is where the model says it is.
+    fn check(&self, app: &App, what: &str) {
+        let (file, target) = self.flat[self.cursor].clone();
+        assert_eq!(
+            app.cursor_address(),
+            Some(address(file, target)),
+            "{what}: cursor address"
+        );
+        assert_eq!(app.selected, self.anchor, "{what}: anchor");
+        assert_eq!(
+            self.start_of(app.selected) + app.diff_scroll.get(),
+            self.top,
+            "{what}: flat top (anchor {}, offset {})",
+            app.selected,
+            app.diff_scroll.get()
+        );
+    }
+}
+
+/// The `reveal`'s top for a *converged* destination is computed in the anchor's
+/// own coordinates; this test drives the model and the app side by side.
+fn walk_against_the_oracle(repo: &TempDir, h: u16, keys: &[char], label: &str) {
+    let (rows, flat) = flatten(repo, h);
+    let mut oracle = Oracle::new(rows, flat, (h - 4) as usize);
+    let mut app = app_for(repo, config(true, false));
+    dump(&app, W, h);
+    press(&mut app, 'l');
+    dump(&app, W, h);
+    let half = ((h - 4) as usize / 2).max(1);
+    oracle.check(&app, &format!("{label}: before any press"));
+
+    for (index, key) in keys.iter().enumerate() {
+        // One match for both sides: the app's key and the model's `(down, step)`
+        // can't drift apart, and an unknown key can't quietly become a Ctrl-u.
+        let (down, step) = match key {
+            'j' => {
+                press(&mut app, 'j');
+                (true, 1)
+            }
+            'k' => {
+                press(&mut app, 'k');
+                (false, 1)
+            }
+            'd' => {
+                app.on_key(ctrl('d'));
+                (true, half)
+            }
+            'u' => {
+                app.on_key(ctrl('u'));
+                (false, half)
+            }
+            other => panic!("unknown key {other}"),
+        };
+        dump(&app, W, h);
+        oracle.step(down, step);
+        oracle.check(&app, &format!("{label}: after press {} ({key})", index + 1));
+    }
+}
+
+#[test]
+fn every_short_key_sequence_matches_the_flattened_oracle() {
+    let repo = oracle_repo();
+    let keys = ['j', 'k', 'd', 'u'];
+    // Exhaustive to length three, at a viewport the stream is deeper than (so
+    // boundaries, flips and the end clamp are all in range) and at V = 1.
+    for h in [8u16, 5] {
+        for &a in &keys {
+            walk_against_the_oracle(&repo, h, &[a], &format!("h={h} [{a}]"));
+            for &b in &keys {
+                walk_against_the_oracle(&repo, h, &[a, b], &format!("h={h} [{a}{b}]"));
+                for &c in &keys {
+                    walk_against_the_oracle(&repo, h, &[a, b, c], &format!("h={h} [{a}{b}{c}]"));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_long_random_walk_matches_the_flattened_oracle() {
+    let repo = oracle_repo();
+    // V = 1, a viewport the stream is deeper than, and one deeper than the whole
+    // stream (where nothing ever scrolls and every step is pure cursor movement).
+    for h in [5u16, 8, 40] {
+        let mut seed = 0x9e37_79b9u32;
+        let keys: Vec<char> = (0..300)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ['j', 'k', 'd', 'u'][((seed >> 8) % 4) as usize]
+            })
+            .collect();
+        walk_against_the_oracle(&repo, h, &keys, &format!("h={h} random"));
+    }
+}
+
+#[test]
+fn a_reveal_triggered_flip_keeps_the_very_same_address() {
+    // At the end of the stream a walk press cannot move the cursor — the residual
+    // is discarded — but it still reveals, and here that reveal renormalizes past
+    // the boundary. So the flip is cursor-preserving in the literal sense: the
+    // same `(file, target)` before and after, only converged (plan 007 §3.3h).
+    let repo = two_tall_files();
+    let mut app = diff_focused_app(&repo);
+    let v = app.diff_area().height as usize;
+    let r_a = app.diff_row_count();
+    app.wheel_scroll_window((r_a - v + 1) as i64); // b.txt's first row enters the window
+    let target = {
+        let window = window_of(&app);
+        let strip = window.segments.last().expect("a strip segment");
+        assert!(!strip.is_anchor(), "b.txt is below the anchor");
+        strip
+            .section
+            .as_ref()
+            .expect("its prepared section")
+            .rows
+            .last()
+            .expect("b.txt has rows")
+            .target
+    };
+    assert!(
+        app.place_cursor(address(unstaged("b.txt"), target)),
+        "b.txt's last target — in the window's file, below its drawn rows"
+    );
+    let before = app.cursor_address();
+    assert!(title(&app).contains("a.txt"), "{}", title(&app));
+
+    press(&mut app, 'j');
+    assert_eq!(
+        app.cursor_address(),
+        before,
+        "the address survived the flip untouched"
+    );
+    assert_eq!(app.selected, 1, "which happened: the anchor moved");
+    assert!(!app.cursor_divergent(), "so the address is converged now");
+    assert!(title(&app).contains("b.txt"), "{}", title(&app));
 }

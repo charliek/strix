@@ -5,25 +5,27 @@
 //! viewport bottom never passes the last row the stream offers (§3.2b), with the
 //! border title following the anchor (§3.2c).
 //!
-//! The keyboard crosses in one press into the same stream (§3.5): `j` at the last
-//! stop lands the next file's header at the top, `k` at the header lands the
-//! previous file's tail with the departed header at the bottom edge, and a
-//! list-focused half page is a plain continuous tick. Off by default; the History
-//! view is excluded.
+//! The keyboard *walks* that same stream (plan 007 §3.3f, which replaced 006's
+//! one-press teleport): `j` at the last stop steps onto the next file's first
+//! target as a divergent cursor with the boundary still on screen, the anchor
+//! following only when the reveal renormalizes past it; `k` above the anchor's
+//! first stop flips immediately onto the previous file's last target. A
+//! list-focused half page stays a plain continuous tick. Off by default; the
+//! History view is excluded.
 
 mod common;
 
 use common::{
     app_for, config, git, init_repo, init_repo_with_diverged_branches, mouse, pane_title,
     prepare_window, press, render_buffer, rendered_app, select, selected_path, short_status_repo,
-    window_of, write,
+    unstaged, window_of, write,
 };
 use std::collections::BTreeMap;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier};
-use strix::app::{App, RowContent, RowTarget};
+use strix::app::{App, FileId, RowContent, RowTarget};
 use strix::comments::{Branch, Comment, Scope, Side, Source, Store};
 use strix::config::Config;
 use strix::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
@@ -156,6 +158,30 @@ fn assert_shift_up(before: &[Vec<Cell>], after: &[Vec<Cell>], step: usize) {
             after[y + step],
             before[y],
             "body row {} after the tick is row {y} from before it",
+            y + step
+        );
+    }
+}
+
+/// The glyphs of every body row, top to bottom. The walk moves the cursor
+/// highlight as well as the view, so a frame-to-frame comparison across a
+/// keypress has to compare *content* — §3.2f's full cell comparison stays the
+/// wheel's, which never touches the cursor.
+fn body_glyphs(rows: &[Vec<Cell>]) -> Vec<String> {
+    rows.iter()
+        .map(|row| row.iter().map(|cell| cell.0.as_str()).collect())
+        .collect()
+}
+
+/// Glyph-only [`assert_shift_up`]: after an upward step of `step` rows every row
+/// that was on screen before is `step` rows lower.
+fn assert_text_shift_up(before: &[Vec<Cell>], after: &[Vec<Cell>], step: usize) {
+    let (before, after) = (body_glyphs(before), body_glyphs(after));
+    for y in 0..before.len().saturating_sub(step) {
+        assert_eq!(
+            after[y + step],
+            before[y],
+            "body row {} after the step is row {y} from before it",
             y + step
         );
     }
@@ -1028,11 +1054,34 @@ fn disabled_clamps_and_never_hops() {
     );
 }
 
-// --- keyboard: crossing in one press (plan 006 §3.5) -----------------------
+// --- keyboard: the walk (plan 007 §3.3f) -----------------------------------
 
-/// The [`RowTarget`] the diff cursor names right now.
+/// The [`RowTarget`] the diff cursor names right now, resolved in the anchor's
+/// layout (a converged cursor only — see [`cursor_at`] for the address).
 fn cursor_target(app: &App) -> RowTarget {
     app.diff_layout(app.diff_area().width)[app.review_cursor()].target
+}
+
+/// The address the cursor names: which stream file, and which of its targets.
+fn cursor_at(app: &App) -> (FileId, RowTarget) {
+    let address = app.cursor_address().expect("the pane has a cursor");
+    (address.file, address.target)
+}
+
+/// Press `j` (or `k`) until the anchor flips, returning how many presses it
+/// took. Measured by the anchor's [`FileId`], which reads the same in either
+/// view — and tells the two entries of a dup path apart. Panics rather than
+/// looping forever.
+fn press_until_flip(app: &mut App, key: char, w: u16, h: u16) -> usize {
+    let from = app.active_file_id();
+    for count in 1..=200 {
+        press(app, key);
+        dump_frame(app, w, h).unwrap();
+        if app.active_file_id() != from {
+            return count;
+        }
+    }
+    panic!("the anchor never flipped");
 }
 
 /// The glyphs of body row `y` of the diff pane.
@@ -1048,73 +1097,96 @@ fn typ(app: &mut App, text: &str) {
 }
 
 #[test]
-fn j_at_the_last_stop_crosses_in_one_press() {
+fn j_at_the_last_stop_walks_onto_the_next_files_header() {
     let repo = short_status_repo(); // b.txt then c.txt, both short
     let mut app = rendered_app(&repo, config(true, false), H);
     press(&mut app, 'l'); // focus the diff
     press(&mut app, 'G'); // cursor to b.txt's last stop
     assert_eq!(app.selected, 0);
+    let (title_before, body_before) = frame(&app, H);
 
     press(&mut app, 'j');
-    assert_eq!(app.selected, 1, "one press crosses the boundary");
-    assert_eq!(selected_path(&app), "c.txt");
-    assert_eq!(
-        app.diff_scroll.get(),
-        0,
-        "the arriving file leads the viewport"
-    );
-    assert_eq!(app.review_cursor(), 0);
-    assert_eq!(
-        cursor_target(&app),
-        RowTarget::FileHeader,
-        "the cursor lands on the arriving file's header row"
-    );
+    // The whole stream already fits the viewport, so the walk moves the cursor
+    // and nothing else: no scroll, no flip, no title change (§3.3f).
+    assert_eq!(app.selected, 0, "the anchor stays where it was");
+    assert_eq!(selected_path(&app), "b.txt");
+    assert_eq!(app.diff_scroll.get(), 0);
+    assert!(app.cursor_divergent(), "the address names the file below");
+    assert_eq!(cursor_at(&app), (unstaged("c.txt"), RowTarget::FileHeader));
 
-    // The title is selection-driven and the selection *is* the anchor, so it reads
-    // the arriving file the moment its header leads the pane (§3.2a).
     let (title, body) = frame(&app, H);
-    assert!(title.contains("c.txt"), "the title flipped: {title}");
+    assert_eq!(title, title_before, "the title still reads b.txt: {title}");
+    assert_eq!(
+        body_glyphs(&body),
+        body_glyphs(&body_before),
+        "the same rows are on screen — only the highlight moved"
+    );
     let first = body_text(&body, 0);
-    assert!(first.contains("c.txt"), "the header row leads: {first}");
+    assert!(first.contains("b.txt"), "the anchor still leads: {first}");
 }
 
 #[test]
-fn k_at_the_header_crosses_to_the_previous_files_tail() {
-    let repo = multi_status_repo(); // a.txt is tall, b.txt short
+fn k_above_the_anchors_first_stop_flips_onto_the_previous_files_last_target() {
+    let repo = handoff_repo(); // a.txt is tall, b.txt deep enough to follow it
     let mut app = rendered_app(&repo, config(true, false), H);
-    let prev_rows = app.diff_row_count(); // a.txt's layout, header included
-    let v = viewport_at(H);
-    assert!(prev_rows > v, "a.txt is deeper than the viewport");
+    let rows = stream_rows(&mut app, H);
+    let prev_rows = rows[0];
 
     press(&mut app, 'j'); // select b.txt
     dump_frame(&app, W, H).unwrap();
     press(&mut app, 'l'); // focus the diff — the cursor rests on b.txt's header
     assert_eq!(cursor_target(&app), RowTarget::FileHeader);
+    assert_eq!(app.diff_scroll.get(), 0);
 
     press(&mut app, 'k');
-    assert_eq!(app.selected, 0, "k at the header crosses back");
+    // Previous files cannot render below the anchor, so this direction flips on
+    // the spot: the anchor, selection and title move to a.txt and the cursor is
+    // converged on its last target, top-aligned (§3.3f's pinned asymmetry).
+    assert_eq!(app.selected, 0, "the anchor moved with the cursor");
     assert_eq!(selected_path(&app), "a.txt");
     assert_eq!(
         app.diff_scroll.get(),
-        prev_rows + 1 - v,
-        "bottom-aligned plus one strip row (§3.5)"
+        prev_rows - 1,
+        "top = the landing target's own span start"
     );
     assert_eq!(
         app.review_cursor(),
         prev_rows - 1,
         "the cursor is on the previous file's last target"
     );
+    assert!(!app.cursor_divergent(), "and it converged there");
 
     let (title, body) = frame(&app, H);
     assert!(
         title.contains("a.txt"),
         "the title followed the anchor: {title}"
     );
-    let bottom = body_text(&body, v - 1);
+    let top = body_text(&body, 0);
     assert!(
-        bottom.contains("b.txt"),
-        "the departed file's header is visible at the bottom edge: {bottom}"
+        top.contains("alpha 59"),
+        "a.txt's last row leads the pane: {top}"
     );
+    let below = body_text(&body, 1);
+    assert!(
+        below.contains("b.txt"),
+        "the file just left continues right below it: {below}"
+    );
+}
+
+#[test]
+fn the_k_flip_moves_the_view_by_exactly_one_row() {
+    // The up flip is a *walk*, not a jump: one press, one row. Pinned as a buffer
+    // comparison (plan 006 §3.2f's rules) rather than an offset assertion.
+    let repo = handoff_repo();
+    let mut app = rendered_app(&repo, config(true, false), H);
+    press(&mut app, 'j'); // select b.txt: its header leads the pane
+    dump_frame(&app, W, H).unwrap();
+    press(&mut app, 'l');
+    let (_, before) = frame(&app, H);
+
+    press(&mut app, 'k');
+    let (_, after) = frame(&app, H);
+    assert_text_shift_up(&before, &after, 1);
 }
 
 #[test]
@@ -1177,24 +1249,24 @@ fn tall_wrapped_target_scrolls_internally_before_crossing() {
         "the step scrolled within the tall target"
     );
 
-    // Keep stepping: once the viewport reaches the hard edge, the next step crosses.
+    // Keep stepping: once the viewport reaches the hard edge, the next step walks
+    // out of the file — onto b.txt's header, with a.txt still anchored.
     for _ in 0..500 {
-        if app.selected != 0 {
+        if app.cursor_divergent() {
             break;
         }
         press(&mut app, 'j');
     }
-    assert_eq!(app.selected, 1, "crosses once the hard edge is reached");
     assert_eq!(
-        app.diff_scroll.get(),
-        0,
-        "the arriving file leads the viewport"
+        cursor_at(&app),
+        (unstaged("b.txt"), RowTarget::FileHeader),
+        "the walk leaves the tall target only once the whole line has been seen"
     );
-    assert_eq!(cursor_target(&app), RowTarget::FileHeader);
+    assert_eq!(app.selected, 0, "a.txt is still the anchor");
 }
 
 #[test]
-fn an_up_cross_onto_a_multi_row_last_target_shows_its_tail() {
+fn an_up_walk_onto_a_multi_row_last_target_top_aligns_the_whole_box() {
     let repo = init_repo();
     write(repo.path(), "a.txt", "one\ntwo\n");
     write(repo.path(), "b.txt", "x\ny\n");
@@ -1235,27 +1307,31 @@ fn an_up_cross_onto_a_multi_row_last_target_shows_its_tail() {
     press(&mut app, 'l'); // focus the diff — the cursor rests on b.txt's header
 
     press(&mut app, 'k');
-    assert_eq!(app.selected, 0, "crossed back into a.txt");
-    let offset = prev_rows + 1 - v;
-    assert_eq!(app.diff_scroll.get(), offset, "the §3.5 landing offset");
+    assert_eq!(app.selected, 0, "the up walk flipped back into a.txt");
+    assert_eq!(
+        app.diff_scroll.get(),
+        box_start,
+        "top = the landing target's span start, so the whole box is revealed \
+         from its first row rather than clipped to its tail"
+    );
     assert_eq!(
         cursor_target(&app),
         last_target,
         "the cursor names the whole box"
     );
     assert!(
-        box_start < offset,
-        "the box starts above the viewport, so only its tail shows"
+        prev_rows - box_start >= v,
+        "the box fills the viewport on its own"
     );
     let (_, body) = frame(&app, h);
     assert!(
-        body_text(&body, v - 1).contains("b.txt"),
-        "the departed header still holds the bottom edge"
+        !body_text(&body, 0).contains("b.txt"),
+        "the box leads the pane, not the file the cursor came from"
     );
 }
 
 #[test]
-fn an_empty_file_is_a_one_stop_section_the_keyboard_crosses_through() {
+fn an_empty_file_is_a_one_stop_section_the_walk_steps_through() {
     let repo = init_repo();
     write(repo.path(), "a.txt", "one\n");
     write(repo.path(), "bin.dat", "a\0b\0c\n"); // NUL bytes → a binary diff
@@ -1266,51 +1342,50 @@ fn an_empty_file_is_a_one_stop_section_the_keyboard_crosses_through() {
     press(&mut app, 'l');
     press(&mut app, 'G'); // a.txt's last stop
     press(&mut app, 'j');
+    // The three files together are shallower than the viewport, so the cursor
+    // walks the whole stream with a.txt anchored throughout.
     assert_eq!(
-        selected_path(&app),
-        "bin.dat",
-        "crossed onto the binary file"
+        cursor_at(&app),
+        (unstaged("bin.dat"), RowTarget::FileHeader)
     );
-    assert_eq!(
-        app.diff_row_count(),
-        1,
-        "with cross-file on its header row is the whole section"
-    );
-    assert_eq!(cursor_target(&app), RowTarget::FileHeader);
+    assert_eq!(app.selected, 0, "the anchor never moved");
     assert_eq!(app.diff_scroll.get(), 0);
 
     dump_frame(&app, W, H).unwrap();
-    press(&mut app, 'j'); // a one-stop section: the next press crosses onward
-    assert_eq!(selected_path(&app), "z.txt");
-    assert_eq!(app.review_cursor(), 0);
+    press(&mut app, 'j'); // a one-stop section: the next press steps clean off it
+    assert_eq!(cursor_at(&app), (unstaged("z.txt"), RowTarget::FileHeader));
 
     // Symmetric upward: back onto the one-stop section, then off it again.
     dump_frame(&app, W, H).unwrap();
     press(&mut app, 'k');
-    assert_eq!(selected_path(&app), "bin.dat");
-    assert_eq!(app.review_cursor(), 0, "its only stop");
+    assert_eq!(
+        cursor_at(&app),
+        (unstaged("bin.dat"), RowTarget::FileHeader),
+        "its only stop"
+    );
     dump_frame(&app, W, H).unwrap();
     press(&mut app, 'k');
-    assert_eq!(selected_path(&app), "a.txt");
+    assert_eq!(app.selected, 0);
+    assert!(!app.cursor_divergent(), "back home on the anchor");
     assert_eq!(
         app.review_cursor(),
         app.diff_row_count() - 1,
-        "the previous file's last target"
+        "the anchor's last target"
     );
 }
 
 #[test]
-fn the_keyboard_crosses_a_staged_unstaged_same_path_boundary() {
+fn the_walk_crosses_a_staged_unstaged_same_path_boundary() {
     // `dup.txt` is both staged and unstaged: two stream entries, one path, with
-    // different header markers — the landing must flip the marker.
+    // different header markers. The address has to name the *entry*, not the path.
     let repo = init_repo();
-    let staged: String = (0..60).map(|i| format!("line {i}\n")).collect();
-    write(repo.path(), "dup.txt", &staged);
+    let staged_text: String = (0..60).map(|i| format!("line {i}\n")).collect();
+    write(repo.path(), "dup.txt", &staged_text);
     git(repo.path(), &["add", "dup.txt"]);
     write(
         repo.path(),
         "dup.txt",
-        &format!("{staged}extra a\nextra b\n"),
+        &format!("{staged_text}extra a\nextra b\n"),
     );
     let mut app = rendered_app(&repo, config(true, false), H);
     assert_eq!(app.status.total(), 2, "staged and unstaged rows");
@@ -1321,26 +1396,41 @@ fn the_keyboard_crosses_a_staged_unstaged_same_path_boundary() {
     press(&mut app, 'G'); // the staged entry's last stop
     press(&mut app, 'j');
     assert_eq!(
-        app.selected, 1,
-        "crossed into the same path's other section"
+        cursor_at(&app),
+        (unstaged("dup.txt"), RowTarget::FileHeader),
+        "the walk stepped into the *working-tree* entry of the same path"
+    );
+    assert_eq!(app.selected, 0, "which the anchor has not followed yet");
+    assert_eq!(
+        anchor_header_marker(&app),
+        staged_marker,
+        "so the title's header marker is still the staged one"
+    );
+
+    // Walking on flips exactly when the reveal renormalizes past the boundary.
+    let presses = press_until_flip(&mut app, 'j', W, H);
+    assert_eq!(
+        presses,
+        viewport_at(H),
+        "one press per row (the first is already spent) until the top passes \
+         R_anchor"
     );
     assert_eq!(selected_path(&app), "dup.txt");
-    assert_eq!(app.diff_scroll.get(), 0);
-    assert_eq!(cursor_target(&app), RowTarget::FileHeader);
+    assert_eq!(app.diff_scroll.get(), 1, "(B, 1): one row past the top");
     assert_ne!(
         anchor_header_marker(&app),
         staged_marker,
-        "the header marker flips at the landing"
+        "the header marker flips with the anchor"
     );
+    assert!(!app.cursor_divergent(), "the address converged on the flip");
 
-    dump_frame(&app, W, H).unwrap();
-    press(&mut app, 'k');
+    press_until_flip(&mut app, 'k', W, H);
     assert_eq!(app.selected, 0, "and back the other way");
     assert_eq!(anchor_header_marker(&app), staged_marker);
     assert_eq!(
         app.diff_scroll.get(),
-        staged_rows + 1 - viewport_at(H),
-        "the §3.5 landing offset, measured against the staged entry"
+        staged_rows - 1,
+        "top-aligned on the staged entry's last target"
     );
 }
 
@@ -1380,10 +1470,17 @@ fn a_keypress_while_wheel_extended_snaps_back_to_the_cursor() {
 }
 
 #[test]
-fn the_h_scroll_clamp_follows_a_keyboard_flip() {
+fn the_h_scroll_clamp_follows_a_walk_flip() {
     let repo = init_repo();
-    write(repo.path(), "a.txt", &format!("{}\n", "x".repeat(400)));
-    write(repo.path(), "b.txt", "short\n");
+    // A wide, tall a.txt followed by a narrow, tall b.txt: tall enough on both
+    // sides that the walk really renormalizes the anchor across the boundary.
+    let wide: String = (0..60).map(|_| format!("{}\n", "x".repeat(400))).collect();
+    write(repo.path(), "a.txt", &wide);
+    write(
+        repo.path(),
+        "b.txt",
+        &(0..40).map(|i| format!("beta {i}\n")).collect::<String>(),
+    );
     let mut app = rendered_app(&repo, config(true, false), H);
     let d = app.diff_area();
     for _ in 0..4 {
@@ -1395,7 +1492,7 @@ fn the_h_scroll_clamp_follows_a_keyboard_flip() {
 
     press(&mut app, 'l');
     press(&mut app, 'G');
-    press(&mut app, 'j'); // cross onto the short-lined b.txt
+    press_until_flip(&mut app, 'j', W, H); // walk across the boundary
     assert_eq!(selected_path(&app), "b.txt");
     assert_eq!(
         app.diff_hscroll, shifted,
@@ -1406,12 +1503,11 @@ fn the_h_scroll_clamp_follows_a_keyboard_flip() {
         "but it reads clamped against the arriving file's longest line"
     );
 
-    dump_frame(&app, W, H).unwrap();
-    press(&mut app, 'k'); // back to the wide file
+    press_until_flip(&mut app, 'k', W, H); // back to the wide file
     assert_eq!(
         app.effective_hscroll(),
         shifted,
-        "crossing back restores the full shift"
+        "walking back restores the full shift"
     );
 }
 
@@ -1570,45 +1666,64 @@ fn review_disabled_never_hops() {
 }
 
 #[test]
-fn review_keyboard_crosses_both_directions() {
+fn review_walks_both_directions() {
     let (_repo, mut app) = review_app(true);
-    let h = 8; // a 4-row viewport, so the up-cross has a strip row to show
+    let h = 8; // a 4-row viewport, so the walk has a boundary to cross
     dump_frame(&app, W, h).unwrap();
     let v = viewport_at(h);
     let first_rows = app.diff_row_count();
     let first = app.review_files()[0].path.clone();
     let second = app.review_files()[1].path.clone();
+    let second_id = FileId::Review {
+        path: second.clone(),
+    };
 
     press(&mut app, 'l'); // focus the diff
     press(&mut app, 'G'); // the first file's last stop
     press(&mut app, 'j');
-    assert_eq!(app.review_selected(), 1, "one press crosses");
-    assert_eq!(app.diff_scroll.get(), 0);
-    assert_eq!(cursor_target(&app), RowTarget::FileHeader);
+    assert_eq!(
+        cursor_at(&app),
+        (second_id, RowTarget::FileHeader),
+        "the walk stepped onto the next review file's header"
+    );
+    assert_eq!(
+        app.review_selected(),
+        0,
+        "with the anchor still on the first"
+    );
     let (title, body) = frame(&app, h);
-    assert!(title.contains(&second), "the title flipped: {title}");
-    assert!(body_text(&body, 0).contains(&second));
+    assert!(title.contains(&first), "the title has not flipped: {title}");
+    assert!(
+        body_text(&body, v - 1).contains(&second),
+        "and the arriving header is the bottom row"
+    );
 
-    press(&mut app, 'k');
+    // The anchor follows once the reveal renormalizes past the boundary.
+    let presses = press_until_flip(&mut app, 'j', W, h);
+    assert_eq!(presses, v, "one press per row past the first stop");
+    assert_eq!(app.review_selected(), 1);
+    assert_eq!(app.diff_scroll.get(), 1, "one row past the top");
+    let (title, _) = frame(&app, h);
+    assert!(title.contains(&second), "the title flipped: {title}");
+
+    // And back: `k` walks down-stream to the boundary, then flips on the stop
+    // above the anchor's first.
+    press_until_flip(&mut app, 'k', W, h);
     assert_eq!(app.review_selected(), 0, "and back the other way");
     assert_eq!(
         app.diff_scroll.get(),
-        (first_rows + 1).saturating_sub(v),
-        "the §3.5 landing offset"
-    );
-    assert_eq!(
-        app.review_cursor(),
         first_rows - 1,
-        "the cursor is on the previous file's last target"
+        "top-aligned on the previous file's last target"
     );
+    assert_eq!(app.review_cursor(), first_rows - 1);
     let (title, body) = frame(&app, h);
     assert!(
         title.contains(&first),
         "the title followed the anchor: {title}"
     );
-    let bottom = body_text(&body, v - 1);
     assert!(
-        bottom.contains(&second),
-        "the departed file's header holds the bottom edge: {bottom}"
+        body_text(&body, 1).contains(&second),
+        "the file just left continues below it: {}",
+        body_text(&body, 1)
     );
 }

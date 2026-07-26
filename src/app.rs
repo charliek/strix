@@ -492,6 +492,21 @@ pub struct CursorAddress {
     pub target: RowTarget,
 }
 
+/// What happens to the diff cursor when the anchor flips under it
+/// ([`App::flip_anchor`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FlipCursor {
+    /// 006 §3.2d's contract: the arriving anchor starts with no cursor at all.
+    /// The wheel's mode — and the firewall that keeps mouse scrolling from
+    /// inheriting an address the keyboard walked to.
+    Reset,
+    /// Plan 007 §3.3h: the address survives the flip, captured before the
+    /// selection moves and re-installed after it. The mode every flip a *cursor*
+    /// movement triggered uses, so the row the user is pointing at is still the
+    /// row they are pointing at once the title has changed.
+    Keep,
+}
+
 /// One file's prepared contribution to the stream: the diff computed for it and
 /// the physical rows built from that diff. Named `FileSection` because `Section`
 /// alone is the staged/unstaged enum (`git::Section`).
@@ -1919,22 +1934,32 @@ impl App {
         self.set_cursor_on_anchor(None);
     }
 
-    /// Move the diff cursor by `step` physical rows (clamped), then scroll the
-    /// viewport so it stays visible ("act-and-reveal", plan §3.4). The cursor is
-    /// re-pinned to the [`RowTarget`] at the new physical row. A multi-row comment
-    /// box shares one target across N physical rows, so a downward step never
-    /// stalls inside the current box: it starts past the box's own last row, which
-    /// makes `j`/`k` cross a whole box in one step (plan §3.0).
+    /// Move the diff cursor by `step` physical rows, then scroll the viewport so
+    /// it stays visible ("act-and-reveal", plan §3.4).
+    ///
+    /// With a stream below the pane the movement is the **walk** (plan 007
+    /// §3.3f); without one it is today's single-file clamp.
     fn review_move_cursor(&mut self, down: bool, step: usize) {
+        if self.strip_anchor().is_some() {
+            self.walk_cursor(down, step);
+        } else {
+            self.move_cursor_in_anchor(down, step);
+        }
+    }
+
+    /// The pre-stream cursor move: `step` physical rows clamped to the anchor's
+    /// own row list. The path taken with cross-file scroll off, while the in-place
+    /// editor is open (the strip is collapsed for its duration), and in any view
+    /// without a stream.
+    ///
+    /// A multi-row comment box shares one target across N physical rows, so a
+    /// downward step never stalls inside the current box: it starts past the box's
+    /// own last row, which makes `j`/`k` cross a whole box in one step (plan §3.0).
+    fn move_cursor_in_anchor(&mut self, down: bool, step: usize) {
         let count = self.review_row_count();
         if count == 0 {
-            // Only reachable with cross-file scroll off: with it on, the file-header
-            // row makes an empty or binary file a normal one-stop section rather
-            // than a rowless one (plan 006 §3.5), so crossing off it goes through
-            // the ordinary no-advance path below.
             return;
         }
-        let current = self.review_cursor_target();
         let (start, end) = self
             .review_cursor_span()
             .map_or((0, 1), |span| (span.start, span.end));
@@ -1946,26 +1971,136 @@ impl App {
             start.saturating_sub(step)
         };
         let target = self.review_target_at(next);
-        // A step that leaves the cursor on the same target is a "no advance": the
-        // cursor is already on the last (down) or first (up) target. With
-        // cross-file scroll on, either scroll within a taller-than-viewport target
-        // or, once the viewport is pinned at the hard edge, cross into the
-        // neighbouring file in one press (plan 006 §3.5) — the residual step past
-        // the boundary is discarded. With it off, or at the first/last file, this
-        // falls through to the plain reveal — today's clamping.
-        if target == current && self.cross_file_scroll && !self.editing() {
-            if !self.at_hard_edge(down) {
-                // Step within the tall target (cursor unchanged); Ctrl-d/u clamps
-                // toward the edge first, a later press then crosses.
-                self.scroll_diff(down, step.min(u16::MAX as usize) as u16);
-                return;
-            }
-            if self.cross_file_step(down) {
-                return;
-            }
-        }
         self.set_cursor_on_anchor(target);
         self.review_reveal_cursor();
+    }
+
+    /// The keyboard walk (plan 007 §3.3f).
+    ///
+    /// Movement is defined on the **flattened target stream** — every stream
+    /// file's physical rows concatenated in list order — and starts from wherever
+    /// the *cursor* is, which may be a file below the anchor. A step that runs off
+    /// the end of the cursor's file keeps its residual and spends it in the next
+    /// one, so `j` walks a stop at a time through however many short files it
+    /// meets while the anchor stays put, and Ctrl-d moves a full half page across
+    /// boundaries instead of pausing at each. The residual is discarded only at
+    /// the two ends of the stream, where there is nothing left to spend it on.
+    ///
+    /// The anchor follows only when the reveal below renormalizes past the
+    /// boundary (`o > R_anchor`, 006's strict hysteresis — the same threshold the
+    /// wheel flips at), except upward, where a destination *above* the anchor
+    /// renormalizes on the spot: previous files cannot render below the anchor, so
+    /// there is no divergent state to walk through (§3.3f's pinned asymmetry).
+    fn walk_cursor(&mut self, down: bool, step: usize) {
+        let width = self.diff_pane_width();
+        let Some(address) = self.cursor_address() else {
+            return; // no file, or a layout with no rows at all
+        };
+        let Some(index) = self.stream_index_of_exact(&address.file) else {
+            return;
+        };
+        let Some(span) = self.address_file_span(&address) else {
+            return;
+        };
+        // The tall-target rule (plan 006 §3.5), unchanged and checked before any
+        // crossing: when the step cannot advance within the cursor's own file but
+        // the viewport still has room to move, scroll inside the target rather
+        // than stepping off content the user hasn't seen yet.
+        //
+        // Converged cursors only, because `at_hard_edge` is anchor-domain: a
+        // divergent cursor implies the anchor is pinned at its *lower* edge
+        // (§3.3b's first corollary) but says nothing about the upper one, and its
+        // own file's rows are not the anchor's to measure anyway. That leaves the
+        // rule firing exactly where it did before the walk existed.
+        let stuck = self.address_is_anchor(&address)
+            && if down {
+                span.end >= self.stream_rows(index, width)
+            } else {
+                span.start == 0
+            };
+        if stuck && !self.at_hard_edge(down) {
+            self.scroll_diff(down, step.min(u16::MAX as usize) as u16);
+            return;
+        }
+        let Some((file, row)) = self.walk_step(index, &span, down, step, width) else {
+            return;
+        };
+        let Some(destination) = self.stream_address_at(file, row, width) else {
+            return;
+        };
+        let target = destination.target;
+        if self.address_is_anchor(&destination) {
+            self.set_cursor_on_anchor(Some(target));
+            self.review_reveal_cursor();
+            return;
+        }
+        // Reveal *before* pinning: walking into a file is what brings it into the
+        // window, and `place_cursor` deliberately refuses an address the window
+        // doesn't hold yet. The reveal may hand the anchor over to the very file
+        // being walked into (always, going up), which converges the address.
+        self.reveal_address(&destination);
+        if self.address_is_anchor(&destination) {
+            self.set_cursor_on_anchor(Some(target));
+        } else {
+            // A rejected placement — the window still doesn't hold the file
+            // because a section vanished under the walk — leaves the cursor where
+            // it was rather than pinning a dangling address.
+            self.place_cursor(destination);
+        }
+    }
+
+    /// Where `step` physical rows from `span` in stream file `index` lands, as
+    /// `(file, row)` in the flattened stream. Files crossed on the way are
+    /// prepared here — the walk's laziness trigger (plan 007 §3.4).
+    fn walk_step(
+        &mut self,
+        index: usize,
+        span: &Range<usize>,
+        down: bool,
+        step: usize,
+        width: u16,
+    ) -> Option<(usize, usize)> {
+        let mut file = index;
+        if down {
+            // `.max(span.end)` skips the rest of a multi-row target, so one press
+            // crosses a whole comment box.
+            let mut row = (span.start + step).max(span.end);
+            loop {
+                let rows = self.stream_rows(file, width);
+                if row < rows {
+                    return Some((file, row));
+                }
+                if file + 1 >= self.stream_len() {
+                    return Some((file, rows.checked_sub(1)?)); // last file: clamp
+                }
+                row -= rows;
+                file += 1;
+            }
+        } else {
+            let mut row = span.start as i64 - step as i64;
+            while row < 0 {
+                if file == 0 {
+                    return Some((0, 0)); // first file: clamp
+                }
+                file -= 1;
+                row += self.stream_rows(file, width) as i64;
+            }
+            Some((file, row as usize))
+        }
+    }
+
+    /// The address physical `row` of stream file `index` names: that file's
+    /// identity paired with the [`RowTarget`] its rows carry there — read from the
+    /// live layout when it is the anchor (the one file whose rows can carry the
+    /// in-place editor), from its prepared section otherwise.
+    fn stream_address_at(&mut self, index: usize, row: usize, width: u16) -> Option<CursorAddress> {
+        let file = self.stream_file_id(index)?;
+        let target = if Some(index) == self.stream_position() {
+            self.review_target_at(row)?
+        } else {
+            self.prepare_section(index, width)?.rows.get(row)?.target
+        };
+        Some(CursorAddress { file, target })
     }
 
     /// Half-page in review: the diff pane moves the cursor (act-and-reveal); the
@@ -2004,6 +2139,13 @@ impl App {
     /// fully shown, so it top-aligns to the box's first row rather than looping
     /// (plan §3.4).
     fn review_reveal_cursor(&mut self) {
+        if let Some(address) = self.divergent_address() {
+            // A divergent cursor has no row in the anchor's layout at all, so the
+            // anchor-domain arithmetic below would reveal the wrong rows (or
+            // none): §3.3h's window-aware reveal owns this case.
+            self.reveal_address(&address);
+            return;
+        }
         if self.active_pane().is_none() {
             return;
         }
@@ -2032,6 +2174,43 @@ impl App {
         // Never scroll past the last full page of content.
         let max_top = count.saturating_sub(viewport);
         self.diff_scroll.set(new_top.min(max_top));
+    }
+
+    /// Scroll so `address` is visible, measured over the whole **stream** rather
+    /// than one file's rows (plan 007 §3.3h). Same rule as the anchor-domain
+    /// reveal above — already visible is a no-op, above the viewport top-aligns,
+    /// below pulls the last row in, a span taller than the viewport top-aligns —
+    /// but the top it computes is an extended-domain offset, settled through the
+    /// stream renormalizer. A top past the anchor's last row (`o > R_anchor`,
+    /// 006's strict hysteresis and the same threshold the wheel flips at) hands
+    /// the anchor over instead of clamping the address off screen; a negative one
+    /// hands it back to a previous file.
+    ///
+    /// The flip that settling may trigger is cursor-PRESERVING: an address being
+    /// revealed is an address the user is still pointing at. The wheel's resetting
+    /// flip is 006's contract and stays exactly as it was.
+    fn reveal_address(&mut self, address: &CursorAddress) {
+        let Some(anchor) = self.strip_anchor() else {
+            return;
+        };
+        let viewport = self.diff_viewport.get() as i64;
+        if viewport == 0 {
+            return;
+        }
+        let Some(span) = self.address_stream_span(address) else {
+            return;
+        };
+        let width = self.diff_pane_width();
+        let anchor_rows = self.diff_layout(width).len();
+        let top = self.paint_offset(anchor_rows, viewport as usize) as i64;
+        let new_top = if span.start < top || span.end - span.start >= viewport {
+            span.start
+        } else if span.end > top + viewport {
+            span.end - viewport
+        } else {
+            top
+        };
+        self.settle_stream_offset(anchor, new_top, FlipCursor::Keep);
     }
 
     /// Whether the diff cursor target's first row lies within the visible
@@ -2293,6 +2472,40 @@ impl App {
             drawn += segment.rows();
         }
         None
+    }
+
+    /// `address`'s span in the **offset domain**: physical rows counted from the
+    /// anchor file's own row 0, which is where `diff_scroll` lives (plan 006
+    /// §3.2a's extended domain, plus its mirror image above the anchor). This is
+    /// what [`App::reveal_address`] does its arithmetic in — [`App::
+    /// address_window_span`]'s screen rows move with the offset, so they cannot
+    /// express where the offset should go.
+    ///
+    /// Signed, because a file *before* the anchor sits at negative offsets: the
+    /// position the renormalizer turns back into a (previous file, offset) pair,
+    /// which is exactly how the upward walk flips. Files between the anchor and
+    /// the address are prepared on the way (§3.4).
+    fn address_stream_span(&mut self, address: &CursorAddress) -> Option<Range<i64>> {
+        let anchor = self.stream_position()?;
+        let index = self.stream_index_of_exact(&address.file)?;
+        let width = self.diff_pane_width();
+        if index != anchor {
+            // The address's own rows have to be readable before its span resolves;
+            // a walk upward reaches files the window never prepared.
+            self.prepare_section(index, width)?;
+        }
+        let span = self.address_file_span(address)?;
+        let mut base = 0i64;
+        if index >= anchor {
+            for file in anchor..index {
+                base += self.stream_rows(file, width) as i64;
+            }
+        } else {
+            for file in index..anchor {
+                base -= self.stream_rows(file, width) as i64;
+            }
+        }
+        Some(base + span.start as i64..base + span.end as i64)
     }
 
     /// The prepared section `file` resolves through, by exact identity — never
@@ -3829,7 +4042,7 @@ impl App {
         let Some(index) = self.stream_index_of_exact(&id) else {
             return;
         };
-        if !self.flip_anchor(index, 0) {
+        if !self.flip_anchor(index, 0, FlipCursor::Reset) {
             return;
         }
         self.focus_active_diff();
@@ -4106,61 +4319,6 @@ impl App {
         } else {
             offset == 0
         }
-    }
-
-    /// Cross one file boundary with the keyboard, in one press (plan 006 §3.5).
-    /// Returns `false` at the first/last file (the caller clamps as before) and in
-    /// any view without a stream.
-    ///
-    /// Down lands `(next, 0)`: the arriving file's header row leads the viewport
-    /// and takes the cursor, which is the whole transition marker. Up lands the
-    /// previous file bottom-aligned **plus one strip row** — `R_prev + 1 - V`,
-    /// held to `R_prev` for a file shorter than the viewport — so the departed
-    /// file's own header row stays visible at the bottom edge, marking where the
-    /// cursor came from. That offset is legal only in the extended domain, so it
-    /// is set directly through `flip_anchor`; `review_reveal_cursor` would clamp
-    /// the strip row back off.
-    fn cross_file_step(&mut self, down: bool) -> bool {
-        let Some(anchor) = self.strip_anchor() else {
-            return false;
-        };
-        let Some(to) = neighbour_index(anchor, self.stream_len(), down) else {
-            return false; // first/last file → clamp, no wraparound
-        };
-        let width = self.diff_pane_width();
-        let height = self.diff_viewport.get();
-        // Laziness trigger: a keyboard cross needs exactly the destination
-        // (plan 006 §3.3), which `flip_anchor` then requires to be prepared.
-        let Some(section) = self.prepare_section(to, width) else {
-            return false;
-        };
-        let rows = section.rows.len();
-        let offset = if down {
-            0
-        } else {
-            rows.saturating_add(1)
-                .saturating_sub(height as usize)
-                .min(rows)
-        };
-        if !self.flip_anchor(to, offset) {
-            // The section prepared above vanished before the flip could seed it
-            // (an invalidation drained in between) — stay put rather than pin a
-            // cursor against whichever file is still selected.
-            return false;
-        }
-        // `flip_anchor` resets the cursor (a wheel flip carries none), so the
-        // keyboard's own landing is pinned afterwards — against the layout the flip
-        // installed, which is why the row index resolves to the arriving file's
-        // targets rather than the departed file's.
-        let row = if down {
-            0
-        } else {
-            self.review_row_count().saturating_sub(1)
-        };
-        let target = self.review_target_at(row);
-        self.set_cursor_on_anchor(target);
-        self.ensure_diff_window(width, height);
-        true
     }
 
     fn history_scroll(&mut self, pos: Position, down: bool) {
@@ -5540,13 +5698,8 @@ impl App {
 
     /// A wheel tick in the extended stream domain (plan 006 §3.2a–b) — the wheel
     /// entry whenever cross-file scroll is on and the pane isn't editing. `delta`
-    /// is a signed physical-row count.
-    ///
-    /// Three steps, in order: **renormalize** the offset across file boundaries
-    /// (`(B, o) ≡ (A, R_A + o)`), **fill** the window from where that landed, and
-    /// **clamp** by any shortfall so the viewport bottom never passes the last row
-    /// the stream offers. All arithmetic is `i64`: an up-tick legitimately goes
-    /// negative before renormalization moves the anchor, and a `usize` would wrap.
+    /// is a signed physical-row count, applied to what the last frame painted and
+    /// settled by [`App::settle_stream_offset`].
     ///
     /// `pub` for the same reason as [`App::diff_window`]: the renormalizer's
     /// property test drives exact deltas, which a synthetic wheel event (fixed at
@@ -5557,18 +5710,39 @@ impl App {
             return;
         };
         let width = self.diff_pane_width();
-        let height = self.diff_viewport.get();
-        let viewport = height as usize;
+        let viewport = self.diff_viewport.get() as usize;
         if viewport == 0 {
             return;
         }
-        let mut index = anchor;
         // Build the layout before reading the offset: a relayout queued earlier in
         // this batch re-anchors `diff_scroll`, and the tick must move from the
         // settled value. Starting from `paint_offset` — what the last frame drew —
         // is what makes a tick continuous with the picture on screen.
         let anchor_rows = self.diff_layout(width).len();
-        let mut offset = self.paint_offset(anchor_rows, viewport) as i64 + delta;
+        let offset = self.paint_offset(anchor_rows, viewport) as i64 + delta;
+        // A wheel flip carries no cursor: 006 §3.2d's contract, and the firewall
+        // that keeps mouse scrolling from inheriting a walked-to address.
+        self.settle_stream_offset(anchor, offset, FlipCursor::Reset);
+    }
+
+    /// Install `offset` — a signed position in the stream domain, anchored on file
+    /// `anchor` — as the pane's scroll state, renormalizing and clamping it into a
+    /// legal `(anchor, offset)` pair first. The shared tail of every stream-domain
+    /// move: the wheel tick above and §3.3h's window-aware reveal both land here,
+    /// differing only in what a flip does to the cursor.
+    ///
+    /// Two steps, in order: **renormalize** the offset across file boundaries
+    /// (`(B, o) ≡ (A, R_A + o)`), then **clamp** by whatever shortfall filling the
+    /// window from there reveals, so the viewport bottom never passes the last row
+    /// the stream offers. All arithmetic is `i64`: an upward move legitimately
+    /// goes negative before renormalization moves the anchor, and a `usize` would
+    /// wrap.
+    fn settle_stream_offset(&mut self, anchor: usize, offset: i64, cursor: FlipCursor) {
+        let width = self.diff_pane_width();
+        let height = self.diff_viewport.get();
+        let viewport = height as usize;
+        let mut index = anchor;
+        let mut offset = offset;
 
         // Renormalize. Each step moves the anchor one file and rebases the offset
         // on that file's row count, so the *rendered* top row never moves — the
@@ -5621,7 +5795,7 @@ impl App {
         let offset = offset.max(0) as usize;
         if index == anchor {
             self.diff_scroll.set(offset);
-        } else if !self.flip_anchor(index, offset) {
+        } else if !self.flip_anchor(index, offset, cursor) {
             // The destination's section vanished between the fill loop above
             // and here — stay on the current anchor rather than half-apply.
             return;
@@ -5633,8 +5807,9 @@ impl App {
     /// section — no recompute, no scroll reset, no placement token (plan 006
     /// §3.2d). `sync_diff`/`sync_review_diff` early-return afterwards because the
     /// diff key (and, for Status, the section) already match and nothing is dirty.
-    /// A wheel flip carries no cursor; the border title follows the selection, so
-    /// the one-row-past-the-top handoff falls out of *when* this is called.
+    /// The border title follows the selection, so the one-row-past-the-top handoff
+    /// falls out of *when* this is called; `cursor` decides what the cursor does
+    /// while it happens.
     ///
     /// Returns `false` — a no-op, nothing touched — if `to` has no prepared
     /// section under the current key/generation; callers ensure first, but
@@ -5642,12 +5817,20 @@ impl App {
     /// "flip" (a queued invalidation drained in between), and installing the
     /// caller's cursor/offset against whichever file is still selected would
     /// silently resolve against the wrong layout.
-    fn flip_anchor(&mut self, to: usize, new_offset: usize) -> bool {
+    fn flip_anchor(&mut self, to: usize, new_offset: usize, cursor: FlipCursor) -> bool {
         let width = self.diff_pane_width();
         let key = self.layout_key(width);
         let generation = self.stream_generation.get();
         let Some((id, section)) = self.prepared_section(to, key, generation) else {
             return false;
+        };
+        // §3.3h's capture rule: read the address BEFORE the selection moves. Every
+        // seam below (`set_cursor_on_anchor` for Status, `select_review_file` for
+        // Review) rewrites the cursor against whichever file is selected at the
+        // time, so a kept address has to be lifted out first and put back after.
+        let carried = match cursor {
+            FlipCursor::Keep => self.pinned_address().cloned(),
+            FlipCursor::Reset => None,
         };
         // Retire the file being left into the cache *before* the selection moves,
         // so scrolling back across the boundary re-reads it instead of recomputing
@@ -5693,6 +5876,16 @@ impl App {
         // redraw, must clamp against the new file's bounds.
         self.set_diff_metrics(self.diff_viewport.get(), section.rows.len());
         self.prune_highlight_cache();
+        if cursor == FlipCursor::Keep {
+            // Put the captured address back verbatim. If it names the arriving
+            // file it is simply converged now (its target came from that file's
+            // rows, which are the layout just installed); if it names one further
+            // down it stays divergent, and the caller's trailing
+            // `ensure_diff_window` re-validates it against the window the flip
+            // produced — including dropping it if the flip left it *above* the
+            // anchor, where nothing renders.
+            self.write_cursor(carried);
+        }
         true
     }
 
@@ -7248,20 +7441,6 @@ fn col_at_display(line: &str, target: usize) -> usize {
         col += 1;
     }
     col
-}
-
-/// The neighbouring selection index in `[0, total)`: the next one going down, the
-/// previous going up. `None` at the boundary (last going down, first going up) or
-/// an empty list — a keyboard cross clamps there rather than wrapping (plan §3.4).
-fn neighbour_index(current: usize, total: usize, down: bool) -> Option<usize> {
-    if total == 0 {
-        return None;
-    }
-    if down {
-        (current + 1 < total).then(|| current + 1)
-    } else {
-        (current > 0).then(|| current - 1)
-    }
 }
 
 /// The `[start, end)` run of `rows` sharing `target`: its first row through the
