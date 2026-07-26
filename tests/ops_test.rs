@@ -1,13 +1,8 @@
 mod common;
 
-use common::{init_repo, write};
+use common::{esc, init_repo, key, write};
 use strix::app::App;
-use strix::crossterm::event::{KeyCode, KeyEvent};
 use strix::git::{Change, Repo};
-
-fn key(c: char) -> KeyEvent {
-    KeyEvent::from(KeyCode::Char(c))
-}
 
 #[test]
 fn stage_then_unstage_via_repo() {
@@ -100,7 +95,7 @@ fn discard_can_be_cancelled() {
     let mut app = App::new(path.to_path_buf()).unwrap();
     app.on_key(key('x'));
     assert!(app.modal.is_some());
-    app.on_key(KeyEvent::from(KeyCode::Esc)); // cancel
+    app.on_key(esc()); // cancel
     assert!(app.modal.is_none());
     assert!(!app.status.is_clean(), "changes remain after cancel");
 }

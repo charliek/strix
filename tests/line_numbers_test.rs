@@ -7,26 +7,17 @@ mod common;
 
 use std::collections::HashMap;
 
-use common::{init_repo, init_repo_with_diverged_branches, init_repo_with_history, write};
+use common::{ctrl, init_repo, init_repo_with_history, key, review_app, write};
 use strix::app::{App, DiffMode};
 use strix::config::Config;
-use strix::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use strix::crossterm::event::{KeyCode, KeyEvent};
 use strix::keys::{Action, Keymap};
-use tempfile::TempDir;
 
 const W: u16 = 120;
 const H: u16 = 30;
 
-fn key(c: char) -> KeyEvent {
-    KeyEvent::from(KeyCode::Char(c))
-}
-
-fn ctrl(c: char) -> KeyEvent {
-    KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
-}
-
 fn dump(app: &App) -> String {
-    strix::terminal::dump_frame(app, W, H).unwrap()
+    common::dump(app, W, H)
 }
 
 /// The column (char index within its row) of the first line containing
@@ -232,12 +223,6 @@ fn works_in_history_view() {
     app.on_key(key('n'));
     let col_off = col_of(&dump(&app), "second line");
     assert_eq!(col_on - col_off, 10, "history view respects the toggle");
-}
-
-fn review_app(range: &str) -> (TempDir, App) {
-    let repo = init_repo_with_diverged_branches();
-    let app = App::for_review(repo.path().to_path_buf(), &Config::default(), range).unwrap();
-    (repo, app)
 }
 
 #[test]

@@ -9,9 +9,8 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::process::Command;
 
-use common::{git, init_repo, init_repo_with_diverged_branches, press, write};
+use common::{git, head_oid, init_repo_with_diverged_branches, press, three_modified_files, write};
 use strix::app::App;
 use strix::comments::{Branch, Comment, Scope, Side, Source, Store};
 use strix::config::Config;
@@ -52,30 +51,6 @@ fn window(app: &mut App) -> usize {
     let area = app.diff_area();
     app.ensure_diff_window(area.width, area.height);
     app.diff_window(area.width, area.height).segments.len()
-}
-
-/// Three committed files, each modified in the working tree.
-fn three_modified_files() -> TempDir {
-    let repo = init_repo();
-    for name in ["a.txt", "b.txt", "c.txt"] {
-        write(repo.path(), name, "one\ntwo\nthree\n");
-    }
-    git(repo.path(), &["add", "."]);
-    git(repo.path(), &["commit", "-q", "-m", "files"]);
-    for name in ["a.txt", "b.txt", "c.txt"] {
-        write(repo.path(), name, "one\nTWO\nthree\n");
-    }
-    repo
-}
-
-fn head_oid(repo: &Path) -> String {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .expect("git rev-parse");
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 /// Seed `comments.json` directly — the schema the TUI and the `strix comment`

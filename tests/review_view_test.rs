@@ -6,7 +6,10 @@ mod common;
 
 use std::process::Command;
 
-use common::{git, init_repo, init_repo_with_diverged_branches, write};
+use common::{
+    commit_file, enter, esc, git, init_repo, init_repo_with_diverged_branches, key, review_app,
+    tab, write,
+};
 use strix::app::{App, Focus, ViewMode};
 use strix::config::Config;
 use strix::crossterm::event::{
@@ -18,24 +21,8 @@ use tempfile::TempDir;
 const W: u16 = 100;
 const H: u16 = 24;
 
-fn key(c: char) -> KeyEvent {
-    KeyEvent::from(KeyCode::Char(c))
-}
-
-fn esc() -> KeyEvent {
-    KeyEvent::from(KeyCode::Esc)
-}
-
-fn tab() -> KeyEvent {
-    KeyEvent::from(KeyCode::Tab)
-}
-
 fn space() -> KeyEvent {
     KeyEvent::from(KeyCode::Char(' '))
-}
-
-fn enter() -> KeyEvent {
-    KeyEvent::from(KeyCode::Enter)
 }
 
 fn mouse(kind: MouseEventKind, x: u16, y: u16) -> MouseEvent {
@@ -48,15 +35,7 @@ fn mouse(kind: MouseEventKind, x: u16, y: u16) -> MouseEvent {
 }
 
 fn dump(app: &App) -> String {
-    strix::terminal::dump_frame(app, W, H).unwrap()
-}
-
-/// A review session over `main…HEAD` on the diverged fixture (HEAD = feature).
-/// Hold the `TempDir` for the `App`'s lifetime (dropping it deletes the repo).
-fn review_app(range: &str) -> (TempDir, App) {
-    let repo = init_repo_with_diverged_branches();
-    let app = App::for_review(repo.path().to_path_buf(), &Config::default(), range).unwrap();
-    (repo, app)
+    common::dump(app, W, H)
 }
 
 // --- Rendering ---
@@ -331,13 +310,6 @@ fn wheel_over_list_moves_selection_over_diff_scrolls() {
 }
 
 // --- View-aware reload + churn guard ---
-
-/// Commit `contents` for `rel` on the current branch (feature/HEAD).
-fn commit_file(dir: &std::path::Path, rel: &str, contents: &str, msg: &str) {
-    write(dir, rel, contents);
-    git(dir, &["add", "."]);
-    git(dir, &["commit", "-qm", msg]);
-}
 
 #[test]
 fn reload_picks_up_a_new_commit_and_preserves_selection_by_path() {

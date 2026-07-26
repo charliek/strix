@@ -15,7 +15,7 @@ use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use common::{cell_symbol, git, init_repo, render_buffer, write};
+use common::{cell_symbol, cursor_target, git, init_repo, key, render_buffer, review, write};
 use strix::app::{App, RowContent, RowTarget};
 use strix::config::Config;
 use strix::crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
@@ -23,16 +23,8 @@ use strix::crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseE
 const W: u16 = 100;
 const H: u16 = 30;
 
-fn key(c: char) -> KeyEvent {
-    KeyEvent::from(KeyCode::Char(c))
-}
-
 fn dump(app: &App) -> String {
-    strix::terminal::dump_frame(app, W, H).unwrap()
-}
-
-fn review(repo: &Path, range: &str) -> App {
-    App::for_review(repo.to_path_buf(), &Config::default(), range).unwrap()
+    common::dump(app, W, H)
 }
 
 /// A repo whose `feature` branch adds a file with a mix of short lines and one
@@ -90,14 +82,6 @@ fn layout_targets(app: &App) -> Vec<(RowTarget, usize, bool)> {
             )
         })
         .collect()
-}
-
-/// The logical target the diff cursor addresses, read back through the layout
-/// (`review_cursor` gives the target's first physical row).
-fn cursor_target(app: &App) -> Option<RowTarget> {
-    let w = app.diff_area().width;
-    let idx = app.review_cursor();
-    app.diff_layout(w).get(idx).map(|r| r.target)
 }
 
 /// The `(code_index, subrows)` runs of consecutive `Line` rows sharing a target.

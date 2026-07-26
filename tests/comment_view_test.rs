@@ -8,29 +8,22 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use common::{git, init_repo, init_repo_with_diverged_branches, write};
+use common::{
+    commit_file, git, init_repo, init_repo_with_diverged_branches, key, modified_line_repo,
+    pure_rename_repo, row_of, seed_store, strix_dir, write,
+};
 use strix::app::App;
 use strix::comments::{Branch, Comment, Scope, Side, Source, Store};
 use strix::config::Config;
-use strix::crossterm::event::{KeyCode, KeyEvent};
 use tempfile::TempDir;
 
 const W: u16 = 100;
 const H: u16 = 24;
 
-fn key(c: char) -> KeyEvent {
-    KeyEvent::from(KeyCode::Char(c))
-}
-
 fn dump(app: &App) -> String {
-    strix::terminal::dump_frame(app, W, H).unwrap()
-}
-
-/// The store dir for a normal (non-worktree) repo checkout.
-fn strix_dir(repo: &Path) -> PathBuf {
-    repo.join(".git").join("strix")
+    common::dump(app, W, H)
 }
 
 /// A comment builder with sensible defaults; override fields at the call site.
@@ -65,28 +58,6 @@ fn orphaned(mut c: Comment) -> Comment {
     c
 }
 
-/// Write a store under `branch` with `range` and `comments`. Pretty JSON with no
-/// trailing newline, so a *later* strix write (which appends `\n`) is byte-detectable.
-fn seed_store(repo: &Path, branch: &str, range: Option<&str>, comments: Vec<Comment>) {
-    let mut branches = BTreeMap::new();
-    branches.insert(
-        branch.to_string(),
-        Branch {
-            active_range: range.map(str::to_string),
-            comments,
-        },
-    );
-    let store = Store {
-        version: 2,
-        next_id: 1000,
-        branches,
-    };
-    let dir = strix_dir(repo);
-    std::fs::create_dir_all(&dir).unwrap();
-    let json = serde_json::to_string_pretty(&store).unwrap();
-    std::fs::write(dir.join("comments.json"), json).unwrap();
-}
-
 /// Rewrite the store file directly with an arbitrary comment set (simulates an
 /// agent `strix comment` write while a TUI session is open).
 fn rewrite_store(repo: &Path, branch: &str, range: Option<&str>, comments: Vec<Comment>) {
@@ -99,22 +70,7 @@ fn store_bytes(repo: &Path) -> Vec<u8> {
 
 /// Move the review selection until the given file's diff is showing.
 fn select_file(app: &mut App, path: &str) {
-    let _ = dump(app);
-    for _ in 0..20 {
-        if app.active_diff_path().as_deref() == Some(path) {
-            return;
-        }
-        app.on_key(key('j'));
-    }
-    panic!("{path} never became the selected file");
-}
-
-/// The 0-based row of the first frame line containing `needle`.
-fn row_of(frame: &str, needle: &str) -> usize {
-    frame
-        .lines()
-        .position(|l| l.contains(needle))
-        .unwrap_or_else(|| panic!("frame missing {needle:?}:\n{frame}"))
+    common::select_file(app, path, W, H, 20)
 }
 
 // --- Anchored rows (unified + SBS) ---
@@ -174,21 +130,6 @@ fn agent_comment_labels_the_source() {
     let frame = dump(&app);
     assert!(frame.contains("● agent — feature.txt R1"), "{frame}");
     assert!(frame.contains("auto note"), "{frame}");
-}
-
-/// A modified line yields a deletion+addition Pair in side-by-side; comments on
-/// the old side must emit before the new side, each ordered by id.
-fn modified_line_repo() -> TempDir {
-    let dir = init_repo();
-    let p = dir.path();
-    write(p, "file.txt", "line1\nOLD\nline3\n");
-    git(p, &["add", "."]);
-    git(p, &["commit", "-qm", "base"]);
-    git(p, &["checkout", "-qb", "feature"]);
-    write(p, "file.txt", "line1\nNEW\nline3\n");
-    git(p, &["add", "."]);
-    git(p, &["commit", "-qm", "change"]);
-    dir
 }
 
 #[test]
@@ -361,20 +302,6 @@ fn binary_file_orphan_shows_in_its_block_not_the_footer() {
     );
 }
 
-/// A repo whose `feature` branch renames a file with no content change, so the
-/// file is listed in the range but its text diff is empty (no lines to anchor).
-fn pure_rename_repo() -> TempDir {
-    let dir = init_repo();
-    let p = dir.path();
-    write(p, "orig.txt", "unchanged\ncontent\n");
-    git(p, &["add", "."]);
-    git(p, &["commit", "-qm", "add orig"]);
-    git(p, &["checkout", "-qb", "feature"]);
-    git(p, &["mv", "orig.txt", "renamed.txt"]);
-    git(p, &["commit", "-qm", "pure rename"]);
-    dir
-}
-
 #[test]
 fn empty_diff_orphan_shows_in_its_block_not_the_footer() {
     let repo = pure_rename_repo();
@@ -455,13 +382,6 @@ fn scroll_to_bottom_reaches_a_comment_below_the_last_line() {
 }
 
 // --- OID-change reload path ---
-
-/// Commit `contents` for `rel` on the current branch and return nothing.
-fn commit_file(dir: &Path, rel: &str, contents: &str, msg: &str) {
-    write(dir, rel, contents);
-    git(dir, &["add", "."]);
-    git(dir, &["commit", "-qm", msg]);
-}
 
 #[test]
 fn a_commit_that_moves_the_anchor_line_follows_it() {

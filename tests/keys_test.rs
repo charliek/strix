@@ -1,15 +1,9 @@
+mod common;
+
 use std::collections::HashMap;
 
-use strix::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use common::{ctrl, key};
 use strix::keys::{Action, Keymap};
-
-fn key(c: char) -> KeyEvent {
-    KeyEvent::from(KeyCode::Char(c))
-}
-
-fn ctrl(c: char) -> KeyEvent {
-    KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
-}
 
 #[test]
 fn default_bindings() {

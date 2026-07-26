@@ -8,11 +8,9 @@
 
 mod common;
 
-use common::{cell_bg, cell_symbol, git, init_repo, press, render_buffer, write};
+use common::{cell_bg, cell_symbol, git, init_repo, mouse, press, render_buffer, write};
 use strix::app::{App, DiffMode};
-use strix::crossterm::event::{
-    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
+use strix::crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEventKind};
 use tempfile::TempDir;
 
 fn enter(app: &mut App) {
@@ -22,17 +20,8 @@ fn enter(app: &mut App) {
 const W: u16 = 100;
 const H: u16 = 30;
 
-fn mouse(col: u16, row: u16, kind: MouseEventKind) -> MouseEvent {
-    MouseEvent {
-        kind,
-        column: col,
-        row,
-        modifiers: KeyModifiers::NONE,
-    }
-}
-
 fn dump(app: &App) -> String {
-    strix::terminal::dump_frame(app, W, H).unwrap()
+    common::dump(app, W, H)
 }
 
 /// A repo with `code.txt` committed as `before`, edited (uncommitted) to `after`

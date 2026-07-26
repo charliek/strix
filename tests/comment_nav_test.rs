@@ -6,41 +6,22 @@
 
 mod common;
 
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-
-use common::{git, init_repo, init_repo_with_diverged_branches, write};
+use common::{
+    ctrl, git, init_repo, init_repo_with_diverged_branches, key, mouse, review, row_of, seed_store,
+    store_text, strix_dir, tall_repo, write,
+};
 use ratatui::style::Color;
 use strix::app::{App, FlashKind};
-use strix::comments::{Branch, Comment, Scope, Side, Source, Store};
-use strix::config::Config;
-use strix::crossterm::event::{
-    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
-use strix::terminal::{dump_frame, render_to_buffer};
+use strix::comments::{Comment, Scope, Side, Source};
+use strix::crossterm::event::{MouseButton, MouseEventKind};
+use strix::terminal::render_to_buffer;
 use tempfile::TempDir;
 
 const W: u16 = 100;
 const H: u16 = 24;
 
-fn key(c: char) -> KeyEvent {
-    KeyEvent::from(KeyCode::Char(c))
-}
-
-fn ctrl(c: char) -> KeyEvent {
-    KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
-}
-
 fn dump(app: &App) -> String {
-    dump_frame(app, W, H).unwrap()
-}
-
-fn review(repo: &Path, range: &str) -> App {
-    App::for_review(repo.to_path_buf(), &Config::default(), range).unwrap()
-}
-
-fn strix_dir(repo: &Path) -> PathBuf {
-    repo.join(".git").join("strix")
+    common::dump(app, W, H)
 }
 
 fn comment(id: u64, file: &str, side: Side, line: usize, text: &str, ctx: &str) -> Comment {
@@ -64,62 +45,9 @@ fn comment(id: u64, file: &str, side: Side, line: usize, text: &str, ctx: &str) 
     }
 }
 
-fn seed_store(repo: &Path, branch: &str, range: Option<&str>, comments: Vec<Comment>) {
-    let mut branches = BTreeMap::new();
-    branches.insert(
-        branch.to_string(),
-        Branch {
-            active_range: range.map(str::to_string),
-            comments,
-        },
-    );
-    let store = Store {
-        version: 2,
-        next_id: 1000,
-        branches,
-    };
-    let dir = strix_dir(repo);
-    std::fs::create_dir_all(&dir).unwrap();
-    let json = serde_json::to_string_pretty(&store).unwrap();
-    std::fs::write(dir.join("comments.json"), json).unwrap();
-}
-
-fn store_text(repo: &Path) -> String {
-    std::fs::read_to_string(strix_dir(repo).join("comments.json")).unwrap()
-}
-
 /// Move the review selection (in the file list) until `path`'s diff is showing.
 fn select_file(app: &mut App, path: &str) {
-    let _ = dump(app);
-    for _ in 0..20 {
-        if app.active_diff_path().as_deref() == Some(path) {
-            return;
-        }
-        app.on_key(key('j'));
-    }
-    panic!("{path} never became the selected file");
-}
-
-fn row_of(frame: &str, needle: &str) -> usize {
-    frame
-        .lines()
-        .position(|l| l.contains(needle))
-        .unwrap_or_else(|| panic!("frame missing {needle:?}:\n{frame}"))
-}
-
-/// A repo whose `feature` branch adds a 40-line file (single file in range).
-fn tall_repo() -> TempDir {
-    let dir = init_repo();
-    let p = dir.path();
-    git(p, &["checkout", "-qb", "feature"]);
-    let mut content = String::new();
-    for i in 1..=40 {
-        content.push_str(&format!("row {i}\n"));
-    }
-    write(p, "big.txt", &content);
-    git(p, &["add", "."]);
-    git(p, &["commit", "-qm", "add big"]);
-    dir
+    common::select_file(app, path, W, H, 20)
 }
 
 // --- Cursor movement ---
@@ -526,15 +454,6 @@ fn a_failed_delete_keeps_the_comment_and_flashes() {
 }
 
 // --- Mouse ---
-
-fn mouse(col: u16, row: u16, kind: MouseEventKind) -> MouseEvent {
-    MouseEvent {
-        kind,
-        column: col,
-        row,
-        modifiers: KeyModifiers::NONE,
-    }
-}
 
 #[test]
 fn clicking_a_diff_row_focuses_the_pane_and_moves_the_cursor() {

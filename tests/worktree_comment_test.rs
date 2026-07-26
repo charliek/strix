@@ -10,47 +10,26 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
-use common::{git, init_empty_repo, init_repo, init_repo_with_diverged_branches, write};
+use common::{
+    enter, git, head_oid, init_empty_repo, init_repo, init_repo_with_diverged_branches, key,
+    row_of, strix_dir, write,
+};
 use strix::app::{App, FlashKind};
 use strix::comments::{self, Branch, Comment, Scope, Side, Source, Store};
 use strix::config::Config;
-use strix::crossterm::event::{KeyCode, KeyEvent};
 
 const W: u16 = 110;
 const H: u16 = 30;
 
-fn key(c: char) -> KeyEvent {
-    KeyEvent::from(KeyCode::Char(c))
-}
-
-fn enter() -> KeyEvent {
-    KeyEvent::from(KeyCode::Enter)
-}
-
 fn dump(app: &App) -> String {
-    strix::terminal::dump_frame(app, W, H).unwrap()
-}
-
-fn strix_dir(repo: &Path) -> PathBuf {
-    repo.join(".git").join("strix")
+    common::dump(app, W, H)
 }
 
 fn load_store(repo: &Path) -> Store {
     comments::load(&strix_dir(repo)).unwrap()
-}
-
-/// The current HEAD commit oid (the baseline a worktree comment stamps).
-fn head_oid(repo: &Path) -> String {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .expect("git rev-parse");
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 /// A worktree comment with a baseline HEAD (as C3 records it), anchored on the
@@ -125,24 +104,9 @@ fn seed(repo: &Path, branch: &str, range: Option<&str>, comments: Vec<Comment>) 
     .unwrap();
 }
 
-/// The 0-based frame row of the first line containing `needle`.
-fn row_of(frame: &str, needle: &str) -> usize {
-    frame
-        .lines()
-        .position(|l| l.contains(needle))
-        .unwrap_or_else(|| panic!("frame missing {needle:?}:\n{frame}"))
-}
-
 /// Move the status file selection until `path` is the selected file.
 fn select_status_file(app: &mut App, path: &str) {
-    let _ = dump(app);
-    for _ in 0..40 {
-        if app.active_diff_path().as_deref() == Some(path) {
-            return;
-        }
-        app.on_key(key('j'));
-    }
-    panic!("{path} never became the selected status file");
+    common::select_status_file(app, path, W, H, 40)
 }
 
 /// The worktree comments the status view currently holds for `branch`.

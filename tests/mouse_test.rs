@@ -1,30 +1,15 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::path::Path;
+use std::time::Instant;
 
-use common::{git, init_repo, write};
+use common::{click, git, init_repo, key, mouse, ms, row_of, strix_dir, write};
 use strix::app::{App, Focus};
 use strix::comments::{Branch, Comment, Scope, Side, Source, Store};
 use strix::config::Config;
-use strix::crossterm::event::{
-    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
+use strix::crossterm::event::{MouseButton, MouseEventKind};
 use strix::terminal::dump_frame;
-
-fn mouse(col: u16, row: u16, kind: MouseEventKind) -> MouseEvent {
-    MouseEvent {
-        kind,
-        column: col,
-        row,
-        modifiers: KeyModifiers::NONE,
-    }
-}
-
-fn click(col: u16, row: u16) -> MouseEvent {
-    mouse(col, row, MouseEventKind::Down(MouseButton::Left))
-}
 
 /// A repo with one staged file (selection 0) and one untracked file (1).
 fn app_with_two_files() -> (tempfile::TempDir, App) {
@@ -107,20 +92,8 @@ fn wheel_over_staging_moves_selection() {
 const W: u16 = 120;
 const H: u16 = 30;
 
-fn ms(n: u64) -> Duration {
-    Duration::from_millis(n)
-}
-
-fn key(c: char) -> KeyEvent {
-    KeyEvent::from(KeyCode::Char(c))
-}
-
 fn dump(app: &App) -> String {
-    dump_frame(app, W, H).unwrap()
-}
-
-fn strix_dir(repo: &Path) -> PathBuf {
-    repo.join(".git").join("strix")
+    common::dump(app, W, H)
 }
 
 /// The current HEAD oid, the baseline a worktree comment stamps (so the sweep
@@ -176,24 +149,9 @@ fn seed(repo: &Path, branch: &str, comments: Vec<Comment>) {
     .unwrap();
 }
 
-/// The 0-based frame row (== screen y) of the first line containing `needle`.
-fn row_of(frame: &str, needle: &str) -> usize {
-    frame
-        .lines()
-        .position(|l| l.contains(needle))
-        .unwrap_or_else(|| panic!("frame missing {needle:?}:\n{frame}"))
-}
-
 /// Move the status file selection until `path` is the selected file.
 fn select_status_file(app: &mut App, path: &str) {
-    let _ = dump(app);
-    for _ in 0..40 {
-        if app.active_diff_path().as_deref() == Some(path) {
-            return;
-        }
-        app.on_key(key('j'));
-    }
-    panic!("{path} never became the selected status file");
+    common::select_status_file(app, path, W, H, 40)
 }
 
 /// A status app on `file`'s net diff (an untracked file with `contents`), its

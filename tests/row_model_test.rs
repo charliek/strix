@@ -11,68 +11,26 @@
 
 mod common;
 
-use std::path::Path;
-
-use common::{git, init_repo, init_repo_with_diverged_branches, write};
+use common::{
+    git, init_repo, init_repo_with_diverged_branches, key, mouse, pure_rename_repo, review,
+    tall_repo, write,
+};
 use strix::app::{App, ViewMode};
-use strix::config::Config;
-use strix::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use strix::crossterm::event::MouseEventKind;
 use tempfile::TempDir;
 
 const W: u16 = 100;
 const H: u16 = 24;
 
-fn key(c: char) -> KeyEvent {
-    KeyEvent::from(KeyCode::Char(c))
-}
-
-fn dump_at(app: &App, w: u16, h: u16) -> String {
-    strix::terminal::dump_frame(app, w, h).unwrap()
-}
+use common::dump as dump_at;
 
 fn dump(app: &App) -> String {
     dump_at(app, W, H)
 }
 
-fn review(repo: &Path, range: &str) -> App {
-    App::for_review(repo.to_path_buf(), &Config::default(), range).unwrap()
-}
-
-fn mouse(col: u16, row: u16, kind: MouseEventKind) -> MouseEvent {
-    MouseEvent {
-        kind,
-        column: col,
-        row,
-        modifiers: KeyModifiers::NONE,
-    }
-}
-
 /// Move the review selection until `path`'s diff is showing.
 fn select_file(app: &mut App, path: &str) {
-    let _ = dump(app);
-    for _ in 0..20 {
-        if app.active_diff_path().as_deref() == Some(path) {
-            return;
-        }
-        app.on_key(key('j'));
-    }
-    panic!("{path} never became the selected file");
-}
-
-/// A repo whose `feature` branch adds a 40-line file (a single file in range,
-/// so the diff has plenty of selectable code rows).
-fn tall_repo() -> TempDir {
-    let dir = init_repo();
-    let p = dir.path();
-    git(p, &["checkout", "-qb", "feature"]);
-    let mut content = String::new();
-    for i in 1..=40 {
-        content.push_str(&format!("row {i}\n"));
-    }
-    write(p, "big.txt", &content);
-    git(p, &["add", "."]);
-    git(p, &["commit", "-qm", "add big"]);
-    dir
+    common::select_file(app, path, W, H, 20)
 }
 
 /// A repo whose `feature` branch adds a binary file (NUL bytes), so its range
@@ -84,20 +42,6 @@ fn binary_repo() -> TempDir {
     write(p, "blob.bin", "a\0b\0c\n");
     git(p, &["add", "."]);
     git(p, &["commit", "-qm", "add binary"]);
-    dir
-}
-
-/// A repo whose `feature` branch renames a file with no content change, so the
-/// file is listed in the range but its text diff is empty (no code rows).
-fn pure_rename_repo() -> TempDir {
-    let dir = init_repo();
-    let p = dir.path();
-    write(p, "orig.txt", "unchanged\ncontent\n");
-    git(p, &["add", "."]);
-    git(p, &["commit", "-qm", "add orig"]);
-    git(p, &["checkout", "-qb", "feature"]);
-    git(p, &["mv", "orig.txt", "renamed.txt"]);
-    git(p, &["commit", "-qm", "pure rename"]);
     dir
 }
 

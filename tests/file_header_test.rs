@@ -8,28 +8,17 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{cell_bg, cell_fg, git, init_repo, init_repo_with_diverged_branches, press, write};
+use common::{
+    cell_bg, cell_fg, click, git, init_repo, init_repo_with_diverged_branches, mouse, press, write,
+};
 use strix::app::{App, FlashKind};
 use strix::config::Config;
-use strix::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use strix::crossterm::event::MouseEventKind;
 use strix::terminal::dump_frame;
 use tempfile::TempDir;
 
 const W: u16 = 120;
 const H: u16 = 24;
-
-fn mouse(col: u16, row: u16, kind: MouseEventKind) -> MouseEvent {
-    MouseEvent {
-        kind,
-        column: col,
-        row,
-        modifiers: KeyModifiers::NONE,
-    }
-}
-
-fn click(col: u16, row: u16) -> MouseEvent {
-    mouse(col, row, MouseEventKind::Down(MouseButton::Left))
-}
 
 fn config(cross_file: bool) -> Config {
     Config {

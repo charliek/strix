@@ -12,17 +12,13 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{git, init_repo, press, write};
+use common::{dump, git, init_repo, press, write};
 use strix::app::App;
 use strix::crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
 use tempfile::TempDir;
 
 const W: u16 = 100;
 const H: u16 = 30;
-
-fn dump(app: &App, width: u16, height: u16) -> String {
-    strix::terminal::dump_frame(app, width, height).unwrap()
-}
 
 /// A repo with `big.txt` committed at ~2,200 lines, then edited (uncommitted)
 /// so roughly half the lines change: every 100th changed line is stretched to

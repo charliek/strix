@@ -8,35 +8,22 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use common::{git, init_repo, init_repo_with_diverged_branches, write};
-use strix::app::{App, DiffMode, FlashKind, ViewMode};
-use strix::comments::{Branch, Comment, Scope, Side, Source, Store};
-use strix::config::Config;
-use strix::crossterm::event::{
-    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+use common::{
+    ctrl, enter, git, init_repo, init_repo_with_diverged_branches, key, mouse, review, row_of,
+    seed_store, store_text, strix_dir, tall_repo, write,
 };
-use strix::terminal::dump_frame;
+use strix::app::{App, DiffMode, FlashKind, ViewMode};
+use strix::comments::{Comment, Scope, Side, Source, Store};
+use strix::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use tempfile::TempDir;
 
 const W: u16 = 100;
 const H: u16 = 24;
 
-fn key(c: char) -> KeyEvent {
-    KeyEvent::from(KeyCode::Char(c))
-}
-
 fn code(code: KeyCode) -> KeyEvent {
     KeyEvent::from(code)
-}
-
-fn ctrl(c: char) -> KeyEvent {
-    KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
-}
-
-fn enter() -> KeyEvent {
-    KeyEvent::from(KeyCode::Enter)
 }
 
 fn shift_enter() -> KeyEvent {
@@ -52,20 +39,10 @@ fn ctrl_j() -> KeyEvent {
 }
 
 fn dump(app: &App) -> String {
-    dump_frame(app, W, H).unwrap()
+    common::dump(app, W, H)
 }
 
-fn dump_hw(app: &App, w: u16, h: u16) -> String {
-    dump_frame(app, w, h).unwrap()
-}
-
-fn review(repo: &Path, range: &str) -> App {
-    App::for_review(repo.to_path_buf(), &Config::default(), range).unwrap()
-}
-
-fn strix_dir(repo: &Path) -> PathBuf {
-    repo.join(".git").join("strix")
-}
+use common::dump as dump_hw;
 
 /// Type a string into the app one key at a time (each char a plain key event).
 fn typ(app: &mut App, s: &str) {
@@ -81,30 +58,6 @@ fn comments_of(repo: &Path, branch: &str) -> Vec<Comment> {
         .get(branch)
         .map(|b| b.comments.clone())
         .unwrap_or_default()
-}
-
-fn store_text(repo: &Path) -> String {
-    std::fs::read_to_string(strix_dir(repo).join("comments.json")).unwrap()
-}
-
-fn seed_store(repo: &Path, branch: &str, range: Option<&str>, comments: Vec<Comment>) {
-    let mut branches = BTreeMap::new();
-    branches.insert(
-        branch.to_string(),
-        Branch {
-            active_range: range.map(str::to_string),
-            comments,
-        },
-    );
-    let store = Store {
-        version: 2,
-        next_id: 1000,
-        branches,
-    };
-    let dir = strix_dir(repo);
-    std::fs::create_dir_all(&dir).unwrap();
-    let json = serde_json::to_string_pretty(&store).unwrap();
-    std::fs::write(dir.join("comments.json"), json).unwrap();
 }
 
 fn human(id: u64, file: &str, side: Side, line: usize, text: &str, ctx: &str) -> Comment {
@@ -128,14 +81,6 @@ fn human(id: u64, file: &str, side: Side, line: usize, text: &str, ctx: &str) ->
     }
 }
 
-/// The 0-based frame row of the first line containing `needle`.
-fn row_of(frame: &str, needle: &str) -> usize {
-    frame
-        .lines()
-        .position(|l| l.contains(needle))
-        .unwrap_or_else(|| panic!("frame missing {needle:?}:\n{frame}"))
-}
-
 /// A repo whose `feature` branch edits the middle line of a 5-line file, so the
 /// diff carries context lines above and below a deletion+addition pair.
 fn context_repo() -> TempDir {
@@ -148,21 +93,6 @@ fn context_repo() -> TempDir {
     write(p, "code.txt", "one\ntwo\nTHREE\nfour\nfive\n");
     git(p, &["add", "."]);
     git(p, &["commit", "-qm", "edit line 3"]);
-    dir
-}
-
-/// A repo whose `feature` branch adds a 40-line file (single file in range).
-fn tall_repo() -> TempDir {
-    let dir = init_repo();
-    let p = dir.path();
-    git(p, &["checkout", "-qb", "feature"]);
-    let mut content = String::new();
-    for i in 1..=40 {
-        content.push_str(&format!("row {i}\n"));
-    }
-    write(p, "big.txt", &content);
-    git(p, &["add", "."]);
-    git(p, &["commit", "-qm", "add big"]);
     dir
 }
 
@@ -184,15 +114,6 @@ fn cursor_to(app: &mut App, n: usize) {
     app.on_key(key('g'));
     for _ in 0..n {
         app.on_key(key('j'));
-    }
-}
-
-fn mouse(col: u16, row: u16, kind: MouseEventKind) -> MouseEvent {
-    MouseEvent {
-        kind,
-        column: col,
-        row,
-        modifiers: KeyModifiers::NONE,
     }
 }
 
