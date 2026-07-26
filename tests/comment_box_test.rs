@@ -8,36 +8,23 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use common::{
-    cell_symbol, git, init_repo, init_repo_with_diverged_branches, render_buffer, row_has_bg,
-    row_has_fg, write,
+    cell_symbol, git, init_repo, init_repo_with_diverged_branches, key, modified_line_repo,
+    render_buffer, review, row_has_bg, row_has_fg, row_of, strix_dir, tall_repo, write,
 };
 use strix::app::App;
 use strix::comments::{Branch, Comment, Scope, Side, Source, Store};
-use strix::config::Config;
-use strix::crossterm::event::{KeyCode, KeyEvent};
-use tempfile::TempDir;
 
 const W: u16 = 100;
 const H: u16 = 24;
 
-fn key(c: char) -> KeyEvent {
-    KeyEvent::from(KeyCode::Char(c))
-}
-
 fn dump(app: &App) -> String {
-    strix::terminal::dump_frame(app, W, H).unwrap()
+    common::dump(app, W, H)
 }
 
-fn dump_hw(app: &App, w: u16, h: u16) -> String {
-    strix::terminal::dump_frame(app, w, h).unwrap()
-}
-
-fn strix_dir(repo: &Path) -> PathBuf {
-    repo.join(".git").join("strix")
-}
+use common::dump as dump_hw;
 
 /// A comment anchored to `line` on `side`, with `ctx` the anchored line's text
 /// (it must match, or the session-open re-anchor pass orphans the note).
@@ -97,56 +84,8 @@ fn seed(repo: &Path, branch: &str, comments: Vec<Comment>) {
     .unwrap();
 }
 
-fn review(repo: &Path, range: &str) -> App {
-    App::for_review(repo.to_path_buf(), &Config::default(), range).unwrap()
-}
-
 fn select_file(app: &mut App, path: &str) {
-    let _ = dump(app);
-    for _ in 0..30 {
-        if app.active_diff_path().as_deref() == Some(path) {
-            return;
-        }
-        app.on_key(key('j'));
-    }
-    panic!("{path} never became the selected file");
-}
-
-fn row_of(frame: &str, needle: &str) -> usize {
-    frame
-        .lines()
-        .position(|l| l.contains(needle))
-        .unwrap_or_else(|| panic!("frame missing {needle:?}:\n{frame}"))
-}
-
-/// A repo whose `feature` branch adds a 40-line file (a single file in range).
-fn tall_repo() -> TempDir {
-    let dir = init_repo();
-    let p = dir.path();
-    git(p, &["checkout", "-qb", "feature"]);
-    let mut content = String::new();
-    for i in 1..=40 {
-        content.push_str(&format!("row {i}\n"));
-    }
-    write(p, "big.txt", &content);
-    git(p, &["add", "."]);
-    git(p, &["commit", "-qm", "add big"]);
-    dir
-}
-
-/// A repo whose `feature` branch replaces `file.txt`'s middle line (OLD → NEW),
-/// so the diff is one deletion (old side) paired with one addition (new side).
-fn modified_line_repo() -> TempDir {
-    let dir = init_repo();
-    let p = dir.path();
-    write(p, "file.txt", "line1\nOLD\nline3\n");
-    git(p, &["add", "."]);
-    git(p, &["commit", "-qm", "base"]);
-    git(p, &["checkout", "-qb", "feature"]);
-    write(p, "file.txt", "line1\nNEW\nline3\n");
-    git(p, &["add", "."]);
-    git(p, &["commit", "-qm", "change"]);
-    dir
+    common::select_file(app, path, W, H, 30)
 }
 
 // --- Unified box shape + border colour ---

@@ -10,7 +10,9 @@
 
 mod common;
 
-use common::{cell_bg, cell_symbol, git, init_repo, press, render_buffer, row_has_bg, write};
+use common::{
+    cell_bg, cell_symbol, cursor_target, git, init_repo, press, render_buffer, row_has_bg, write,
+};
 use strix::app::{App, RowContent, RowTarget};
 use strix::crossterm::event::{KeyCode, KeyEvent};
 use tempfile::TempDir;
@@ -533,11 +535,4 @@ fn a_zero_content_width_cell_is_one_subrow_not_one_per_char() {
         !line.contains("abcd") && !line.contains('a'),
         "a 0-width cell draws no content: {line:?}"
     );
-}
-
-/// The logical target the diff cursor addresses, read back through the layout.
-fn cursor_target(app: &App) -> Option<RowTarget> {
-    let w = app.diff_area().width;
-    let idx = app.review_cursor();
-    app.diff_layout(w).get(idx).map(|r| r.target)
 }

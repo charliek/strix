@@ -8,20 +8,16 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use common::{
-    git, init_repo, init_repo_with_diverged_branches, init_repo_with_history, press, render_buffer,
-    write,
+    click, config, git, init_repo, init_repo_with_diverged_branches, init_repo_with_history, mouse,
+    ms, pane_title, prepare_window, render_buffer, rendered_app, select, selected_path,
+    short_status_repo, window_of, write,
 };
-use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
-use strix::app::{App, BoxPart, DiffWindow, Focus, HistoryFocus, RowContent, ViewMode};
+use strix::app::{App, BoxPart, Focus, HistoryFocus, RowContent, ViewMode};
 use strix::comments::{Branch, Comment, Scope, Side, Source, Store};
-use strix::config::Config;
-use strix::crossterm::event::{
-    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
+use strix::crossterm::event::{KeyCode, KeyEvent, MouseEventKind};
 use strix::terminal::dump_frame;
 use tempfile::TempDir;
 
@@ -29,24 +25,6 @@ const W: u16 = 120;
 const H: u16 = 24;
 
 // --- construction ------------------------------------------------------
-
-fn config(cross_file: bool, wrap: bool) -> Config {
-    Config {
-        cross_file_scroll: Some(cross_file),
-        wrap_lines: Some(wrap),
-        ..Config::default()
-    }
-}
-
-fn app_for(repo: &TempDir, cfg: Config) -> App {
-    App::with_config(repo.path().to_path_buf(), &cfg).unwrap()
-}
-
-fn rendered_app(repo: &TempDir, cfg: Config, h: u16) -> App {
-    let app = app_for(repo, cfg);
-    dump_frame(&app, W, h).unwrap();
-    app
-}
 
 /// A status repo with two tall untracked files (`a.txt` 60 lines, `b.txt` 40
 /// lines) — deep enough that either can lead the strip.
@@ -60,14 +38,6 @@ fn handoff_status_repo() -> TempDir {
 }
 
 /// Two short untracked files whose whole stream (headers included) fits well
-/// under a 20-row viewport — the fixture for a shortfall-region click.
-fn short_status_repo() -> TempDir {
-    let repo = init_repo();
-    write(repo.path(), "b.txt", "one\ntwo\n");
-    write(repo.path(), "c.txt", "x\ny\n");
-    repo
-}
-
 /// A review with two tall files (`a.txt`, `b.txt`) added on `feature`, mirroring
 /// `handoff_status_repo` for the Review view.
 fn handoff_review_repo() -> TempDir {
@@ -84,48 +54,6 @@ fn handoff_review_repo() -> TempDir {
 
 // --- event helpers -------------------------------------------------------
 
-fn mouse(col: u16, row: u16, kind: MouseEventKind) -> MouseEvent {
-    MouseEvent {
-        kind,
-        column: col,
-        row,
-        modifiers: KeyModifiers::NONE,
-    }
-}
-
-fn click(col: u16, row: u16) -> MouseEvent {
-    mouse(col, row, MouseEventKind::Down(MouseButton::Left))
-}
-
-fn ms(n: u64) -> Duration {
-    Duration::from_millis(n)
-}
-
-/// Select stream file `index` from the file list and refresh the metrics —
-/// mirrors the identical helper in `cross_file_scroll_test.rs`.
-fn select(app: &mut App, index: usize, h: u16) {
-    while app.selected < index {
-        press(app, 'j');
-    }
-    while app.selected > index {
-        press(app, 'k');
-    }
-    dump_frame(app, W, h).unwrap();
-}
-
-/// Prepare the window for the pane's current geometry, the way the event path
-/// does after every scroll.
-fn prepare_window(app: &mut App) {
-    let area = app.diff_area();
-    app.ensure_diff_window(area.width, area.height);
-}
-
-/// The window the pane would render right now.
-fn window_of(app: &App) -> DiffWindow {
-    let area = app.diff_area();
-    app.diff_window(area.width, area.height)
-}
-
 /// Park the stream at `(file index, offset)` with the window prepared and one
 /// frame rendered — the window hit map a click resolves against is recorded
 /// by the renderer, so a test must re-render after moving the scroll offset
@@ -135,23 +63,6 @@ fn park(app: &mut App, index: usize, offset: usize, h: u16) {
     app.diff_scroll.set(offset);
     prepare_window(app);
     dump_frame(app, W, h).unwrap();
-}
-
-fn selected_path(app: &App) -> String {
-    app.selected_file()
-        .map(|(_, e)| e.path.clone())
-        .unwrap_or_default()
-}
-
-/// The diff pane's border title (the row just above its inner area).
-fn pane_title(buf: &Buffer, area: Rect) -> String {
-    (area.x..area.x + area.width)
-        .map(|x| {
-            buf.cell((x, area.y - 1))
-                .map(|c| c.symbol().to_string())
-                .unwrap_or_default()
-        })
-        .collect()
 }
 
 /// Seed a one-comment review store on `file` (mirrors

@@ -226,18 +226,17 @@ impl Flash {
     }
 }
 
-/// Where a click on a physical [`LayoutRow`] lands. Recorded per row so a later
-/// commit (C8) can turn a click into an action without re-deriving geometry:
-/// `Code` is a code/hunk line; `Body(id)` is anywhere on comment `id`'s box;
-/// `Close(id)` is the box's `[x]` close cell — resolved by C8 against the finer
-/// [`DiffPaneState`] `x_rects` rect, since a whole-row `hit` can't split the
-/// title row's `[x]` from its text.
+/// How far a comment-set change has to reach when invalidating cached rows
+/// (plan 007 §3.1's exactly-once contract). A standalone mutation — an agent's
+/// `add`/`rm` seen by a watcher reload, a save, a delete — is `Stream`: every
+/// cached section carries its own file's boxes, so all of them retire. The same
+/// work run *inside* a relist is `AnchorOnly`: the enclosing branch already
+/// takes the cycle's single `stream_generation` bump once every piece of state
+/// is installed, and a second bump there would retire the window twice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HitRegion {
-    Code,
-    Close(u64),
-    Body(u64),
-    FileHeader,
+enum CommentInvalidation {
+    Stream,
+    AnchorOnly,
 }
 
 /// The *semantic* region a click landed on, the part of a [`HitTarget`] that
@@ -402,16 +401,16 @@ pub enum BoxPart {
 /// One physical row of the diff pane's layout: the logical [`RowTarget`] it
 /// belongs to, its 0-based offset within that target (`subrow`), the side column
 /// a side-by-side box occupies (`None` for unified, full-width, and code rows),
-/// the click [`HitRegion`], and the render `content`. A code line is exactly one
-/// `LayoutRow`; a comment box is N rows sharing one `target`. The layout is
-/// cached width-keyed (see [`App::diff_layout`]), so a resize rebuilds it while
-/// preserving the logical targets.
+/// and the render `content`. A code line is exactly one `LayoutRow`; a comment
+/// box is N rows sharing one `target`. The layout is cached width-keyed (see
+/// [`App::diff_layout`]), so a resize rebuilds it while preserving the logical
+/// targets. Clicks resolve through `ClickRegion`/`WindowHit`, not through the
+/// row.
 #[derive(Clone)]
 pub struct LayoutRow {
     pub target: RowTarget,
     pub subrow: usize,
     pub side: Option<Side>,
-    pub hit: HitRegion,
     pub content: RowContent,
 }
 
@@ -1356,7 +1355,7 @@ impl App {
         // Load the review inbox (records the range + re-anchors, per §3.1.1). A
         // corrupt store is recoverable: it flashes and opens comment-free rather
         // than failing construction.
-        app.reanchor_review_comments();
+        app.reanchor_review_comments(CommentInvalidation::Stream);
         // Load the status view's worktree inbox (re-anchor + sweep). A no-op in a
         // review session; recoverable on a corrupt store, exactly like the review
         // inbox above.
@@ -1439,7 +1438,13 @@ impl App {
                 }
                 self.sync_status_comments();
             }
-            Err(err) => tracing::warn!("status refresh failed: {err:#}"),
+            Err(err) => {
+                tracing::warn!("status refresh failed: {err:#}");
+                // A failed snapshot is not a reason to trust the cached sections:
+                // whatever made `git status` fail may already have rewritten the
+                // files they were built from. Retire them (plan 007 §3.1).
+                self.bump_stream_generation();
+            }
         }
     }
 
@@ -1450,8 +1455,8 @@ impl App {
         // A watcher-driven reload can shrink the menu's row list (a theme file
         // vanished); drop any open dropdown rather than risk a stale `item`.
         self.open_menu = None;
-        // Whatever the watcher saw may have rewritten any file in the stream.
-        self.bump_stream_generation();
+        // No bump here: `refresh_active` reaches whichever view's refresh owns the
+        // single invalidation for this cycle (plan 007 §3.1).
         self.refresh_active();
         self.sync_active();
     }
@@ -2312,8 +2317,9 @@ impl App {
         });
         match result {
             Ok(Some(set)) => {
-                self.apply_active_comments(set);
-                self.invalidate_comment_rows();
+                if self.apply_active_comments(set) {
+                    self.invalidate_comment_rows();
+                }
                 self.clamp_review_cursor();
                 self.flash = Some(Flash::info("comment deleted"));
             }
@@ -2405,7 +2411,7 @@ impl App {
         if let Some(pane) = self.active_pane_mut() {
             pane.editing = Some(edit);
         }
-        self.invalidate_comment_rows();
+        self.relayout_comment_rows();
         self.editor_reveal();
     }
 
@@ -2511,7 +2517,7 @@ impl App {
             return;
         };
         f(edit);
-        self.invalidate_comment_rows();
+        self.relayout_comment_rows();
     }
 
     /// Route a key to the in-place editor (plan §3.5), run before the keymap when
@@ -2669,8 +2675,10 @@ impl App {
                 // it already reloaded — rather than showing the old branch's comments
                 // (codex fix #3).
                 let same_branch = self.active_branch_key().as_deref() == Some(branch.as_str());
-                if same_branch {
-                    self.apply_active_comments(set);
+                // A changed set means neighbour sections are stale too;
+                // `close_editor` below only rebuilds the anchor's rows.
+                if same_branch && self.apply_active_comments(set) {
+                    self.bump_stream_generation();
                 }
                 self.close_editor();
                 if same_branch {
@@ -2710,13 +2718,15 @@ impl App {
         self.close_editor();
     }
 
-    /// Close the editor: drop the edit slot, invalidate the row cache (its box is
+    /// Close the editor: drop the edit slot, rebuild the anchor's rows (its box is
     /// gone, or a saved box takes its place), and clamp the cursor to the new list.
+    /// Anchor-only — a save that actually changed the inbox bumps the stream in
+    /// `save_edit`, and a discard changed nothing outside these rows.
     fn close_editor(&mut self) {
         if let Some(pane) = self.active_pane_mut() {
             pane.editing = None;
         }
-        self.invalidate_comment_rows();
+        self.relayout_comment_rows();
         self.clamp_review_cursor();
     }
 
@@ -4175,23 +4185,30 @@ impl App {
             .repo
             .head_branch_key()
             .unwrap_or_else(|_| old_branch_key.clone());
-        let key_changed = branch_key != old_branch_key;
         if let Some(review) = self.review.as_mut() {
             review.authoring = head_oid == Some(spec.head);
             review.branch_key = branch_key;
         }
-        if key_changed {
-            // The inbox changed identity; drop cached comment rows so they rebuild
-            // for the new branch's set.
-            self.invalidate_comment_rows();
-        }
+
+        let moved = spec.base != old_base || spec.head != old_head;
+        // A relist is one top-level mutation and takes one bump, at its end (plan
+        // 007 §3.1). The store re-read and the re-anchor below are subordinate to
+        // it, so inside a relist they only rebuild the anchor's rows — otherwise a
+        // range move that also carries an inbox change would retire the window two
+        // or three times. Reached without a relist (the churn-guarded watcher tick)
+        // the store re-read is the top-level mutation and keeps its own bump.
+        let how = if moved {
+            CommentInvalidation::AnchorOnly
+        } else {
+            CommentInvalidation::Stream
+        };
 
         // Re-read the store from disk (plan §3.2b) so an agent's `rm`/`add` — and
         // any new branch key above — is reflected even when the range OIDs are
         // unchanged. Cheap and write-free, so it can't drive a reload loop.
-        self.reload_review_comments();
+        let comments_changed = self.reload_review_comments(how);
 
-        if spec.base == old_base && spec.head == old_head {
+        if !moved {
             // Range unchanged: keep the list, selection, scroll, and warm caches.
             // A store re-read above may still have dropped comment rows (agent
             // `rm`), so clamp the cursor to the possibly-shorter row list.
@@ -4218,6 +4235,12 @@ impl App {
             Err(err) => {
                 tracing::warn!("listing review files failed: {err:#}");
                 self.flash = Some(Flash::error(format!("review: {err}")));
+                // Bailing out before the relist's own bump: if the store re-read
+                // above changed the set, its deferred invalidation is owed here or
+                // the sections keep rendering the previous comments.
+                if comments_changed {
+                    self.bump_stream_generation();
+                }
                 return;
             }
         };
@@ -4234,13 +4257,15 @@ impl App {
             // Force the open diff to recompute against the new tips.
             review.diff_key = None;
         }
-        // The range moved and the list was rebuilt: every section was computed
-        // against the old tips (plan 006 §3.3).
-        self.bump_stream_generation();
         // The range moved, so a full re-anchor pass runs against the new diff
         // (write elided when nothing moved — plan §3.2b), updating the in-memory
         // set the row model reads.
-        self.reanchor_review_comments();
+        self.reanchor_review_comments(CommentInvalidation::AnchorOnly);
+        // Every section was computed against the old tips, and the re-anchored
+        // boxes above may have moved within them (plan 006 §3.3). One bump, taken
+        // once all of the new state is installed — nothing below prepares a
+        // section, so no stale one can be re-tagged as live.
+        self.bump_stream_generation();
         self.sync_review_diff();
         // The relist rebuilt the row list; keep the cursor's index but clamp it
         // to the new count (plan §3.4).
@@ -4251,7 +4276,11 @@ impl App {
     /// write-free (so it can't loop the store-dir watcher), and a no-op when
     /// comments are inactive. On a load error the prior set is kept and an error
     /// flashes at most once (a corrupt store must not spam on every reload).
-    fn reload_review_comments(&mut self) {
+    ///
+    /// Returns whether the in-memory set actually changed, so a caller that
+    /// passed `AnchorOnly` still knows a bump is owed if it bails out before
+    /// taking its own.
+    fn reload_review_comments(&mut self, how: CommentInvalidation) -> bool {
         let dir = self.repo.strix_dir();
         let (active, branch) = match self.review.as_ref() {
             Some(review) if review.authoring => (true, review.branch_key.clone()),
@@ -4268,9 +4297,9 @@ impl App {
                 had
             });
             if cleared {
-                self.invalidate_comment_rows();
+                self.invalidate_comments(how);
             }
-            return;
+            return cleared;
         }
         match comments::load(&dir) {
             Ok(store) => {
@@ -4279,13 +4308,19 @@ impl App {
                     .get(&branch)
                     .map(|b| b.comments.clone())
                     .unwrap_or_default();
-                self.apply_review_comments(set);
-                self.invalidate_comment_rows();
+                // Elided when the store re-read produced the set already on screen:
+                // the common watcher tick must not retire the prepared window.
+                let changed = self.apply_review_comments(set);
+                if changed {
+                    self.invalidate_comments(how);
+                }
                 self.clear_comment_error();
+                changed
             }
             Err(err) => {
                 tracing::warn!("re-reading comments store failed: {err:#}");
                 self.flash_comment_error(err);
+                false
             }
         }
     }
@@ -4295,7 +4330,7 @@ impl App {
     /// open (plan §3.1.1 / §3.2) and the OID-changed refresh branch; inactive → a
     /// no-op. A store error keeps the prior set and flashes once, so a corrupt
     /// store opens comment-free rather than failing construction.
-    fn reanchor_review_comments(&mut self) {
+    fn reanchor_review_comments(&mut self, how: CommentInvalidation) {
         let dir = self.repo.strix_dir();
         let (branch, spec, files) = match self.review.as_ref() {
             Some(review) if review.authoring => (
@@ -4307,8 +4342,9 @@ impl App {
         };
         match record_range_and_reanchor(&self.repo, &dir, &branch, &spec, &files) {
             Ok(set) => {
-                self.apply_review_comments(set);
-                self.invalidate_comment_rows();
+                if self.apply_review_comments(set) {
+                    self.invalidate_comments(how);
+                }
                 self.clear_comment_error();
             }
             Err(err) => {
@@ -4321,27 +4357,37 @@ impl App {
     /// Replace the active view's in-memory comment set from a branch entry's full
     /// set, keeping only the comments of the active view's scope (so a worktree
     /// comment never leaks into a review render, nor vice versa).
-    fn apply_active_comments(&mut self, full: Vec<Comment>) {
+    /// Returns whether the view's set actually changed, so callers can skip the
+    /// invalidation when a reload/re-anchor produced the set already on screen.
+    fn apply_active_comments(&mut self, full: Vec<Comment>) -> bool {
         match self.view {
             ViewMode::Status => {
-                self.status_comments = full.into_iter().filter(is_worktree_scope).collect();
+                let set: Vec<Comment> = full.into_iter().filter(is_worktree_scope).collect();
+                let changed = set != self.status_comments;
+                self.status_comments = set;
+                changed
             }
             ViewMode::Review => self.apply_review_comments(full),
-            ViewMode::History => {}
+            ViewMode::History => false,
         }
     }
 
     /// Replace `review.comments` from a branch entry's full set, keeping only the
     /// comments scoped to *this* review's exact range (codex-#5): a worktree
     /// comment, or a range comment from a different range, is filtered out.
-    fn apply_review_comments(&mut self, full: Vec<Comment>) {
-        if let Some(review) = self.review.as_mut() {
-            let input = review.spec.input.clone();
-            review.comments = full
-                .into_iter()
-                .filter(|c| is_review_scope(c, &input))
-                .collect();
-        }
+    /// Returns whether the set actually changed (see [`apply_active_comments`]).
+    fn apply_review_comments(&mut self, full: Vec<Comment>) -> bool {
+        let Some(review) = self.review.as_mut() else {
+            return false;
+        };
+        let input = review.spec.input.clone();
+        let set: Vec<Comment> = full
+            .into_iter()
+            .filter(|c| is_review_scope(c, &input))
+            .collect();
+        let changed = set != review.comments;
+        review.comments = set;
+        changed
     }
 
     /// Re-anchor the worktree inbox and apply the §3.2 lifecycle (sweep landed
@@ -4381,7 +4427,10 @@ impl App {
         match result {
             Ok(set) => {
                 self.status_comments = set;
-                self.invalidate_comment_rows();
+                // Anchor-only: this runs solely from `new` and from `refresh`, and
+                // `refresh` already owns this cycle's single stream bump (plan 007
+                // §3.1) — a second one here would retire the window twice per tick.
+                self.relayout_comment_rows();
                 self.clear_comment_error();
             }
             Err(err) => {
@@ -4427,13 +4476,34 @@ impl App {
         }
     }
 
-    /// Drop the physical row layout so the next render rebuilds it (after any
-    /// comment mutation or reload — a box appeared, vanished, or changed).
-    fn invalidate_comment_rows(&self) {
+    /// Drop the *anchor's* physical row layout so the next render rebuilds it,
+    /// leaving every cached neighbour section intact.
+    ///
+    /// Split from [`invalidate_comment_rows`] because the two have different
+    /// blast radii (plan 007 §3.1). The in-place editor only ever renders in the
+    /// anchor's rows, so its open/keystroke/close path belongs here: bumping the
+    /// stream on every keypress would retire the whole prepared window — every
+    /// neighbour section recomputed per typed character.
+    fn relayout_comment_rows(&self) {
         *self.layout.borrow_mut() = None;
-        // Neighbours' sections carry *their* comment boxes, so a mutation anywhere
-        // in the inbox invalidates the stream too (plan 006 §3.3).
+    }
+
+    /// Drop the anchor's layout *and* retire every cached section: a comment set
+    /// actually changed, and neighbours' sections carry *their* comment boxes
+    /// (plan 006 §3.3). Only for real inbox mutations — a top-level
+    /// refresh/reload/relist owns its own single bump instead (plan 007 §3.1).
+    fn invalidate_comment_rows(&self) {
+        self.relayout_comment_rows();
         self.bump_stream_generation();
+    }
+
+    /// Apply a changed comment set's invalidation at the reach the caller's
+    /// context calls for — see [`CommentInvalidation`].
+    fn invalidate_comments(&self, how: CommentInvalidation) {
+        match how {
+            CommentInvalidation::Stream => self.invalidate_comment_rows(),
+            CommentInvalidation::AnchorOnly => self.relayout_comment_rows(),
+        }
     }
 
     /// Invalidate every cached section. Anything that can change which files the
@@ -5343,7 +5413,6 @@ impl App {
                     target: RowTarget::Code(index),
                     subrow,
                     side: None,
-                    hit: HitRegion::Code,
                     content: RowContent::Line { line: index, seg },
                 });
             }
@@ -5434,7 +5503,6 @@ impl App {
                     target: RowTarget::Code(i),
                     subrow: 0,
                     side: None,
-                    hit: HitRegion::Code,
                     content: RowContent::Hunk(i),
                 }),
                 SbsCode::Pair { left, right } => {
@@ -5477,7 +5545,6 @@ impl App {
                             target,
                             subrow,
                             side: None,
-                            hit: HitRegion::Code,
                             content: RowContent::Pair {
                                 left: cell(left, &left_segs),
                                 right: cell(right, &right_segs),
@@ -5554,7 +5621,6 @@ impl App {
                 target,
                 subrow,
                 side,
-                hit: HitRegion::Body(id),
                 content: RowContent::Box(BoxRow {
                     id,
                     stale: comment.stale,
@@ -5585,7 +5651,6 @@ impl App {
                 target: RowTarget::Editor,
                 subrow,
                 side,
-                hit: HitRegion::Code,
                 content: RowContent::Editor(part),
             });
         }
@@ -6924,7 +6989,6 @@ fn header_row(header: FileHeaderRow) -> LayoutRow {
         target: RowTarget::FileHeader,
         subrow: 0,
         side: None,
-        hit: HitRegion::FileHeader,
         content: RowContent::FileHeader(header),
     }
 }

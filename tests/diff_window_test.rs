@@ -13,7 +13,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use common::{
-    git, init_repo, init_repo_with_diverged_branches, init_repo_with_history, press, write,
+    init_repo, init_repo_with_diverged_branches, init_repo_with_history, press, strix_dir,
+    three_modified_files, write,
 };
 use strix::app::{App, DiffWindow, FileId, RowContent, RowTarget};
 use strix::comments::{Branch, Comment, Scope, Side, Source, Store};
@@ -77,25 +78,6 @@ fn three_small_files() -> TempDir {
     write(repo.path(), "b.txt", "b1\nb2\nb3\n");
     write(repo.path(), "c.txt", "c1\n");
     repo
-}
-
-/// Three committed files, each modified in the working tree (so they can be
-/// staged, unlike untracked ones).
-fn three_modified_files() -> TempDir {
-    let repo = init_repo();
-    for name in ["a.txt", "b.txt", "c.txt"] {
-        write(repo.path(), name, "one\ntwo\nthree\n");
-    }
-    git(repo.path(), &["add", "."]);
-    git(repo.path(), &["commit", "-q", "-m", "files"]);
-    for name in ["a.txt", "b.txt", "c.txt"] {
-        write(repo.path(), name, "one\nTWO\nthree\n");
-    }
-    repo
-}
-
-fn strix_dir(repo: &Path) -> std::path::PathBuf {
-    repo.join(".git").join("strix")
 }
 
 /// Seed a review comment store, the schema the TUI and the `strix comment` CLI

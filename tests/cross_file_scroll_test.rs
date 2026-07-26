@@ -13,16 +13,20 @@
 
 mod common;
 
-use common::{git, init_repo, init_repo_with_diverged_branches, press, render_buffer, write};
+use common::{
+    app_for, config, git, init_repo, init_repo_with_diverged_branches, mouse, pane_title,
+    prepare_window, press, render_buffer, rendered_app, select, selected_path, short_status_repo,
+    window_of, write,
+};
 use std::collections::BTreeMap;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier};
-use strix::app::{App, DiffWindow, RowContent, RowTarget};
+use strix::app::{App, RowContent, RowTarget};
 use strix::comments::{Branch, Comment, Scope, Side, Source, Store};
 use strix::config::Config;
-use strix::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use strix::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
 use strix::terminal::dump_frame;
 use tempfile::TempDir;
 
@@ -35,14 +39,6 @@ fn viewport_at(h: u16) -> usize {
 
 // --- construction ----------------------------------------------------------
 
-fn config(cross_file: bool, wrap: bool) -> Config {
-    Config {
-        cross_file_scroll: Some(cross_file),
-        wrap_lines: Some(wrap),
-        ..Config::default()
-    }
-}
-
 /// A status repo (README committed) with three untracked files, listed in path
 /// order: `a.txt` is tall (60 lines), `b.txt` and `c.txt` are short.
 fn multi_status_repo() -> TempDir {
@@ -50,14 +46,6 @@ fn multi_status_repo() -> TempDir {
     let long: String = (0..60).map(|i| format!("line {i}\n")).collect();
     write(repo.path(), "a.txt", &long);
     write(repo.path(), "b.txt", "one\ntwo\nthree\n");
-    write(repo.path(), "c.txt", "x\ny\n");
-    repo
-}
-
-/// Two short untracked files, so every diff has `max_scroll == 0`.
-fn short_status_repo() -> TempDir {
-    let repo = init_repo();
-    write(repo.path(), "b.txt", "one\ntwo\n");
     write(repo.path(), "c.txt", "x\ny\n");
     repo
 }
@@ -85,28 +73,7 @@ fn short_then_tall_repo() -> TempDir {
     repo
 }
 
-fn app_for(repo: &TempDir, cfg: Config) -> App {
-    App::with_config(repo.path().to_path_buf(), &cfg).unwrap()
-}
-
-/// An app on `repo` with one frame rendered at `h`, so the pane geometry and the
-/// scroll metrics every clamp reads are live.
-fn rendered_app(repo: &TempDir, cfg: Config, h: u16) -> App {
-    let app = app_for(repo, cfg);
-    dump_frame(&app, W, h).unwrap();
-    app
-}
-
 // --- event helpers ---------------------------------------------------------
-
-fn mouse(col: u16, row: u16, kind: MouseEventKind) -> MouseEvent {
-    MouseEvent {
-        kind,
-        column: col,
-        row,
-        modifiers: KeyModifiers::NONE,
-    }
-}
 
 fn wheel_down(app: &mut App) {
     let d = app.diff_area();
@@ -134,37 +101,6 @@ fn wheel_to_bottom(app: &mut App) {
     }
 }
 
-fn selected_path(app: &App) -> String {
-    app.selected_file()
-        .map(|(_, e)| e.path.clone())
-        .unwrap_or_default()
-}
-
-/// Select stream file `index` from the file list and refresh the metrics, the
-/// way a click on the list would.
-fn select(app: &mut App, index: usize, h: u16) {
-    while app.selected < index {
-        press(app, 'j');
-    }
-    while app.selected > index {
-        press(app, 'k');
-    }
-    dump_frame(app, W, h).unwrap();
-}
-
-/// Prepare the window for the pane's current geometry, the way the event path
-/// does after every scroll.
-fn prepare_window(app: &mut App) {
-    let area = app.diff_area();
-    app.ensure_diff_window(area.width, area.height);
-}
-
-/// The window the pane would render right now.
-fn window_of(app: &App) -> DiffWindow {
-    let area = app.diff_area();
-    app.diff_window(area.width, area.height)
-}
-
 /// Park the stream at `(file index, offset)` with the window prepared, the state
 /// invariant every wheel tick starts from.
 fn park(app: &mut App, index: usize, offset: usize, h: u16) {
@@ -188,17 +124,6 @@ fn pane_rows(buf: &Buffer, area: Rect) -> Vec<Vec<Cell>> {
                     (cell.symbol().to_string(), cell.fg, cell.bg, cell.modifier)
                 })
                 .collect()
-        })
-        .collect()
-}
-
-/// The diff pane's border title (the row just above its inner area).
-fn pane_title(buf: &Buffer, area: Rect) -> String {
-    (area.x..area.x + area.width)
-        .map(|x| {
-            buf.cell((x, area.y - 1))
-                .map(|c| c.symbol().to_string())
-                .unwrap_or_default()
         })
         .collect()
 }

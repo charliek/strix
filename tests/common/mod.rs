@@ -2,18 +2,161 @@
 // dead-code lint that would otherwise fire per-crate.
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
 use ratatui::style::Color;
-use strix::app::App;
-use strix::crossterm::event::{KeyCode, KeyEvent};
+use strix::app::{App, DiffWindow, RowTarget};
+use strix::comments::{Branch, Comment, Store};
+use strix::config::Config;
+use strix::crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use strix::terminal::dump_frame;
 use tempfile::TempDir;
 
 /// Press a plain character key on `app`, as if typed at the keyboard.
 pub fn press(app: &mut App, ch: char) {
     app.on_key(KeyEvent::from(KeyCode::Char(ch)));
+}
+
+// --- Key / mouse event builders ---------------------------------------------
+// `key` builds the event without applying it (vs [`press`], which applies).
+
+pub fn key(c: char) -> KeyEvent {
+    KeyEvent::from(KeyCode::Char(c))
+}
+
+pub fn ctrl(c: char) -> KeyEvent {
+    KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+}
+
+pub fn enter() -> KeyEvent {
+    KeyEvent::from(KeyCode::Enter)
+}
+
+pub fn esc() -> KeyEvent {
+    KeyEvent::from(KeyCode::Esc)
+}
+
+pub fn tab() -> KeyEvent {
+    KeyEvent::from(KeyCode::Tab)
+}
+
+pub fn mouse(col: u16, row: u16, kind: MouseEventKind) -> MouseEvent {
+    MouseEvent {
+        kind,
+        column: col,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+pub fn click(col: u16, row: u16) -> MouseEvent {
+    mouse(col, row, MouseEventKind::Down(MouseButton::Left))
+}
+
+pub fn ms(n: u64) -> Duration {
+    Duration::from_millis(n)
+}
+
+// --- Frame rendering ---------------------------------------------------------
+
+/// Render one frame to text at `w`×`h`. Suites with a fixed viewport keep a
+/// local `fn dump(app: &App) -> String` that calls this with their own `W`/`H`.
+pub fn dump(app: &App, w: u16, h: u16) -> String {
+    dump_frame(app, w, h).unwrap()
+}
+
+/// The 0-indexed row in `frame` (as produced by [`dump`]) containing `needle`,
+/// or panics with the frame content if not found.
+pub fn row_of(frame: &str, needle: &str) -> usize {
+    frame
+        .lines()
+        .position(|l| l.contains(needle))
+        .unwrap_or_else(|| panic!("frame missing {needle:?}:\n{frame}"))
+}
+
+// --- Selection polling --------------------------------------------------------
+
+/// Press `j` up to `max_tries` times until `app`'s active diff path is `path`,
+/// or panic. Suites keep a local zero-arg `select_file`/`select_status_file`
+/// wrapper pinning their own `W`/`H`/retry count.
+pub fn select_file(app: &mut App, path: &str, w: u16, h: u16, max_tries: u32) {
+    let _ = dump(app, w, h);
+    for _ in 0..max_tries {
+        if app.active_diff_path().as_deref() == Some(path) {
+            return;
+        }
+        app.on_key(key('j'));
+    }
+    panic!("{path} never became the selected file");
+}
+
+/// As [`select_file`], for suites whose failure message calls out the status
+/// (working-tree) list rather than a review file list.
+pub fn select_status_file(app: &mut App, path: &str, w: u16, h: u16, max_tries: u32) {
+    let _ = dump(app, w, h);
+    for _ in 0..max_tries {
+        if app.active_diff_path().as_deref() == Some(path) {
+            return;
+        }
+        app.on_key(key('j'));
+    }
+    panic!("{path} never became the selected status file");
+}
+
+// --- Review-mode app construction --------------------------------------------
+
+/// A review-mode `App` over `repo` at `range`, default config.
+pub fn review(repo: &Path, range: &str) -> App {
+    App::for_review(repo.to_path_buf(), &Config::default(), range).unwrap()
+}
+
+/// As [`review`], also returning the backing repo (some suites build the repo
+/// inline rather than taking it as a parameter).
+pub fn review_app(range: &str) -> (TempDir, App) {
+    let repo = init_repo_with_diverged_branches();
+    let app = App::for_review(repo.path().to_path_buf(), &Config::default(), range).unwrap();
+    (repo, app)
+}
+
+// --- Comment store I/O --------------------------------------------------------
+
+/// The `strix` comments directory under `repo`'s `.git`.
+pub fn strix_dir(repo: &Path) -> PathBuf {
+    repo.join(".git").join("strix")
+}
+
+/// The raw JSON text of `repo`'s comment store.
+pub fn store_text(repo: &Path) -> String {
+    std::fs::read_to_string(strix_dir(repo).join("comments.json")).unwrap()
+}
+
+/// Write a comment store for `repo` with a single branch entry (`branch`,
+/// `range`, `comments`), `next_id` 1000.
+pub fn seed_store(repo: &Path, branch: &str, range: Option<&str>, comments: Vec<Comment>) {
+    let mut branches = BTreeMap::new();
+    branches.insert(
+        branch.to_string(),
+        Branch {
+            active_range: range.map(str::to_string),
+            comments,
+        },
+    );
+    let store = Store {
+        version: 2,
+        next_id: 1000,
+        branches,
+    };
+    let dir = strix_dir(repo);
+    std::fs::create_dir_all(&dir).unwrap();
+    let json = serde_json::to_string_pretty(&store).unwrap();
+    std::fs::write(dir.join("comments.json"), json).unwrap();
 }
 
 // --- Styled-cell assertions -------------------------------------------------
@@ -276,4 +419,178 @@ pub fn setup_for_binary() -> TempDir {
     git(path, &["add", "."]);
     commit_at(path, "add binary", "2021-01-02T00:00:00");
     dir
+}
+
+// --- More repo fixtures -------------------------------------------------------
+
+/// A repository with a `feature` branch adding a 40-line `big.txt` not present
+/// on the base, so a range diff against it runs well past a typical viewport.
+pub fn tall_repo() -> TempDir {
+    let dir = init_repo();
+    let p = dir.path();
+    git(p, &["checkout", "-qb", "feature"]);
+    let mut content = String::new();
+    for i in 1..=40 {
+        content.push_str(&format!("row {i}\n"));
+    }
+    write(p, "big.txt", &content);
+    git(p, &["add", "."]);
+    git(p, &["commit", "-qm", "add big"]);
+    dir
+}
+
+/// A repository with one commit changing a single line of `file.txt`
+/// (`OLD` -> `NEW`), on a `feature` branch off the base.
+pub fn modified_line_repo() -> TempDir {
+    let dir = init_repo();
+    let p = dir.path();
+    write(p, "file.txt", "line1\nOLD\nline3\n");
+    git(p, &["add", "."]);
+    git(p, &["commit", "-qm", "base"]);
+    git(p, &["checkout", "-qb", "feature"]);
+    write(p, "file.txt", "line1\nNEW\nline3\n");
+    git(p, &["add", "."]);
+    git(p, &["commit", "-qm", "change"]);
+    dir
+}
+
+/// A repository with a pure rename (`orig.txt` -> `renamed.txt`, no content
+/// change) committed on a `feature` branch off the base.
+pub fn pure_rename_repo() -> TempDir {
+    let dir = init_repo();
+    let p = dir.path();
+    write(p, "orig.txt", "unchanged\ncontent\n");
+    git(p, &["add", "."]);
+    git(p, &["commit", "-qm", "add orig"]);
+    git(p, &["checkout", "-qb", "feature"]);
+    git(p, &["mv", "orig.txt", "renamed.txt"]);
+    git(p, &["commit", "-qm", "pure rename"]);
+    dir
+}
+
+/// A repository with three modified files (`a.txt`/`b.txt`/`c.txt`, each
+/// `two` -> `TWO` on the middle line), for multi-file window/stream tests.
+pub fn three_modified_files() -> TempDir {
+    let repo = init_repo();
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        write(repo.path(), name, "one\ntwo\nthree\n");
+    }
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-q", "-m", "files"]);
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        write(repo.path(), name, "one\nTWO\nthree\n");
+    }
+    repo
+}
+
+/// Write `contents` to `rel` in `dir` and commit it with `msg`.
+pub fn commit_file(dir: &Path, rel: &str, contents: &str, msg: &str) {
+    write(dir, rel, contents);
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-qm", msg]);
+}
+
+/// `repo`'s current `HEAD` commit OID.
+pub fn head_oid(repo: &Path) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("git rev-parse");
+    assert!(
+        out.status.success(),
+        "git rev-parse HEAD failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+// --- Cross-file scroll / strip-mouse shared fixtures --------------------------
+//
+// `cross_file_scroll_test.rs` and `strip_mouse_test.rs` both drive the same
+// continuous diff-pane stream at a shared 120-column viewport; these nine
+// helpers were byte-identical between the two suites.
+
+/// The fixed pane width both suites render at.
+const STREAM_W: u16 = 120;
+
+/// Cursor's resolved [`RowTarget`] at the anchor's current layout, if any.
+pub fn cursor_target(app: &App) -> Option<RowTarget> {
+    let w = app.diff_area().width;
+    let idx = app.review_cursor();
+    app.diff_layout(w).get(idx).map(|r| r.target)
+}
+
+/// A status repo with two small modified files (`b.txt`, `c.txt`), short
+/// enough that both fit in a typical window at once.
+pub fn short_status_repo() -> TempDir {
+    let repo = init_repo();
+    write(repo.path(), "b.txt", "one\ntwo\n");
+    write(repo.path(), "c.txt", "x\ny\n");
+    repo
+}
+
+/// A cross-file-scroll / wrap config with both flags explicit.
+pub fn config(cross_file: bool, wrap: bool) -> Config {
+    Config {
+        cross_file_scroll: Some(cross_file),
+        wrap_lines: Some(wrap),
+        ..Config::default()
+    }
+}
+
+/// A status-mode `App` over `repo` with `cfg`.
+pub fn app_for(repo: &TempDir, cfg: Config) -> App {
+    App::with_config(repo.path().to_path_buf(), &cfg).unwrap()
+}
+
+/// Force the diff window to prepare at `app`'s current pane size.
+pub fn prepare_window(app: &mut App) {
+    let area = app.diff_area();
+    app.ensure_diff_window(area.width, area.height);
+}
+
+/// `app`'s current diff window at its current pane size.
+pub fn window_of(app: &App) -> DiffWindow {
+    let area = app.diff_area();
+    app.diff_window(area.width, area.height)
+}
+
+/// Build `app_for(repo, cfg)` and render one frame at [`STREAM_W`]×`h`, so the
+/// diff window is prepared before the test drives it further.
+pub fn rendered_app(repo: &TempDir, cfg: Config, h: u16) -> App {
+    let app = app_for(repo, cfg);
+    dump_frame(&app, STREAM_W, h).unwrap();
+    app
+}
+
+/// Move the status-list selection to `index` via `j`/`k`, then render one
+/// frame at [`STREAM_W`]×`h`.
+pub fn select(app: &mut App, index: usize, h: u16) {
+    while app.selected < index {
+        press(app, 'j');
+    }
+    while app.selected > index {
+        press(app, 'k');
+    }
+    dump_frame(app, STREAM_W, h).unwrap();
+}
+
+/// The currently selected file's path, or `""` if none.
+pub fn selected_path(app: &App) -> String {
+    app.selected_file()
+        .map(|(_, e)| e.path.clone())
+        .unwrap_or_default()
+}
+
+/// The title text rendered on the row just above `area` in `buf`.
+pub fn pane_title(buf: &Buffer, area: Rect) -> String {
+    (area.x..area.x + area.width)
+        .map(|x| {
+            buf.cell((x, area.y - 1))
+                .map(|c| c.symbol().to_string())
+                .unwrap_or_default()
+        })
+        .collect()
 }

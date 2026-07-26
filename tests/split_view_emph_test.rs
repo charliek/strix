@@ -18,12 +18,10 @@ use tempfile::TempDir;
 const W: u16 = 100;
 const H: u16 = 24;
 
+use common::dump as dump_at;
+
 fn dump(app: &App) -> String {
     dump_at(app, W, H)
-}
-
-fn dump_at(app: &App, w: u16, h: u16) -> String {
-    strix::terminal::dump_frame(app, w, h).unwrap()
 }
 
 /// The 0-based screen row containing `needle`, panicking if there is none —

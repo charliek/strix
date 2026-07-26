@@ -1,22 +1,10 @@
 mod common;
 
-use common::init_repo_with_history;
+use common::{esc, init_repo_with_history, key, tab};
 use strix::app::{App, HistoryFocus, ViewMode};
-use strix::crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use strix::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use strix::git::{FileDiff, LineKind};
 use tempfile::TempDir;
-
-fn key(c: char) -> KeyEvent {
-    KeyEvent::from(KeyCode::Char(c))
-}
-
-fn esc() -> KeyEvent {
-    KeyEvent::from(KeyCode::Esc)
-}
-
-fn tab() -> KeyEvent {
-    KeyEvent::from(KeyCode::Tab)
-}
 
 fn mouse(kind: MouseEventKind, x: u16, y: u16) -> MouseEvent {
     MouseEvent {
@@ -31,7 +19,7 @@ const W: u16 = 100;
 const H: u16 = 30;
 
 fn dump(app: &App) -> String {
-    strix::terminal::dump_frame(app, W, H).unwrap()
+    common::dump(app, W, H)
 }
 
 /// Build an `App` against a 3-commit repo. The returned `TempDir` must be held
