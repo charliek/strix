@@ -119,5 +119,39 @@ enables the MSRV-aware resolver (`incompatible-rust-versions = "fallback"`).
 - **See a frame without a terminal**: `cargo run -- --dump-frame [--width W --height H]`
   renders one frame against the current repo and prints it as text. This is the
   primary way to inspect the UI in tests and headless runs.
-- **Build**: `cargo build`; `make check` runs fmt + clippy + tests. Docs:
-  `make docs-serve` (needs `uv`).
+- **Build**: `cargo build`; `make check` runs fmt + clippy + tests.
+
+## Docs
+
+**Not part of `make check`.** The docs site has its own toolchain (uv/Python)
+and its own CI workflows; the Rust gates do not cover it, and it does not need
+to run for a change that touches neither. Run it for commits touching `docs/`,
+`zensical.toml`, `pyproject.toml`, `uv.lock`, or either docs workflow — both
+workflows trigger on those shared inputs (and each additionally on its own
+file), because a dependency or lockfile change can break the build just as
+easily as a content change:
+
+```bash
+make docs            # uv run --locked zensical build --strict
+make docs-serve      # preview on http://127.0.0.1:7071
+```
+
+The site is [Zensical](https://zensical.org) (not MkDocs — migrated 2026-08),
+configured in `zensical.toml`, built into `site-build/`. `--strict` fails on
+broken links and anchors and is what both CI workflows run, so run it locally
+before pushing docs changes. Note `zensical serve --strict` is unsupported;
+verify strictness via `build`.
+
+The look comes from the shared
+[stridelabs-docs-theme](https://github.com/charliek/stridelabs-docs-theme)
+package, pinned by tag in `pyproject.toml`. Palette, fonts and feature toggles
+live there, not here — do not add `theme.palette`, `theme.features`, or a
+`[project.theme.font]` table to `zensical.toml`. The last is the sharp edge: it
+re-enables Zensical's Google Fonts `<link>` on every page while the theme's
+self-hosted faces keep loading anyway.
+
+Two gotchas worth knowing: Zensical **silently ignores unknown config keys**
+even under `--strict`, so a green build does not prove a config edit did what
+you meant; and the `pymdownx.emoji` callables live in the
+`zensical.extensions.emoji` namespace — the Material for MkDocs
+`material.extensions.emoji` namespace aborts the build.

@@ -1,0 +1,98 @@
+# =============================================================================
+# Documentation style
+# =============================================================================
+# - Professional, direct tone (no marketing language)
+# - Tables for CLI options, config fields, keybindings
+# - Code blocks with language hints (bash, toml, rust)
+# - Admonitions sparingly (important notes / warnings only)
+# - Examples should be copy-pasteable
+# - One topic per page; keep pages focused
+# =============================================================================
+
+[project]
+
+site_name = "strix"
+site_description = "A focused, polished TUI for staging changes, viewing diffs, and reviewing a branch against its base"
+site_author = "strix Contributors"
+site_url = "https://charliek.github.io/strix/"
+
+repo_name = "charliek/strix"
+repo_url = "https://github.com/charliek/strix"
+edit_uri = "edit/main/docs/"
+
+docs_dir = "docs"
+site_dir = "site-build"
+
+dev_addr = "127.0.0.1:7071"
+
+nav = [
+  { "Home" = "index.md" },
+  { "Getting Started" = [
+    { "Installation" = "getting-started/installation.md" },
+    { "Usage" = "getting-started/usage.md" },
+    { "Keybindings" = "getting-started/keybindings.md" },
+  ] },
+  { "Guides" = [
+    { "Review loop" = "guides/review-loop.md" },
+    { "Theming" = "guides/theming.md" },
+    { "Configuration" = "guides/configuration.md" },
+  ] },
+  { "Reference" = [
+    { "CLI" = "reference/cli.md" },
+    { "Architecture" = "reference/architecture.md" },
+  ] },
+  { "Development" = [
+    { "Setup" = "development/setup.md" },
+  ] },
+]
+
+# -----------------------------------------------------------------------------
+# Theme
+# -----------------------------------------------------------------------------
+# The shared StrideLabs theme (stridelabs-docs-theme, pinned in pyproject.toml)
+# supplies the palette, the self-hosted type stack, the feature toggles, and
+# the owl + project-icon header lockup. Anything set here overrides it.
+#
+# Do NOT add a [project.theme.font] table: the theme sets `font: false` and
+# ships its own woff2 faces, so setting one re-enables Zensical's Google Fonts
+# <link> on every page while the self-hosted faces keep loading anyway.
+[project.theme]
+name = "stridelabs"
+
+# The icon that says *which* tool this is -- rendered beside the shared owl.
+[project.theme.icon]
+logo = "material/eye-outline"
+
+# -----------------------------------------------------------------------------
+# Extra
+# -----------------------------------------------------------------------------
+[[project.extra.social]]
+icon = "fontawesome/brands/github"
+link = "https://github.com/charliek/strix"
+
+# -----------------------------------------------------------------------------
+# Markdown extensions
+# -----------------------------------------------------------------------------
+[project.markdown_extensions.admonition]
+[project.markdown_extensions.attr_list]
+[project.markdown_extensions.md_in_html]
+
+[project.markdown_extensions.toc]
+permalink = true
+
+[project.markdown_extensions.pymdownx.details]
+
+[project.markdown_extensions.pymdownx.highlight]
+anchor_linenums = true
+line_spans = "__span"
+pygments_lang_class = true
+
+[project.markdown_extensions.pymdownx.inlinehilite]
+[project.markdown_extensions.pymdownx.snippets]
+[project.markdown_extensions.pymdownx.superfences]
+
+[project.markdown_extensions.pymdownx.tabbed]
+alternate_style = true
+
+[project.markdown_extensions.pymdownx.tasklist]
+custom_checkbox = true

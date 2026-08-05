@@ -8,6 +8,36 @@ Each release below is headed by a `## vX.Y.Z` entry added by
 `/release-workflows:release`; `release.yml` turns that section into the GitHub
 Release notes.
 
+## Unreleased
+
+### Changed
+
+- **Docs site migrated from Material for MkDocs to
+  [Zensical](https://zensical.org)**, the successor from the same team.
+  Material entered maintenance mode in November 2025 and now warns on every
+  build that MkDocs 2.0 will remove the plugin and theming systems with no
+  migration path. `mkdocs.yml` is replaced by a native `zensical.toml`;
+  documentation content is unchanged.
+
+  The look now comes from the shared
+  [stridelabs-docs-theme](https://github.com/charliek/stridelabs-docs-theme)
+  package rather than per-repo config, so restyling every site is a version
+  bump instead of an edit in each repo. Fonts are self-hosted by the theme, so
+  the site no longer requests anything from `fonts.googleapis.com` or
+  `fonts.gstatic.com`.
+
+  Verified against the pre-migration build: identical 11-page set and all 89
+  heading anchors preserved, so existing deep links still resolve. Page
+  `<title>` now derives from the page `<h1>` rather than the nav label, which
+  is the one intentional difference.
+
+### Added
+
+- **`Docs PR Build` workflow.** Docs previously built only on push to `main`,
+  and without `--strict`, so a broken link or heading anchor could land on
+  `main` and be caught at deploy time or not at all. Both workflows now build
+  `--strict` and watch `uv.lock`.
+
 ## v0.0.7 — 2026-07-26
 
 Milestones 11–13 — the diff pane becomes one continuous stream: files flow past
