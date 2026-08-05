@@ -2,8 +2,12 @@
 /target/
 **/*.rs.bk
 
-# mkdocs build output
+# Docs build output
 /site-build/
+
+# Zensical differential-build cache (root only -- the anchor keeps this
+# from also swallowing a nested .cache/ elsewhere in the tree)
+/.cache/
 
 # Python / uv (docs tooling)
 .venv/
