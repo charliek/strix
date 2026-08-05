@@ -186,8 +186,8 @@ wheels = [
 
 [[package]]
 name = "stridelabs-docs-theme"
-version = "0.2.1"
-source = { git = "https://github.com/charliek/stridelabs-docs-theme?tag=v0.2.1#ba1a8de4b387a7cf6f73d466b8b215c356eb68f6" }
+version = "0.2.2"
+source = { git = "https://github.com/charliek/stridelabs-docs-theme?tag=v0.2.2#6ce3083a4110817b45c39ad0160fd76c5d01cf1a" }
 dependencies = [
     { name = "zensical" },
 ]
@@ -207,7 +207,7 @@ docs = [
 
 [package.metadata.requires-dev]
 docs = [
-    { name = "stridelabs-docs-theme", git = "https://github.com/charliek/stridelabs-docs-theme?tag=v0.2.1" },
+    { name = "stridelabs-docs-theme", git = "https://github.com/charliek/stridelabs-docs-theme?tag=v0.2.2" },
     { name = "zensical", specifier = ">=0.0.52" },
 ]
 

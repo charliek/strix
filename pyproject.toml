@@ -15,4 +15,4 @@ docs = [
 # PRs from forks. The tag is mutable; uv.lock pins the resolved commit SHA,
 # which is why every docs build uses --locked.
 [tool.uv.sources]
-stridelabs-docs-theme = { git = "https://github.com/charliek/stridelabs-docs-theme", tag = "v0.2.1" }
+stridelabs-docs-theme = { git = "https://github.com/charliek/stridelabs-docs-theme", tag = "v0.2.2" }
