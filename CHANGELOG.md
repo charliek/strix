@@ -38,6 +38,13 @@ Release notes.
   `main` and be caught at deploy time or not at all. Both workflows now build
   `--strict` and watch `uv.lock`.
 
+- **Fixed the docs header lockup overlapping the site title in the mobile
+  drawer.** Behind the hamburger menu on a phone, the divider and project icon
+  painted on top of the site name. Zensical sizes that drawer slot for a single
+  glyph, so the wider lockup overflowed it. Fixed upstream in
+  [stridelabs-docs-theme](https://github.com/charliek/stridelabs-docs-theme)
+  v0.2.2; this bumps the pin. Desktop was never affected.
+
 ## v0.0.7 — 2026-07-26
 
 Milestones 11–13 — the diff pane becomes one continuous stream: files flow past
