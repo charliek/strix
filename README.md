@@ -111,7 +111,7 @@ writes the bundled skill to disk and prints its absolute path. See the
 
 ## Documentation
 
-The full site lives under `docs/` and builds with `mkdocs-material`
+The full site lives under `docs/` and builds with [Zensical](https://zensical.org)
 (`make docs-serve` → http://127.0.0.1:7071):
 
 - [Installation](docs/getting-started/installation.md)

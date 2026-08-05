@@ -6,7 +6,13 @@ requires-python = ">=3.12"
 
 [dependency-groups]
 docs = [
-    "mkdocs>=1.6.1,<2.0",
-    "mkdocs-material>=9.6",
-    "pymdown-extensions>=10.15",
+    "zensical>=0.0.52",
+    "stridelabs-docs-theme",
 ]
+
+# The shared theme is a plain git dependency, not a registry package -- these
+# are public repos with public docs builds, so an auth-gated index would break
+# PRs from forks. The tag is mutable; uv.lock pins the resolved commit SHA,
+# which is why every docs build uses --locked.
+[tool.uv.sources]
+stridelabs-docs-theme = { git = "https://github.com/charliek/stridelabs-docs-theme", tag = "v0.2.1" }

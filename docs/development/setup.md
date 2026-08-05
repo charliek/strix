@@ -48,8 +48,9 @@ backend, and prints the cell grid as text.
 every pull request into `main` and on every push to `main`. The pull-request
 run is the required gate: strix has outside users, so nothing lands on `main`
 without going through a PR and a green CI run — see the branch policy in
-`CLAUDE.md`. `.github/workflows/docs.yml` builds the mkdocs site and deploys
-it to GitHub Pages when a push to `main` touches `docs/`.
+`CLAUDE.md`. `.github/workflows/docs.yml` builds the docs site and deploys it
+to GitHub Pages when a push to `main` touches `docs/`, and
+`.github/workflows/docs-pr.yml` runs the same strict build on pull requests.
 
 ## Contributing
 

@@ -48,7 +48,7 @@ The maintainer runs step 1; everything else is automated.
 
 NOT bumped:
 
-- `pyproject.toml` (`strix-docs`) — docs-site tooling for MkDocs, not a release
+- `pyproject.toml` (`strix-docs`) — docs-site tooling, not a release
   artifact; its version is unrelated to the binary's
 
 ## Snapshot / dev versioning
