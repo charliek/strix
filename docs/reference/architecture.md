@@ -272,17 +272,38 @@ same-file refresh preserves it, matching `diff_scroll`'s convention.
 
 **Cross-file scroll.** With `cross_file_scroll` on (key `f`; Status and
 Review only — History is excluded and never crossed), every file's layout
-gains a `FileHeaderRow` at row 0 (`RowContent::FileHeader`, addressed as
-`RowTarget::FileHeader`) — one physical row, always
-truncated rather than wrapped, never h-shifted — built once from the same
-`stat_spans` core the review/history file lists use, never re-derived per
-frame; `LayoutKey` gains `cross_file`, so toggling `f` rebuilds the layout.
-The conceptual document is the concatenation of every file's layout in list
-order, but strix never materializes it: `App::diff_window` renders a
-viewport-sized `DiffWindow` — the selected file (the *anchor*) from the
-current scroll offset, then as many following files' prepared `FileSection`s
-(each a `WindowSegment`) as fit — and `App::ensure_diff_window` prepares
-exactly what that window needs on the event path, never during render.
+gains one or two `FileHeaderRow`s at the top (`RowContent::FileHeader`,
+addressed as `RowTarget::FileHeader`) — always truncated rather than
+wrapped, never h-shifted, resolved once when the layout is built and never
+re-derived per frame; `LayoutKey` gains `cross_file`, so toggling `f`
+rebuilds the layout. The conceptual document is the concatenation of every
+file's layout in list order, but strix never materializes it: `App::diff_window`
+renders a viewport-sized `DiffWindow` — the selected file (the *anchor*) from
+the current scroll offset, then as many following files' prepared
+`FileSection`s (each a `WindowSegment`) as fit — and `App::ensure_diff_window`
+prepares exactly what that window needs on the event path, never during
+render.
+
+**The file header's two rows.** The stream's first file leads with a single
+row, the header band; every file below it gets a separating `─` rule row
+above the band, because the first file's rule would separate it from
+nothing and would double up with the pane's own top border. Both rows share
+one `RowTarget::FileHeader`, differing only in a `HeaderPart` (`Rule` or
+`Band`) stamped onto an otherwise-identical `FileHeaderRow` payload — the
+same shape a comment box uses for its border/body/border rows — so the pair
+is a single cursor stop with no row-count arithmetic anywhere in the scroll,
+walk, or click code. The rule is drawn identically wherever it lands on
+screen, including the pane's own top row after a sidebar jump to a
+non-first file: keying its render on screen position would break the two
+properties the stream rests on, that a wheel tick is a pure translation of
+the body and that a strip row is cell-identical to the same row drawn as
+the anchor. Whether a file is first is per-file, not pane-global, so it
+isn't part of `LayoutKey` (which holds only things like width, mode, wrap,
+line numbers, and the cross-file toggle above); instead `CachedLayout`
+carries a `first` flag that `diff_layout` compares against the anchor's
+current stream position on every read, so a watcher tick that adds a file
+sorting above the anchor rebuilds its header — even though the path, the
+diff, and every `LayoutKey` input are unchanged.
 
 **Scroll domain and the handoff.** `diff_scroll` stays anchor-relative
 (anchor = the selected file, unchanged single source of truth). Let `R` be
