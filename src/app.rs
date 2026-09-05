@@ -349,19 +349,38 @@ pub enum RowContent {
     Box(BoxRow),
     /// One physical row of the in-place comment editor (plan §3.5).
     Editor(EditorPart),
-    /// The file's header row, present only with cross-file scroll on (plan 006
-    /// §3.1) — always exactly one physical row at the top of the file's layout.
+    /// One physical row of the file's header, present only with cross-file scroll
+    /// on (plan 006 §3.1). The stream's first file leads with the band alone; every
+    /// file below it gets a separating rule row above the band (plan 008 §3.5), so
+    /// the header is one or two rows sharing a single [`RowTarget::FileHeader`].
     FileHeader(FileHeaderRow),
+}
+
+/// Which physical part of a two-row file header a row draws (plan 008 §3.5). Both
+/// rows carry the same [`FileHeaderRow`] payload, differing only here — the same
+/// shape a comment box uses ([`BoxPart`]), which is what makes the pair a single
+/// cursor stop without any row-count arithmetic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeaderPart {
+    /// The separator rule above a header, drawn for every file but the first.
+    Rule,
+    /// The header band itself: bar, marker, prefix, chip, counts.
+    Band,
 }
 
 /// The render payload of a [`RowContent::FileHeader`] row: everything the band
 /// draws, resolved once when the layout is built (plan 006 §3.1) so no frame
 /// re-derives it. The marker's colour is named ([`MarkerTone`]) rather than
-/// resolved, because a theme cycle does not rebuild the layout.
+/// resolved, because a theme cycle does not rebuild the layout. A header's rule
+/// and band rows carry identical payloads apart from `part` (plan 008 §3.5).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileHeaderRow {
     pub marker: char,
     pub tone: MarkerTone,
+    /// Which of the header's physical rows this is — stamped by [`header_rows`],
+    /// which is the only place a payload becomes rows; the payload builders leave
+    /// it `Band`.
+    pub part: HeaderPart,
     /// Everything of the file's list label before the basename, drawn dim: the
     /// directory, and the whole old path for a rename. May be empty.
     pub prefix: String,
@@ -425,9 +444,14 @@ pub struct LayoutRow {
 /// Everything a built layout depends on: a resize (`width`), a diff-mode toggle
 /// (`mode`), a wrap toggle (`wrap`), a line-number toggle (`line_numbers`, which
 /// changes the gutter width and hence the wrap content width), or a cross-file
-/// toggle (`cross_file`, which adds the file-header row — plan 006 §3.1) each
-/// rebuild it. Three of the five are `bool`, so they are named rather than
-/// positional.
+/// toggle (`cross_file`, which adds the file header — plan 006 §3.1) each rebuild
+/// it. Three of the five are `bool`, so they are named rather than positional.
+///
+/// The file's *stream index* is deliberately not a key input: it decides only
+/// whether the header carries its rule row, it is not shared by the whole stream
+/// the way these five are, and a section is only ever read back at the index it
+/// was built for. The anchor's own index change is caught by
+/// [`CachedLayout::first`] instead (plan 008 §3.5).
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct LayoutKey {
     width: u16,
@@ -441,6 +465,12 @@ struct LayoutKey {
 /// `RowTarget`s survive a rebuild (plan §3.3).
 struct CachedLayout {
     key: LayoutKey,
+    /// Whether the file was the stream's first when these rows were built — the
+    /// header's rule row hangs off it, and it is *not* part of [`LayoutKey`]
+    /// because it is per-file rather than pane-global. A watcher tick that adds a
+    /// file sorting above the anchor changes this without changing the path, the
+    /// diff or the key, so `diff_layout` compares it on every read (plan 008 §3.5).
+    first: bool,
     rows: Vec<LayoutRow>,
 }
 
@@ -459,7 +489,9 @@ struct FilePlacements {
 struct LayoutInput<'a> {
     diff: Option<&'a FileDiff>,
     placements: FilePlacements,
-    header: Option<LayoutRow>,
+    /// The file's header rows: empty with cross-file scroll off, one row (the
+    /// band) for the stream's first file, two (rule then band) below it.
+    header: Vec<LayoutRow>,
     editor: bool,
 }
 
@@ -763,8 +795,10 @@ pub enum RowTarget {
     /// The in-place editor box (plan §3.5). Only ever one at a time; keys route to
     /// it before the keymap, so the file cursor never navigates onto it.
     Editor,
-    /// The file's header row (plan 006 §3.1) — one cursor stop, anchoring nothing:
-    /// `c`, double-click-to-edit, and `x` are all no-ops on it.
+    /// The file's header (plan 006 §3.1) — one cursor stop, anchoring nothing:
+    /// `c`, double-click-to-edit, and `x` are all no-ops on it. One physical row
+    /// for the stream's first file, two (rule then band) for every file below it
+    /// (plan 008 §3.5).
     FileHeader,
 }
 
@@ -5475,8 +5509,13 @@ impl App {
     /// renderer.
     pub fn diff_layout(&self, width: u16) -> Ref<'_, Vec<LayoutRow>> {
         let current = self.layout_key(width);
-        let previous = self.layout.borrow().as_ref().map(|c| c.key);
-        if previous != Some(current) {
+        let first = self.stream_position() == Some(0);
+        let cached = self.layout.borrow().as_ref().map(|c| (c.key, c.first));
+        let previous = cached.map(|(key, _)| key);
+        // A stale `first` is a stale header (the rule row appears or goes) even
+        // when every key input still matches, so it forces a rebuild too — and it
+        // does so through the same branch, keeping the top-line anchoring below.
+        if cached != Some((current, first)) {
             // Anchor the top visible logical line across a *structural* relayout —
             // a resize, a wrap toggle, or a line-number toggle — so the row the
             // user was reading stays at the top (plan §3.3). Skip it when the mode
@@ -5513,7 +5552,20 @@ impl App {
                 let row = rows.iter().position(|r| r.target == target).unwrap_or(0);
                 self.diff_scroll.set(row);
             }
-            *self.layout.borrow_mut() = Some(CachedLayout { key: current, rows });
+            // An index-driven rebuild has no key change behind it, so nothing else
+            // refreshes the scroll metrics the way a resize or a mode toggle does —
+            // and the header just grew or lost a row. The event loop drains queued
+            // input before redrawing, so a `j` in the same batch would otherwise
+            // clamp against the pre-refresh row count and walk clean off the file.
+            // Same reasoning, and same call, as `set_cross_file_scroll`.
+            if previous == Some(current) {
+                self.set_diff_metrics(self.diff_viewport.get(), rows.len());
+            }
+            *self.layout.borrow_mut() = Some(CachedLayout {
+                key: current,
+                first,
+                rows,
+            });
         }
         Ref::map(self.layout.borrow(), |cached| {
             &cached.as_ref().expect("filled above").rows
@@ -5528,20 +5580,20 @@ impl App {
     }
 
     /// The build inputs for the active file: its diff, its comment placements, its
-    /// header row, and the in-place editor (only ever the active file's).
+    /// header rows, and the in-place editor (only ever the active file's).
     fn active_layout_input(&self) -> LayoutInput<'_> {
         let diff = self.active_diff();
         LayoutInput {
             diff,
             placements: self.file_placements(self.comment_path(), diff),
-            header: self.file_header_row(),
+            header: self.file_header_rows(),
             editor: true,
         }
     }
 
     /// Build one file's physical layout at pane width `width`: the code rows for
     /// the current mode interleaved with that file's comment boxes, or (for an
-    /// empty/binary/no diff) just its orphan boxes, led by its header row. When
+    /// empty/binary/no diff) just its orphan boxes, led by its header rows. When
     /// the in-place editor is open *and* this is the active file, its box is
     /// injected too — after the anchored code line for a new comment, or in place
     /// of the edited comment's box (plan §3.5).
@@ -5599,8 +5651,10 @@ impl App {
             rows = block;
         }
         // Ahead of the orphan block, in both modes (plan 006 §3.1).
-        if let Some(header) = input.header {
-            rows.insert(0, header);
+        if !input.header.is_empty() {
+            let mut header = input.header;
+            header.append(&mut rows);
+            rows = header;
         }
         rows
     }
@@ -5625,22 +5679,29 @@ impl App {
         }
     }
 
-    /// The active file's header row (plan 006 §3.1; History is never crossed, so
+    /// The active file's header rows (plan 006 §3.1; History is never crossed, so
     /// it has none). Its whole payload — marker, display path, counts — is resolved
-    /// once per layout build, so rendering never re-derives it.
-    fn file_header_row(&self) -> Option<LayoutRow> {
+    /// once per layout build, so rendering never re-derives it. The stream's first
+    /// file gets the band alone; below it the band is led by a rule row (plan 008
+    /// §3.5), which is why this reads the anchor's stream index.
+    fn file_header_rows(&self) -> Vec<LayoutRow> {
         if !self.cross_file_scroll {
-            return None;
+            return Vec::new();
         }
         let header = match self.view {
-            ViewMode::Status => {
-                let (section, entry) = self.selected_file()?;
-                status_header(section, entry, self.active_diff()?)
-            }
-            ViewMode::Review => review_header(self.review_files().get(self.review_selected())?),
-            ViewMode::History => return None,
+            ViewMode::Status => self
+                .selected_file()
+                .zip(self.active_diff())
+                .map(|((section, entry), diff)| status_header(section, entry, diff)),
+            ViewMode::Review => self
+                .review_files()
+                .get(self.review_selected())
+                .map(review_header),
+            ViewMode::History => None,
         };
-        Some(header_row(header))
+        header.map_or_else(Vec::new, |header| {
+            header_rows(header, self.stream_position() == Some(0))
+        })
     }
 
     // --- The stream: identities, sections, window (plan 006 §3.3–3.4) ---
@@ -5724,7 +5785,13 @@ impl App {
     /// Compute one file's section: its diff plus the rows built from that diff at
     /// the current layout key. The only place a *non-selected* file's diff is read,
     /// and it runs on the event path (`ensure_diff_window`) — never during render.
-    fn compute_section(&self, id: &FileId, width: u16) -> Option<FileSection> {
+    ///
+    /// `index` is the file's stream position, which decides whether its header
+    /// carries a rule row (plan 008 §3.5). The caller always knows it, so it is
+    /// passed rather than looked up: `stream_index_of_exact` would answer the same
+    /// question with a list walk, and the section is only ever read back at the
+    /// index it was built for.
+    fn compute_section(&self, id: &FileId, index: usize, width: u16) -> Option<FileSection> {
         let (diff, header) = match id {
             FileId::Status { section, path } => {
                 let entry = self.status_entry(*section, path)?;
@@ -5746,7 +5813,11 @@ impl App {
         let input = LayoutInput {
             diff: Some(&diff),
             placements: self.file_placements(Some(id.path()), Some(&diff)),
-            header: self.cross_file_scroll.then(|| header_row(header)),
+            header: if self.cross_file_scroll {
+                header_rows(header, index == 0)
+            } else {
+                Vec::new()
+            },
             editor: false,
         };
         let rows = self.build_file_layout(input, width);
@@ -5863,7 +5934,7 @@ impl App {
         if let Some(section) = self.sections.borrow_mut().get(&id, key, generation) {
             return Some(section);
         }
-        let section = Rc::new(self.compute_section(&id, width)?);
+        let section = Rc::new(self.compute_section(&id, index, width)?);
         self.sections
             .borrow_mut()
             .insert(id, key, generation, Rc::clone(&section));
@@ -6172,9 +6243,13 @@ impl App {
         }
         // The arriving file's rows *are* its section's (C2 builds both through one
         // seam), so the layout is installed rather than rebuilt. The generation
-        // bump keeps a double-click straddling the flip inert.
+        // bump keeps a double-click straddling the flip inert. `first` records the
+        // index the section was *built* at — `to`, which is also the index the
+        // selection now sits at — so the next `diff_layout` read agrees with it
+        // instead of rebuilding these rows away (plan 008 §3.5).
         *self.layout.borrow_mut() = Some(CachedLayout {
             key,
+            first: to == 0,
             rows: section.rows.clone(),
         });
         self.layout_generation.set(self.layout_generation.get() + 1);
@@ -6201,7 +6276,9 @@ impl App {
 
     /// Store the current anchor's diff + built rows as its stream section, so the
     /// file a flip leaves behind stays warm. Skipped when its layout was built for
-    /// a different key (it would be discarded on the next read anyway).
+    /// a different key, or at a stream index whose header differs from the one it
+    /// holds now (either way the rows would be rebuilt on the next read anyway,
+    /// and caching them would hand a stale header to the strip).
     fn retire_anchor_section(&mut self, key: LayoutKey, generation: u64) {
         let Some(id) = self.active_file_id() else {
             return;
@@ -6209,8 +6286,9 @@ impl App {
         let Some(diff) = self.active_diff().cloned() else {
             return;
         };
+        let first = self.stream_position() == Some(0);
         let rows = match self.layout.borrow().as_ref() {
-            Some(cached) if cached.key == key => cached.rows.clone(),
+            Some(cached) if cached.key == key && cached.first == first => cached.rows.clone(),
             _ => return,
         };
         self.sections
@@ -7030,14 +7108,15 @@ impl App {
     }
 
     /// Flip cross-file scroll on/off — the single seam both the `f` key and the
-    /// View-menu item go through, because turning it *off* retires the file-header
-    /// row and two things depend on that row existing:
+    /// View-menu item go through, because turning it *off* retires the file header
+    /// and two things depend on those rows existing:
     ///
     /// - a cursor pinned to `RowTarget::FileHeader` no longer resolves, and the
     ///   `(0, 1)` span fallback would make the next `j` skip physical row 0;
-    /// - the row count changes by one, so the scroll metrics a same-batch wheel
-    ///   tick or click clamps against are stale until the next render (the same
-    ///   drained-batch rule [`App::flip_anchor`] follows).
+    /// - the row count changes by the header's height — one row for the stream's
+    ///   first file, two for any other (plan 008 §3.5) — so the scroll metrics a
+    ///   same-batch wheel tick or click clamps against are stale until the next
+    ///   render (the same drained-batch rule [`App::flip_anchor`] follows).
     fn set_cross_file_scroll(&mut self, on: bool) {
         self.cross_file_scroll = on;
         if !on && self.pinned_anchor_target() == Some(RowTarget::FileHeader) {
@@ -7846,6 +7925,7 @@ fn status_header(section: Section, entry: &FileEntry, diff: &FileDiff) -> FileHe
     FileHeaderRow {
         marker: entry.change.marker(),
         tone: MarkerTone::for_status(section, entry.change),
+        part: HeaderPart::Band,
         prefix,
         name,
         stat: crate::git::diff::stat_of(diff),
@@ -7859,19 +7939,31 @@ fn review_header(file: &CommitFile) -> FileHeaderRow {
     FileHeaderRow {
         marker: file.change.marker(),
         tone: MarkerTone::for_change_kind(file.change),
+        part: HeaderPart::Band,
         prefix,
         name,
         stat: file.stat,
     }
 }
 
-/// Wrap a header payload as the one physical row that leads a file's layout.
-fn header_row(header: FileHeaderRow) -> LayoutRow {
-    LayoutRow {
+/// Wrap a header payload as the physical rows that lead a file's layout: the band
+/// alone for the stream's `first` file, a separating rule above it for every file
+/// below (plan 008 §3.5). Both rows share one [`RowTarget::FileHeader`] with an
+/// incrementing `subrow`, so the header stays a single cursor stop.
+fn header_rows(header: FileHeaderRow, first: bool) -> Vec<LayoutRow> {
+    let row = |subrow: usize, part: HeaderPart| LayoutRow {
         target: RowTarget::FileHeader,
-        subrow: 0,
+        subrow,
         side: None,
-        content: RowContent::FileHeader(header),
+        content: RowContent::FileHeader(FileHeaderRow {
+            part,
+            ..header.clone()
+        }),
+    };
+    if first {
+        vec![row(0, HeaderPart::Band)]
+    } else {
+        vec![row(0, HeaderPart::Rule), row(1, HeaderPart::Band)]
     }
 }
 

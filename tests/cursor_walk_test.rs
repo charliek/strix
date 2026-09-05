@@ -40,8 +40,10 @@ const H: u16 = 24;
 /// Two short untracked files: at width 120 both fit in one viewport, so `b.txt`
 /// is a strip below the `a.txt` anchor from the first prepared window on.
 ///
-/// Rows per file, cross-file on: a file header, the `@@` hunk row, then one row
-/// per added line — `a.txt` is 4 rows, `b.txt` is 5.
+/// Rows per file, cross-file on: the file header, the `@@` hunk row, then one row
+/// per added line. The header is one row (the band) for `a.txt`, the stream's
+/// first file, and two (rule + band) for `b.txt` — so `a.txt` is 4 rows and
+/// `b.txt` is 6 (plan 008 §3.5).
 fn two_short_files() -> TempDir {
     let repo = init_repo();
     write(repo.path(), "a.txt", "a one\na two\n");
@@ -49,9 +51,10 @@ fn two_short_files() -> TempDir {
     repo
 }
 
-/// Two 40-line files (42 rows each), so the strip only appears once the
-/// viewport overruns the anchor — the state divergence actually requires — and
-/// the stream is deep enough below it for a wheel flip to renormalize.
+/// Two 40-line files — 42 rows for `a.txt` and 43 for `b.txt`, whose header
+/// carries a rule row — so the strip only appears once the viewport overruns the
+/// anchor (the state divergence actually requires) and the stream is deep enough
+/// below it for a wheel flip to renormalize.
 fn two_tall_files() -> TempDir {
     let repo = init_repo();
     let tall: String = (0..40).map(|i| format!("alpha {i}\n")).collect();
@@ -192,14 +195,15 @@ fn a_divergent_cursor_highlights_its_own_strip_row() {
 
     assert!(app.place_cursor(address(unstaged("b.txt"), RowTarget::Code(2))));
 
-    // Resolution: b.txt's own rows are [header, hunk, Code(1), Code(2), Code(3)],
-    // so `Code(2)` is its row 3; the anchor draws 4 rows above it.
+    // Resolution: b.txt is not the stream's first file, so its own rows are
+    // [rule, band, hunk, Code(1), Code(2), Code(3)] and `Code(2)` is its row 4;
+    // the anchor draws 4 rows above it.
     assert_eq!(
         app.cursor_highlight_span(),
-        Some((unstaged("b.txt"), 3..4)),
+        Some((unstaged("b.txt"), 4..5)),
         "the highlight is (file, per-file span)"
     );
-    assert_eq!(app.cursor_window_span(), Some(7..8));
+    assert_eq!(app.cursor_window_span(), Some(8..9));
 
     let area = app.diff_area();
     let buf = render_buffer(&app, W, H);
@@ -722,8 +726,9 @@ fn the_cursor_walks_through_two_files_while_the_first_stays_anchored() {
     // Off the end of a.txt: the next press is the boundary, and every press after
     // it walks the *cursor* alone — the stream already fits the viewport, so
     // there is nothing for the anchor to follow (plan 007 §3.3f). Nothing scrolls
-    // either, so the highlight itself advances one screen row per press, right
-    // through the boundary.
+    // either, so the highlight advances a target at a time, right through the
+    // boundary — one screen row per press across a.txt's one-row targets, and the
+    // press that crosses into b.txt lands on its header's first row.
     for press_no in 1..=rows {
         press(&mut app, 'j');
         assert_eq!(
@@ -738,12 +743,15 @@ fn the_cursor_walks_through_two_files_while_the_first_stays_anchored() {
     );
     assert_eq!(common::selected_path(&app), "a.txt");
 
+    // b.txt is not the stream's first file, so its header is two rows under one
+    // target (plan 008 §3.5): stepping off it lands past *both*, and crossing the
+    // file takes one press fewer than it has rows.
     let b_rows = window_of(&app).segments[1].rows();
-    for press_no in 1..=b_rows {
+    for press_no in 1..b_rows {
         press(&mut app, 'j');
         assert_eq!(
             cursor_screen_row(&app),
-            app.diff_area().y + (rows + press_no) as u16,
+            app.diff_area().y + (rows + press_no + 1) as u16,
             "press {press_no} of the second boundary"
         );
     }
@@ -772,25 +780,33 @@ fn a_walk_across_a_boundary_scrolls_a_row_per_press_and_flips_at_the_threshold()
     assert_eq!(app.diff_scroll.get(), r_a - v);
     let mut before = body(&app);
 
-    // Each press walks one stop into b.txt and pulls the view down exactly one
-    // row: the boundary stays on screen (a.txt's tail above, b.txt's head below)
-    // instead of the whole viewport teleporting.
-    for press_no in 1..=v {
+    // Each press walks one stop into b.txt and pulls the view down: the boundary
+    // stays on screen (a.txt's tail above, b.txt's head below) instead of the
+    // whole viewport teleporting. The *first* press pulls two rows, not one —
+    // b.txt's header is a two-row target since plan 008 §3.5, and revealing a
+    // target reveals its whole span, exactly as landing on a comment box does.
+    for press_no in 1..v {
         press(&mut app, 'j');
         let after = body(&app);
-        assert_shift_down(&before, &after, 1);
+        assert_shift_down(&before, &after, if press_no == 1 { 2 } else { 1 });
         if press_no == 1 {
             // The boundary frame: a.txt's tail still fills the pane, with b.txt's
-            // header arriving on the bottom row under the cursor.
+            // rule and band arriving together and the band — the row the cursor
+            // sits on — on the bottom row.
             assert!(
                 after[v - 1].contains("b.txt"),
-                "the arriving header: {}",
+                "the arriving band: {}",
                 after[v - 1]
             );
             assert!(
-                after[v - 2].contains("alpha"),
-                "the departed tail above it: {}",
+                after[v - 2].chars().all(|c| c == '─'),
+                "its rule row above it: {}",
                 after[v - 2]
+            );
+            assert!(
+                after[v - 3].contains("alpha"),
+                "the departed tail above that: {}",
+                after[v - 3]
             );
         }
         before = after;
@@ -800,25 +816,31 @@ fn a_walk_across_a_boundary_scrolls_a_row_per_press_and_flips_at_the_threshold()
             "press {press_no}: {}",
             title(&app)
         );
-        assert_eq!(app.diff_scroll.get(), r_a - v + press_no);
+        assert_eq!(app.diff_scroll.get(), r_a - v + press_no + 1);
         assert_eq!(
             app.cursor_address().map(|a| a.file),
             Some(unstaged("b.txt")),
             "press {press_no}: the cursor is in the file below"
         );
+        // The target's *last* row rides the bottom edge — which on press 1 is the
+        // band of a two-row header whose rule sits the row above it.
         assert_eq!(
-            cursor_screen_row(&app),
-            app.diff_area().y + v as u16 - 1,
+            app.cursor_window_span()
+                .expect("the cursor is in the window")
+                .end,
+            v,
             "press {press_no}: riding the bottom edge"
         );
     }
 
-    // Press V + 1 is the first whose reveal puts the top past R_anchor — 006's
-    // strict hysteresis, the same threshold the wheel flips at.
+    // Press V is the first whose reveal puts the top past R_anchor — 006's strict
+    // hysteresis, the same threshold the wheel flips at. It comes one press
+    // earlier than it did with a one-row header, because the two-row arrival
+    // spent an extra row on press 1.
     press(&mut app, 'j');
     let after = body(&app);
     assert_shift_down(&before, &after, 1);
-    assert_eq!(app.selected, 1, "the anchor flipped on press {}", v + 1);
+    assert_eq!(app.selected, 1, "the anchor flipped on press {v}");
     assert!(title(&app).contains("b.txt"), "{}", title(&app));
     assert_eq!(app.diff_scroll.get(), 1, "(B, 1): one row past the top");
     // The flip is cursor-preserving: the walk carried on from where it was, and
@@ -898,7 +920,9 @@ fn the_wheel_boundary_state_and_the_walk_share_one_threshold() {
 
     // From here the cursor walks down the visible strip with the view still, and
     // the anchor changes hands only when the reveal has to push past R_anchor.
-    for press_no in 2..=v {
+    // One press fewer than with a one-row header: the walk left b.txt's header
+    // for its row 2, not its row 1, because the header's two rows are one target.
+    for press_no in 2..v {
         press(&mut app, 'j');
         assert_eq!(app.selected, 0, "press {press_no}");
         assert_eq!(
@@ -1099,7 +1123,7 @@ fn a_half_page_into_a_comment_box_resumes_from_the_boxs_first_row() {
 
 /// A stream whose four entries cover the awkward cases in one fixture: a path
 /// listed twice (staged *and* modified, two entries that differ only by
-/// [`FileId`]) and a binary file whose header row is its whole section.
+/// [`FileId`]) and a binary file whose header is its whole section.
 fn oracle_repo() -> TempDir {
     let repo = dup_path_repo();
     write(repo.path(), "bin.dat", "a\0b\0c\n"); // NUL bytes → a binary diff
@@ -1204,6 +1228,34 @@ impl Oracle {
         // not a shortcut in the model; see
         // `a_half_page_into_a_comment_box_resumes_from_the_boxs_first_row`.
         let span = self.span(self.cursor);
+        // The tall-target rule (plan 006 §3.5), consulted before any crossing: a
+        // *converged* cursor whose target already reaches its file's edge scrolls
+        // inside the anchor rather than stepping off rows the user hasn't seen,
+        // unless the anchor is at its own hard edge already. Two-row file headers
+        // (plan 008 §3.5) are the first target that can outgrow the viewport
+        // without a comment box, so the model has to carry the rule now: at V = 1
+        // a `j` on a header-only file's header scrolls onto its band first.
+        if self.file_of(self.cursor) == self.anchor {
+            let file = self.anchor;
+            let base = self.start_of(file);
+            let stuck = if down {
+                span.end - base >= self.rows[file]
+            } else {
+                span.start == base
+            };
+            let max_top = self.rows[file].saturating_sub(self.viewport);
+            let offset = (self.top - base).min(max_top);
+            let at_hard_edge = if down { offset >= max_top } else { offset == 0 };
+            if stuck && !at_hard_edge {
+                self.top = base
+                    + if down {
+                        (offset + step).min(max_top)
+                    } else {
+                        offset.saturating_sub(step)
+                    };
+                return;
+            }
+        }
         let destination = if down {
             (span.start + step).max(span.end).min(self.total() - 1)
         } else {
@@ -1748,9 +1800,10 @@ fn diverged_on_a_clipped_box(repo: &TempDir) -> App {
     let mut app = diff_focused_app(repo);
     let v = app.diff_area().height as usize;
     let r_a = app.diff_row_count();
-    // a.txt's tail plus b.txt's first four rows: header, `@@`, the first added
-    // line, then the box's opening row.
-    app.wheel_scroll_window((r_a - v + 4) as i64);
+    // a.txt's tail plus b.txt's first five rows: its two header rows (rule and
+    // band — b.txt is not the stream's first file), `@@`, the first added line,
+    // then the box's opening row.
+    app.wheel_scroll_window((r_a - v + 5) as i64);
     assert!(app.place_cursor(address(unstaged("b.txt"), RowTarget::Comment(2))));
     assert!(
         app.cursor_window_span().is_none(),

@@ -9,7 +9,7 @@ use ratatui::Frame;
 use syntect::parsing::SyntaxReference;
 
 use crate::app::{
-    sbs_columns, App, BoxPart, BoxRow, EditorPart, FileHeaderRow, LayoutRow, PairCell,
+    sbs_columns, App, BoxPart, BoxRow, EditorPart, FileHeaderRow, HeaderPart, LayoutRow, PairCell,
     PairEmphasis, RowContent, Seg, WindowHit,
 };
 use crate::comments::Side;
@@ -247,9 +247,12 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
                 }
                 // Full-width in both modes, and unshifted: the header names the
                 // file, so `hskip` must not slide it out of the pane (plan 006 §3.1).
-                RowContent::FileHeader(header) => {
-                    file_header_line(header, theme, inner.width as usize, in_cursor)
-                }
+                RowContent::FileHeader(header) => match header.part {
+                    HeaderPart::Rule => file_rule_line(theme, inner.width as usize),
+                    HeaderPart::Band => {
+                        file_header_line(header, theme, inner.width as usize, in_cursor)
+                    }
+                },
             };
             // The band already carries the cursor colour on every span it wants
             // painted; the blanket repaint would flood its chip too (plan 008 §3.4).
@@ -530,6 +533,25 @@ fn hunk_line(line: &DiffLine, theme: &Theme) -> Line<'static> {
     Line::from(Span::styled(
         line.text.clone(),
         Style::new().fg(theme.hunk).add_modifier(Modifier::BOLD),
+    ))
+}
+
+/// The separating rule above a file header (plan 008 §3.5): `─` across the whole
+/// pane in the border colour on the plain pane background, drawn for every file
+/// but the stream's first.
+///
+/// It is drawn identically wherever it lands — the top row of the pane included.
+/// Rendering keyed on screen position would break the two invariants the stream
+/// rests on: a wheel tick is a pure translation of the body (`assert_shift_down`),
+/// and a strip row is cell-identical to the same row drawn as the anchor.
+///
+/// The rule sits inside the header's cursor span (the two rows are one stop) but
+/// never takes the cursor colour — it separates the files, it is not part of the
+/// header's body — which is why it ignores `in_cursor` rather than being handed it.
+fn file_rule_line(theme: &Theme, width: usize) -> Line<'static> {
+    Line::from(Span::styled(
+        "─".repeat(width),
+        Style::new().fg(theme.border).bg(theme.bg),
     ))
 }
 
@@ -1184,6 +1206,7 @@ mod tests {
         FileHeaderRow {
             marker: 'M',
             tone: MarkerTone::Unstaged,
+            part: HeaderPart::Band,
             prefix: prefix.to_string(),
             name: name.to_string(),
             stat: CommitStat {

@@ -150,7 +150,7 @@ fn the_window_fills_the_viewport_with_the_following_files() {
         assert_eq!(
             section.rows[0].target,
             RowTarget::FileHeader,
-            "{} leads with its own header row",
+            "{} leads with its own header",
             segment.path
         );
         assert!(matches!(section.rows[0].content, RowContent::FileHeader(_)));
@@ -264,8 +264,11 @@ fn a_prepared_section_is_reused_on_the_next_pass() {
 
 // --- capacity ---------------------------------------------------------------
 
-/// 40 untracked binary files: each section is exactly its header row, so one
-/// viewport legitimately needs more sections than the LRU budget (32).
+/// 40 untracked binary files: each section is exactly its header, so one viewport
+/// legitimately needs more sections than the LRU budget (32). The stream is 79
+/// rows — the first file's header is a lone band, every other file's is a rule
+/// plus a band (plan 008 §3.5) — so [`OVER_BUDGET_H`] is what it takes to still
+/// show all 40 at once.
 fn forty_binary_files() -> TempDir {
     let repo = init_repo();
     for i in 0..40 {
@@ -274,13 +277,20 @@ fn forty_binary_files() -> TempDir {
     repo
 }
 
+/// A frame tall enough for [`forty_binary_files`]' whole 79-row stream, so the
+/// window still pins more sections than the 32-entry budget. A 50-row frame did
+/// that while every header was one row; with two-row headers it reaches only 22
+/// files, and the over-budget pinning this fixture exists to test stops being
+/// exercised at all.
+const OVER_BUDGET_H: u16 = 84;
+
 #[test]
 fn the_window_pins_more_sections_than_the_lru_budget() {
     let repo = forty_binary_files();
-    let mut app = app_sized(&repo, false, 50);
+    let mut app = app_sized(&repo, false, OVER_BUDGET_H);
     assert!(
-        app.diff_area().height as usize >= 40,
-        "the fixture needs a viewport deeper than the budget"
+        app.diff_area().height as usize >= 79,
+        "the fixture needs a viewport deeper than the whole stream"
     );
     let win = window(&mut app);
 
@@ -297,15 +307,20 @@ fn the_window_pins_more_sections_than_the_lru_budget() {
     );
     for segment in &win.segments[1..] {
         let section = segment.section.as_ref().expect("a strip owns its section");
-        assert_eq!(section.rows.len(), 1, "a binary file is header-only");
+        assert_eq!(
+            section.rows.len(),
+            2,
+            "a binary file below the stream's first is header-only: rule + band"
+        );
         assert_eq!(section.rows[0].target, RowTarget::FileHeader);
+        assert_eq!(section.rows[1].target, RowTarget::FileHeader);
     }
 }
 
 #[test]
 fn sections_the_window_no_longer_needs_are_lru_evicted() {
     let repo = forty_binary_files();
-    let mut app = app_sized(&repo, false, 50);
+    let mut app = app_sized(&repo, false, OVER_BUDGET_H);
     window(&mut app);
     assert_eq!(app.cached_section_count(), 39);
 
@@ -442,10 +457,11 @@ fn each_file_wraps_at_its_own_line_number_gutter() {
         .section
         .as_ref()
         .expect("the big file is a strip");
-    // header + hunk header + 10 000 one-row lines + the two-row long line.
+    // rule + band + hunk header + 10 000 one-row lines + the two-row long line
+    // (`b_big.txt` sorts second, so its header carries a rule row).
     assert_eq!(
         section.rows.len(),
-        1 + 1 + 10_000 + 2,
+        2 + 1 + 10_000 + 2,
         "the long line wrapped at the big file's own content width"
     );
 
@@ -456,7 +472,7 @@ fn each_file_wraps_at_its_own_line_number_gutter() {
     assert_eq!(app.active_path(), Some("b_big.txt"));
     assert_eq!(
         app.diff_row_count(),
-        1 + 1 + 10_000 + 2,
+        2 + 1 + 10_000 + 2,
         "the standalone layout matches the section row for row"
     );
 }
