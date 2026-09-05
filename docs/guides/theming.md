@@ -61,6 +61,8 @@ del = "#f7768e"
 del_bg = "#312027"
 del_emph = "#642a3c"
 filler_bg = "#232431"
+file_header_bg = "#282a38"
+file_header_chip_bg = "#373a4b"
 hunk = "#7dcfff"
 comment = "#bb9af7"
 ```
@@ -86,6 +88,14 @@ glance. A context pair (unchanged on both sides) and a modified pair (both
 sides present) never get this tint, on either side. Optional in a custom
 theme file; an omitted value falls back to the `base` preset's value like
 every other colour.
+
+`file_header_bg`/`file_header_chip_bg` colour the file-header row that
+separates files in the continuous diff stream (cross-file scroll on):
+`file_header_bg` is the band itself, lifted above the pane background so file
+boundaries read clearly while scrolling; `file_header_chip_bg` is the surface
+behind the chip showing the file's basename on that band. Both are optional
+in a custom theme file; an omitted one falls back to the `base` preset's
+value like every other colour.
 
 Any colour you omit falls back to the `base` preset's value, so a partial theme
 is fine.
