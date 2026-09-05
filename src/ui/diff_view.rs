@@ -16,7 +16,7 @@ use crate::comments::Side;
 use crate::git::{DiffLine, FileDiff, LineKind};
 use crate::ui::syntax::syntax_for;
 use crate::ui::theme::Theme;
-use crate::ui::{centered_hint, char_width, fit_spans, panel_block, stat_spans, text_width};
+use crate::ui::{centered_hint, char_width, fit_spans, panel_block, text_width};
 
 /// The minimum width of one line-number column (`nnnn`), so a ≤9999-line file
 /// renders the classic 4-digit gutter unchanged; wider files widen it per-diff.
@@ -201,6 +201,11 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         };
         for (k, row) in rows.iter().enumerate() {
             let screen_y = inner.y + out.len() as u16;
+            // `row_range.start + k` is the row's index in its file's own layout,
+            // the domain the span is in. Resolved before the match because the
+            // header band chooses its span colours from it (plan 008 §3.4).
+            let in_cursor =
+                cursor_span.is_some_and(|span| span.contains(&(segment.row_range.start + k)));
             let line = match &row.content {
                 RowContent::Line { line: li, seg } => unified_line(
                     app,
@@ -243,14 +248,16 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
                 // Full-width in both modes, and unshifted: the header names the
                 // file, so `hskip` must not slide it out of the pane (plan 006 §3.1).
                 RowContent::FileHeader(header) => {
-                    file_header_line(header, theme, inner.width as usize)
+                    file_header_line(header, theme, inner.width as usize, in_cursor)
                 }
             };
-            // `row_range.start + k` is the row's index in its file's own layout,
-            // the domain the span is in.
-            let in_cursor =
-                cursor_span.is_some_and(|span| span.contains(&(segment.row_range.start + k)));
-            out.push(mark_cursor_row(line, in_cursor, theme));
+            // The band already carries the cursor colour on every span it wants
+            // painted; the blanket repaint would flood its chip too (plan 008 §3.4).
+            out.push(if matches!(row.content, RowContent::FileHeader(_)) {
+                line
+            } else {
+                mark_cursor_row(line, in_cursor, theme)
+            });
             window_hits.push(WindowHit {
                 id: segment.id.clone(),
                 target: row.target,
@@ -526,22 +533,132 @@ fn hunk_line(line: &DiffLine, theme: &Theme) -> Line<'static> {
     ))
 }
 
-/// The file-header row (plan 006 §3.1): the review/history file-list spans over a
-/// band of the theme's header surface. The trailing pad is what makes the band
-/// run the full pane width; `stat_spans`/`fit_spans` never set a background, so
-/// the line-level style shows through every span.
-fn file_header_line(header: &FileHeaderRow, theme: &Theme, width: usize) -> Line<'static> {
-    let spans = stat_spans(
-        header.marker,
-        header.tone,
-        header.path.clone(),
-        header.stat,
-        theme,
+/// The file-header band (plan 008 §3.3): a tone-coloured bar, the bold change
+/// marker, the dim directory prefix, the basename on its own chip, then the
+/// `+a −d` counts (or `(binary)`) ending one cell before the pane's right edge.
+///
+/// Every non-chip span carries the band background *at construction* — on the
+/// cursor row `selection_bg`, elsewhere `file_header_bg` — while the chip keeps
+/// `file_header_chip_bg` either way. The chip is the header's identity, so the
+/// cursor colour must not erase it; that is why this row paints its own cursor
+/// state instead of going through [`mark_cursor_row`] (plan 008 §3.4).
+///
+/// Truncation is deliberate rather than `fit_spans`'s left-to-right cut, which
+/// would eat the chip first. The identity order is `bar + marker`, then the chip,
+/// then the counts, then the prefix — and a prefix too wide for its budget is cut
+/// from the *left* with a leading `…` so the directory nearest the name survives.
+fn file_header_line(
+    header: &FileHeaderRow,
+    theme: &Theme,
+    width: usize,
+    in_cursor: bool,
+) -> Line<'static> {
+    if width == 0 {
+        return Line::default();
+    }
+    let tone = header.tone.color(theme);
+    let band = if in_cursor {
+        theme.selection_bg
+    } else {
+        theme.file_header_bg
+    };
+    let banded = Style::new().bg(band);
+
+    let bar = Span::styled("▌".to_string(), banded.fg(tone));
+    let marker = Span::styled(
+        format!(" {} ", header.marker),
+        banded.fg(tone).add_modifier(Modifier::BOLD),
     );
-    let mut spans = fit_spans(spans, width);
+    let chip = Span::styled(
+        format!(" {} ", header.name),
+        Style::new()
+            .bg(theme.file_header_chip_bg)
+            .fg(tone)
+            .add_modifier(Modifier::BOLD),
+    );
+    let counts = if header.stat.binary {
+        vec![Span::styled("(binary)".to_string(), banded.fg(theme.dim))]
+    } else {
+        vec![
+            Span::styled(format!("+{} ", header.stat.added), banded.fg(theme.add)),
+            Span::styled(format!("−{}", header.stat.deleted), banded.fg(theme.del)),
+        ]
+    };
+
+    // Measured, never assumed: the slot is the rendered counts plus the one
+    // trailing cell that keeps them off the pane's right edge.
+    let right: usize = counts.iter().map(|s| text_width(&s.content)).sum::<usize>() + 1;
+    let fixed = 4 + text_width(&chip.content); // bar + " m " + chip
+
+    if fixed + 1 + right <= width {
+        let prefix = fit_left(&header.prefix, width - fixed - right - 1);
+        let fill = width - fixed - right - text_width(&prefix);
+        let mut spans = vec![bar, marker];
+        if !prefix.is_empty() {
+            spans.push(Span::styled(prefix, banded.fg(theme.dim)));
+        }
+        spans.push(chip);
+        spans.push(Span::styled(" ".repeat(fill), banded));
+        spans.extend(counts);
+        spans.push(Span::styled(" ".to_string(), banded));
+        return Line::from(spans);
+    }
+    if fixed <= width {
+        return Line::from(vec![
+            bar,
+            marker,
+            chip,
+            Span::styled(" ".repeat(width - fixed), banded),
+        ]);
+    }
+    // Too narrow even for the chip: keep the bar and marker, then cut inside the
+    // chip itself so its background still frames what is left of the name.
+    let mut spans = vec![bar, marker];
+    if width <= 4 {
+        return Line::from(fit_spans(spans, width));
+    }
+    let chip_style = chip.style;
+    spans.extend(fit_spans(vec![chip], width - 4));
+    // `fit_spans` can return *fewer* columns than its budget — a wide char that
+    // won't fit before the reserved ellipsis is dropped whole — and a short row
+    // would leave the pane background showing through the band's last cells.
     let used: usize = spans.iter().map(|s| text_width(&s.content)).sum();
-    spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
-    Line::from(spans).style(Style::new().bg(theme.header_bg))
+    if used < width {
+        spans.push(Span::styled(" ".repeat(width - used), chip_style));
+    }
+    Line::from(spans)
+}
+
+/// `text` fitted into `max` columns by cutting it from the **left** with a
+/// leading `…`, so the tail — the directory nearest the basename — survives.
+/// A `max` of 0 drops the text entirely.
+fn fit_left(text: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if text_width(text) <= max {
+        return text.to_string();
+    }
+    let budget = max - 1; // the leading ellipsis
+    let mut used = 0;
+    let mut kept: Vec<char> = Vec::new();
+    for ch in text.chars().rev() {
+        let w = char_width(ch);
+        if used + w > budget {
+            break;
+        }
+        kept.push(ch);
+        used += w;
+    }
+    // Walking backwards can keep a combining mark whose base char didn't fit,
+    // which would then render glued to the ellipsis. The renderer drops a mark
+    // whose base is off-window rather than stranding it; do the same here.
+    while kept.last().is_some_and(|ch| char_width(*ch) == 0) {
+        kept.pop();
+    }
+    let mut out = String::from("…");
+    out.extend(kept.into_iter().rev());
+    out
 }
 
 /// Render one physical row of a comment box (plan §3.4). Unified boxes span the
@@ -1057,6 +1174,73 @@ fn gutter_num(no: Option<usize>, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- the file-header band (plan 008 §3.3) ---
+
+    use crate::git::history::CommitStat;
+    use crate::ui::MarkerTone;
+
+    fn header(name: &str, prefix: &str) -> FileHeaderRow {
+        FileHeaderRow {
+            marker: 'M',
+            tone: MarkerTone::Unstaged,
+            prefix: prefix.to_string(),
+            name: name.to_string(),
+            stat: CommitStat {
+                added: 2,
+                deleted: 1,
+                binary: false,
+            },
+        }
+    }
+
+    fn band_width(row: &FileHeaderRow, width: usize) -> usize {
+        file_header_line(row, &Theme::default(), width, false)
+            .spans
+            .iter()
+            .map(|s| text_width(&s.content))
+            .sum()
+    }
+
+    #[test]
+    fn the_band_paints_exactly_the_pane_width_at_every_width() {
+        // Every width, not a sampled few: each truncation branch has its own
+        // arithmetic, and a short row leaves the pane background showing through
+        // the band's tail. A double-width basename is the case that caught it —
+        // the wide char is dropped whole when it can't precede the ellipsis, so
+        // the fitted chip comes back narrower than its budget.
+        for row in [
+            header("code.txt", "src/deeply/nested/"),
+            header("界界界界.txt", "src/"),
+            header("x", ""),
+        ] {
+            for width in 0..60 {
+                assert_eq!(
+                    band_width(&row, width),
+                    width,
+                    "width {width} for {:?}",
+                    row.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_left_cut_prefix_never_strands_a_combining_mark() {
+        // Walking backwards can keep a mark whose base char didn't fit; it would
+        // then render glued to the ellipsis instead of its own letter.
+        let cut = fit_left("xe\u{301}/", 3);
+        assert!(
+            !cut.chars().nth(1).is_some_and(|ch| char_width(ch) == 0),
+            "a bare mark follows the ellipsis: {cut:?}"
+        );
+        assert_eq!(
+            fit_left("src/a/b/", 5),
+            "…a/b/",
+            "the tail survives the cut"
+        );
+        assert_eq!(fit_left("src/", 0), "", "a zero budget drops the prefix");
+    }
 
     /// The visible glyphs a run of spans emits, with the trailing background pad
     /// stripped, plus the run's total display width (pad included).

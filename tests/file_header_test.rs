@@ -1,17 +1,23 @@
-//! The diff pane's file-header row (plan 006 §3.1): with cross-file scroll on,
-//! every Status/Review file's layout is led by a one-row band carrying the change
-//! marker, the display path (`old → new` for a rename), and the `+a −d` counts —
-//! the same spans the review and history file lists draw. With cross-file scroll
-//! off the row doesn't exist and every frame is what it always was.
+//! The diff pane's file-header row (plan 006 §3.1, restyled by plan 008 §3.3):
+//! with cross-file scroll on, every Status/Review file's layout is led by a
+//! one-row band carrying a tone-coloured accent bar, the change marker, the dim
+//! directory prefix, the basename on its own chip, and the `+a −d` counts at the
+//! right edge. The band's label is the file lists' label *split*, not reworded —
+//! `prefix + name` is exactly `display_path()`. With cross-file scroll off the
+//! row doesn't exist and every frame is what it always was.
 
 mod common;
 
 use std::time::{Duration, Instant};
 
 use common::{
-    cell_bg, cell_fg, click, git, init_repo, init_repo_with_diverged_branches, mouse, press, write,
+    cell_bg, cell_fg, click, git, init_repo, init_repo_with_diverged_branches,
+    init_repo_with_history, key, mouse, press, write,
 };
-use strix::app::{App, FlashKind};
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier};
+use strix::app::{App, FileHeaderRow, FlashKind, RowContent};
 use strix::config::Config;
 use strix::crossterm::event::MouseEventKind;
 use strix::terminal::dump_frame;
@@ -77,6 +83,70 @@ fn review_app(repo: &TempDir, cross_file: bool) -> App {
     App::for_review(repo.path().to_path_buf(), &config(cross_file), "main").unwrap()
 }
 
+/// `counted_repo`'s file, buried deep enough that its prefix can't fit a narrow
+/// pane — the fixture for the truncation order (plan 008 §3.3).
+fn deep_repo() -> TempDir {
+    let repo = init_repo();
+    let path = "src/very/deeply/nested/module/code.txt";
+    write(repo.path(), path, "one\ntwo\nthree\n");
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-q", "-m", "add code"]);
+    write(repo.path(), path, "one\nTWO\nthree\nfour\n");
+    repo
+}
+
+/// The band's cells across the pane on row `y`, as `(symbol, fg, bg, bold)`.
+fn band_cells(buf: &Buffer, area: Rect, y: u16) -> Vec<(String, Color, Color, bool)> {
+    (area.x..area.right())
+        .map(|x| {
+            let cell = buf.cell((x, y)).expect("a band cell");
+            (
+                cell.symbol().to_string(),
+                cell.fg,
+                cell.bg,
+                cell.modifier.contains(Modifier::BOLD),
+            )
+        })
+        .collect()
+}
+
+/// The band split by background — `(prefix, chip, whole row)`. The chip is the
+/// run of cells carrying `file_header_chip_bg`; the prefix is what sits between
+/// the bar + marker (four columns) and it.
+fn band_parts(app: &App, buf: &Buffer) -> (String, String, String) {
+    let area = app.diff_area();
+    let cells = band_cells(buf, area, area.y);
+    let chip_bg = app.theme.file_header_chip_bg;
+    let chip_start = cells
+        .iter()
+        .position(|c| c.2 == chip_bg)
+        .unwrap_or(cells.len());
+    let text = |slice: &[(String, Color, Color, bool)]| -> String {
+        slice.iter().map(|c| c.0.as_str()).collect()
+    };
+    let chip: String = cells
+        .iter()
+        .filter(|c| c.2 == chip_bg)
+        .map(|c| c.0.as_str())
+        .collect();
+    (
+        text(&cells[chip_start.min(4)..chip_start]),
+        chip,
+        text(&cells),
+    )
+}
+
+/// The anchor file's own header payload, read out of its layout.
+fn header_payload(app: &App) -> FileHeaderRow {
+    app.diff_layout(app.diff_area().width)
+        .iter()
+        .find_map(|row| match &row.content {
+            RowContent::FileHeader(header) => Some(header.clone()),
+            _ => None,
+        })
+        .expect("the anchor's header row")
+}
+
 // --- content ---------------------------------------------------------------
 
 #[test]
@@ -84,7 +154,10 @@ fn status_header_leads_the_diff_with_marker_path_and_counts() {
     let repo = counted_repo();
     let app = app_for(&repo, true);
     let row = top_row(&app);
-    assert!(row.contains("M code.txt"), "marker + path, got {row:?}");
+    assert!(
+        row.contains("M  code.txt"),
+        "marker + chipped path, got {row:?}"
+    );
     assert!(row.contains("+2"), "two additions counted, got {row:?}");
     assert!(row.contains("−1"), "one deletion counted, got {row:?}");
 }
@@ -95,7 +168,7 @@ fn the_header_band_paints_the_full_pane_width() {
     let app = app_for(&repo, true);
     let buf = common::render_buffer(&app, W, H);
     let area = app.diff_area();
-    let band = app.theme.header_bg;
+    let band = app.theme.file_header_bg;
     for x in [area.x, area.x + area.width / 2, area.right() - 1] {
         assert_eq!(
             cell_bg(&buf, x, area.y),
@@ -111,7 +184,7 @@ fn status_binary_header_reads_binary() {
     write(repo.path(), "bin.dat", "a\0b\0c\n");
     let app = app_for(&repo, true);
     let row = top_row(&app);
-    assert!(row.contains("? bin.dat"), "untracked marker, got {row:?}");
+    assert!(row.contains("?  bin.dat"), "untracked marker, got {row:?}");
     assert!(row.contains("(binary)"), "no counts for a binary file");
 }
 
@@ -122,7 +195,10 @@ fn review_header_shows_the_range_files_stats() {
     let files = app.review_files();
     assert_eq!(files[0].path, "feature.txt", "first review file");
     let row = top_row(&app);
-    assert!(row.contains("A feature.txt"), "marker + path, got {row:?}");
+    assert!(
+        row.contains("A  feature.txt"),
+        "marker + chipped path, got {row:?}"
+    );
     // The review header reads `CommitFile.stat` — the numstat counts, not a
     // recount of the diff.
     let stat = files[0].stat;
@@ -146,9 +222,235 @@ fn review_header_shows_a_rename_as_old_to_new() {
     }
     let row = top_row(&app);
     assert!(
-        row.contains("R shared.txt → renamed.txt"),
-        "the rename display path, got {row:?}"
+        row.contains("R shared.txt →  renamed.txt"),
+        "the rename display path, old path dim, basename chipped, got {row:?}"
     );
+}
+
+#[test]
+fn the_prefix_and_the_name_rebuild_the_display_path() {
+    // The band splits the file lists' label rather than rewording it: for a plain
+    // path, a nested one and a rename, `prefix + name` is exactly what
+    // `display_path()` returns. This equivalence is what keeps the band's label
+    // identical in content to the sidebar's.
+    let repo = init_repo();
+    write(repo.path(), "plain.txt", "one\n");
+    write(repo.path(), "src/deep/keep.txt", "one\n");
+    write(repo.path(), "src/deep/nested.txt", "one\n");
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-q", "-m", "base"]);
+    write(repo.path(), "plain.txt", "one\ntwo\n");
+    write(repo.path(), "src/deep/keep.txt", "one\ntwo\n");
+    std::fs::create_dir_all(repo.path().join("moved")).unwrap();
+    std::fs::rename(
+        repo.path().join("src/deep/nested.txt"),
+        repo.path().join("moved/renamed.txt"),
+    )
+    .unwrap();
+    git(repo.path(), &["add", "-A"]);
+
+    let mut app = app_for(&repo, true);
+    dump_frame(&app, W, H).unwrap();
+    let labels: Vec<String> = app
+        .status
+        .staged
+        .iter()
+        .chain(app.status.unstaged.iter())
+        .map(|entry| entry.display_path())
+        .collect();
+    assert!(
+        labels.iter().any(|l| l.contains(" → ")),
+        "the fixture stages a rename, got {labels:?}"
+    );
+    for label in &labels {
+        let header = header_payload(&app);
+        assert_eq!(
+            format!("{}{}", header.prefix, header.name),
+            *label,
+            "the split label rebuilds the list label"
+        );
+        press(&mut app, 'j');
+        dump_frame(&app, W, H).unwrap();
+    }
+}
+
+// --- band styling ----------------------------------------------------------
+
+#[test]
+fn an_accent_bar_leads_the_band_in_the_marker_tone() {
+    let repo = counted_repo();
+    let app = app_for(&repo, true);
+    let buf = common::render_buffer(&app, W, H);
+    let area = app.diff_area();
+    assert_eq!(common::cell_symbol(&buf, area.x, area.y), "▌");
+    assert_eq!(
+        cell_fg(&buf, area.x, area.y),
+        Some(app.theme.unstaged),
+        "the bar takes the marker tone"
+    );
+    assert_eq!(
+        cell_bg(&buf, area.x, area.y),
+        Some(app.theme.file_header_bg)
+    );
+}
+
+#[test]
+fn the_basename_sits_on_a_bold_chip_in_the_marker_tone() {
+    let repo = counted_repo();
+    let app = app_for(&repo, true);
+    let buf = common::render_buffer(&app, W, H);
+    let area = app.diff_area();
+    let chip: Vec<_> = band_cells(&buf, area, area.y)
+        .into_iter()
+        .filter(|c| c.2 == app.theme.file_header_chip_bg)
+        .collect();
+    assert_eq!(
+        chip.iter().map(|c| c.0.as_str()).collect::<String>(),
+        " code.txt ",
+        "the chip is the padded basename"
+    );
+    for (symbol, fg, _, bold) in &chip {
+        assert_eq!(*fg, app.theme.unstaged, "the marker tone on {symbol:?}");
+        assert!(bold, "the chip is bold on {symbol:?}");
+    }
+}
+
+#[test]
+fn the_directory_prefix_is_dim_and_sits_outside_the_chip() {
+    let repo = init_repo();
+    write(repo.path(), "src/deep/code.txt", "one\n");
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-q", "-m", "base"]);
+    write(repo.path(), "src/deep/code.txt", "one\ntwo\n");
+    let app = app_for(&repo, true);
+    let buf = common::render_buffer(&app, W, H);
+    let (prefix, chip, _) = band_parts(&app, &buf);
+    assert_eq!(prefix, "src/deep/", "the directory leads the basename");
+    assert_eq!(chip, " code.txt ", "only the basename is chipped");
+    let area = app.diff_area();
+    assert_eq!(
+        cell_fg(&buf, area.x + 4, area.y),
+        Some(app.theme.dim),
+        "the prefix is dim"
+    );
+}
+
+#[test]
+fn an_untracked_directory_chips_its_whole_label() {
+    // `git status` collapses a wholly-untracked directory to `dir/` — there is no
+    // basename to chip, so the label goes on the chip rather than leaving it blank.
+    let repo = init_repo();
+    write(repo.path(), "fresh/code.txt", "one\n");
+    let app = app_for(&repo, true);
+    let buf = common::render_buffer(&app, W, H);
+    let (prefix, chip, _) = band_parts(&app, &buf);
+    assert_eq!(prefix, "", "nothing is left over for the prefix");
+    assert_eq!(chip, " fresh/ ");
+}
+
+#[test]
+fn the_counts_end_one_cell_before_the_right_edge() {
+    let repo = counted_repo();
+    let app = app_for(&repo, true);
+    let buf = common::render_buffer(&app, W, H);
+    let area = app.diff_area();
+    let (_, _, row) = band_parts(&app, &buf);
+    assert!(row.ends_with("+2 −1 "), "one trailing cell, got {row:?}");
+    assert_eq!(
+        cell_fg(&buf, area.right() - 2, area.y),
+        Some(app.theme.del),
+        "the deletion count is the last glyph"
+    );
+    assert_eq!(
+        cell_bg(&buf, area.right() - 1, area.y),
+        Some(app.theme.file_header_bg),
+        "the trailing cell is band, not chip"
+    );
+}
+
+#[test]
+fn a_directory_only_rename_dims_the_old_path_and_chips_the_basename() {
+    let repo = init_repo();
+    write(repo.path(), "a/x.txt", "one\ntwo\nthree\n");
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-q", "-m", "base"]);
+    std::fs::create_dir_all(repo.path().join("b")).unwrap();
+    std::fs::rename(repo.path().join("a/x.txt"), repo.path().join("b/x.txt")).unwrap();
+    git(repo.path(), &["add", "-A"]);
+
+    let app = app_for(&repo, true);
+    let buf = common::render_buffer(&app, W, H);
+    let (prefix, chip, _) = band_parts(&app, &buf);
+    assert_eq!(
+        prefix, "a/x.txt → b/",
+        "the whole old path, then the new directory"
+    );
+    assert_eq!(chip, " x.txt ", "the basename alone is chipped");
+}
+
+// --- truncation order ------------------------------------------------------
+
+#[test]
+fn a_narrow_band_cuts_the_prefix_from_the_left() {
+    let repo = deep_repo();
+    let app = app_for(&repo, true);
+    let buf = common::render_buffer(&app, 60, H);
+    let (prefix, chip, row) = band_parts(&app, &buf);
+    assert!(
+        prefix.starts_with('…'),
+        "the prefix is cut from the left, got {prefix:?}"
+    );
+    assert!(
+        prefix.ends_with('/'),
+        "the directory nearest the name survives, got {prefix:?}"
+    );
+    assert_eq!(chip, " code.txt ", "the chip outranks the prefix");
+    assert!(
+        row.ends_with("+2 −1 "),
+        "the counts still end one cell in, got {row:?}"
+    );
+}
+
+#[test]
+fn a_band_too_narrow_for_the_counts_still_keeps_the_chip() {
+    let repo = deep_repo();
+    let app = app_for(&repo, true);
+    let buf = common::render_buffer(&app, 34, H);
+    let (prefix, chip, row) = band_parts(&app, &buf);
+    assert_eq!(chip, " code.txt ", "the chip outranks the counts");
+    assert_eq!(prefix, "", "the prefix went first");
+    assert!(!row.contains("+2"), "the counts are dropped, got {row:?}");
+    assert!(row.starts_with("▌ M  code.txt "), "got {row:?}");
+}
+
+#[test]
+fn a_long_basename_is_truncated_inside_the_chip() {
+    let repo = init_repo();
+    write(repo.path(), &format!("{}.txt", "x".repeat(200)), "one\n");
+    let app = app_for(&repo, true);
+    let buf = common::render_buffer(&app, W, H);
+    let area = app.diff_area();
+    let (_, chip, row) = band_parts(&app, &buf);
+    assert!(
+        row.starts_with("▌ ? "),
+        "the bar and marker outrank the chip, got {row:?}"
+    );
+    assert!(
+        chip.ends_with('…'),
+        "the cut lands inside the chip, got {chip:?}"
+    );
+    assert_eq!(
+        chip.chars().count(),
+        area.width as usize - 4,
+        "the chip takes everything past the bar and marker"
+    );
+    for x in area.x + 4..area.right() {
+        assert_eq!(
+            cell_bg(&buf, x, area.y),
+            Some(app.theme.file_header_chip_bg),
+            "the chip keeps its own background at x={x}"
+        );
+    }
 }
 
 // --- geometry --------------------------------------------------------------
@@ -203,7 +505,7 @@ fn side_by_side_draws_the_header_full_width() {
     press(&mut app, 'd'); // side-by-side
     let rows = diff_rows(&app);
     assert!(
-        rows[0].contains("M code.txt"),
+        rows[0].contains("M  code.txt"),
         "the header row, side-by-side"
     );
     // Full-width means the band paints over the centre divider that every code
@@ -241,6 +543,36 @@ fn the_header_is_a_single_cursor_stop() {
     assert_eq!(app.review_cursor(), 0, "the header is a single stop");
     press(&mut app, 'k');
     assert_eq!(app.review_cursor(), 0, "no row above the header");
+}
+
+#[test]
+fn the_cursor_on_the_header_spares_the_chip() {
+    // The chip is the header's identity, so the band paints its own cursor state
+    // rather than taking the blanket `selection_bg` repaint (plan 008 §3.4).
+    let repo = counted_repo();
+    let mut app = app_for(&repo, true);
+    dump_frame(&app, W, H).unwrap();
+    press(&mut app, 'l'); // focus the diff; the cursor starts on the header
+    assert_eq!(app.review_cursor_highlight(), Some(0..1), "on the header");
+
+    let buf = common::render_buffer(&app, W, H);
+    let area = app.diff_area();
+    let cells = band_cells(&buf, area, area.y);
+    let chip: String = cells
+        .iter()
+        .filter(|c| c.2 == app.theme.file_header_chip_bg)
+        .map(|c| c.0.as_str())
+        .collect();
+    assert_eq!(chip, " code.txt ", "the chip survives the cursor colour");
+    for (i, (symbol, _, bg, _)) in cells.iter().enumerate() {
+        if *bg == app.theme.file_header_chip_bg {
+            continue;
+        }
+        assert_eq!(
+            *bg, app.theme.selection_bg,
+            "band cell {i} ({symbol:?}) takes the cursor colour"
+        );
+    }
 }
 
 #[test]
@@ -293,7 +625,7 @@ fn the_header_marker_follows_the_section_for_a_path_in_both() {
 
     let marker_x = app.diff_area().x + 2;
     let staged_row = top_row(&app);
-    assert!(staged_row.contains("A dup.txt"), "got {staged_row:?}");
+    assert!(staged_row.contains("A  dup.txt"), "got {staged_row:?}");
     assert_eq!(
         cell_fg(
             &common::render_buffer(&app, W, H),
@@ -307,7 +639,7 @@ fn the_header_marker_follows_the_section_for_a_path_in_both() {
 
     press(&mut app, 'j'); // the same path's unstaged row
     let unstaged_row = top_row(&app);
-    assert!(unstaged_row.contains("M dup.txt"), "got {unstaged_row:?}");
+    assert!(unstaged_row.contains("M  dup.txt"), "got {unstaged_row:?}");
     assert_eq!(
         cell_fg(
             &common::render_buffer(&app, W, H),
@@ -322,6 +654,60 @@ fn the_header_marker_follows_the_section_for_a_path_in_both() {
         computed,
         "the diff is path-keyed: only the layout is rebuilt"
     );
+}
+
+// --- the file lists are untouched -------------------------------------------
+
+#[test]
+fn the_review_file_list_keeps_the_plain_stat_spans() {
+    // The band stopped sharing `stat_spans` with the lists; the lists themselves
+    // are unchanged — no chip, no accent bar, one space after the marker.
+    let repo = init_repo_with_diverged_branches();
+    let app = review_app(&repo, true);
+    let out = dump_frame(&app, W, H).unwrap();
+    assert!(
+        out.contains("  A feature.txt  +1 −0"),
+        "the list row is untouched, frame:\n{out}"
+    );
+    assert!(
+        out.contains("  R shared.txt → renamed.txt"),
+        "the rename row is untouched, frame:\n{out}"
+    );
+
+    let buf = common::render_buffer(&app, W, H);
+    let area = app.diff_area();
+    for y in 0..H {
+        for x in 0..area.x {
+            assert_ne!(
+                cell_bg(&buf, x, y),
+                Some(app.theme.file_header_chip_bg),
+                "no chip outside the diff pane at ({x}, {y})"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_history_file_breakdown_keeps_the_plain_stat_spans() {
+    let repo = init_repo_with_history();
+    let mut app = App::with_config(repo.path().to_path_buf(), &config(true)).unwrap();
+    app.on_key(key('i'));
+    let out = dump_frame(&app, W, H).unwrap();
+    assert!(
+        out.contains("  M README.md  +1 −0"),
+        "the commit-detail breakdown is untouched, frame:\n{out}"
+    );
+
+    let buf = common::render_buffer(&app, W, H);
+    for y in 0..H {
+        for x in 0..W {
+            assert_ne!(
+                cell_bg(&buf, x, y),
+                Some(app.theme.file_header_chip_bg),
+                "History draws no header band at ({x}, {y})"
+            );
+        }
+    }
 }
 
 // --- toggling off ----------------------------------------------------------
@@ -451,7 +837,7 @@ fn toggling_f_rebuilds_the_layout_in_place() {
 
     press(&mut app, 'f');
     assert!(
-        top_row(&app).contains("M code.txt"),
+        top_row(&app).contains("M  code.txt"),
         "the header appears without a restart"
     );
     assert_eq!(

@@ -358,12 +358,15 @@ pub enum RowContent {
 /// draws, resolved once when the layout is built (plan 006 §3.1) so no frame
 /// re-derives it. The marker's colour is named ([`MarkerTone`]) rather than
 /// resolved, because a theme cycle does not rebuild the layout.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileHeaderRow {
     pub marker: char,
     pub tone: MarkerTone,
-    /// The file's list label — `old → new` for a rename.
-    pub path: String,
+    /// Everything of the file's list label before the basename, drawn dim: the
+    /// directory, and the whole old path for a rename. May be empty.
+    pub prefix: String,
+    /// The basename, drawn on the chip.
+    pub name: String,
     pub stat: CommitStat,
 }
 
@@ -7817,14 +7820,34 @@ fn line_no(line: &DiffLine, side: Side) -> Option<usize> {
     }
 }
 
+/// Split a file's list label into the dim prefix and the basename the chip
+/// carries (plan 008 §3.2), from the `path`/`orig_path` fields rather than by
+/// re-parsing a formatted label. `prefix + name` is exactly what `display_path`
+/// returns, which is what keeps the band's label identical in content to the
+/// file lists.
+fn split_label(path: &str, orig_path: Option<&str>) -> (String, String) {
+    // `git status` collapses a wholly-untracked directory to a `dir/` entry, which
+    // has no basename to chip — the whole label goes on the chip instead.
+    let (dir, name) = match path.rsplit_once('/') {
+        Some((dir, name)) if !name.is_empty() => (format!("{dir}/"), name.to_string()),
+        _ => (String::new(), path.to_string()),
+    };
+    match orig_path {
+        Some(orig) => (format!("{orig} → {dir}"), name),
+        None => (dir, name),
+    }
+}
+
 /// The header payload for a working-tree file: its section-aware marker and tone,
-/// its display path (`old → new` for a rename), and the counts recounted off the
-/// diff — a `FileEntry` carries no stats of its own (plan 006 §3.1).
+/// its split display path (`old → new` for a rename), and the counts recounted
+/// off the diff — a `FileEntry` carries no stats of its own (plan 006 §3.1).
 fn status_header(section: Section, entry: &FileEntry, diff: &FileDiff) -> FileHeaderRow {
+    let (prefix, name) = split_label(&entry.path, entry.orig_path.as_deref());
     FileHeaderRow {
         marker: entry.change.marker(),
         tone: MarkerTone::for_status(section, entry.change),
-        path: entry.display_path(),
+        prefix,
+        name,
         stat: crate::git::diff::stat_of(diff),
     }
 }
@@ -7832,10 +7855,12 @@ fn status_header(section: Section, entry: &FileEntry, diff: &FileDiff) -> FileHe
 /// The header payload for a reviewed file, whose `+a −d` come from the range's
 /// numstat rather than a recount.
 fn review_header(file: &CommitFile) -> FileHeaderRow {
+    let (prefix, name) = split_label(&file.path, file.orig_path.as_deref());
     FileHeaderRow {
         marker: file.change.marker(),
         tone: MarkerTone::for_change_kind(file.change),
-        path: file.display_path(),
+        prefix,
+        name,
         stat: file.stat,
     }
 }
