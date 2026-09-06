@@ -270,19 +270,18 @@ generation, view)` alongside the diff itself, not recomputed per frame.
 Enabling wrap resets the offset to 0 — the two are mutually exclusive — and a
 same-file refresh preserves it, matching `diff_scroll`'s convention.
 
-**Cross-file scroll.** With `cross_file_scroll` on (key `f`; Status and
-Review only — History is excluded and never crossed), every file's layout
-gains one or two `FileHeaderRow`s at the top (`RowContent::FileHeader`,
-addressed as `RowTarget::FileHeader`) — always truncated rather than
-wrapped, never h-shifted, resolved once when the layout is built and never
-re-derived per frame; `LayoutKey` gains `cross_file`, so toggling `f`
-rebuilds the layout. The conceptual document is the concatenation of every
-file's layout in list order, but strix never materializes it: `App::diff_window`
-renders a viewport-sized `DiffWindow` — the selected file (the *anchor*) from
-the current scroll offset, then as many following files' prepared
-`FileSection`s (each a `WindowSegment`) as fit — and `App::ensure_diff_window`
-prepares exactly what that window needs on the event path, never during
-render.
+**Cross-file scroll.** With `cross_file_scroll` on (key `f`; Status, Review
+and History alike), every file's layout gains one or two `FileHeaderRow`s at
+the top (`RowContent::FileHeader`, addressed as `RowTarget::FileHeader`) —
+always truncated rather than wrapped, never h-shifted, resolved once when the
+layout is built and never re-derived per frame; `LayoutKey` gains
+`cross_file`, so toggling `f` rebuilds the layout. The conceptual document is
+the concatenation of every file's layout in list order, but strix never
+materializes it: `App::diff_window` renders a viewport-sized `DiffWindow` —
+the selected file (the *anchor*) from the current scroll offset, then as many
+following files' prepared `FileSection`s (each a `WindowSegment`) as fit — and
+`App::ensure_diff_window` prepares exactly what that window needs on the event
+path, never during render.
 
 **The file header's two rows.** The stream's first file leads with a single
 row, the header band; every file below it gets a separating `─` rule row

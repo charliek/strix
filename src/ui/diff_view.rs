@@ -122,8 +122,8 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
 
     // The viewport-sized slice of the stream: the anchor from the current offset,
     // then each following file's prepared section (plan 006 §3.4). With cross-file
-    // scroll off — and in History — it is always the single anchor segment, drawn
-    // from exactly the offset this renderer always used.
+    // scroll off it is always the single anchor segment, drawn from exactly the
+    // offset this renderer always used.
     let window = app.diff_window(inner.width, inner.height);
     let crossing = window.segments.len() > 1;
 

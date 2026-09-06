@@ -1,5 +1,5 @@
 //! The diff pane's file header (plan 006 §3.1, restyled by plan 008 §3.3/§3.5):
-//! with cross-file scroll on, every Status/Review file's layout is led by a band
+//! with cross-file scroll on, every file's layout in any view is led by a band
 //! carrying a tone-coloured accent bar, the change marker, the dim directory
 //! prefix, the basename on its own chip, and the `+a −d` counts at the right
 //! edge. The stream's first file leads with that band alone; every file below it

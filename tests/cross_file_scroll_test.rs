@@ -11,8 +11,7 @@
 //! target as a divergent cursor with the boundary still on screen, the anchor
 //! following only when the reveal renormalizes past it; `k` above the anchor's
 //! first stop flips immediately onto the previous file's last target. A
-//! list-focused half page stays a plain continuous tick. Off by default; the
-//! History view is excluded.
+//! list-focused half page stays a plain continuous tick. Off by default.
 
 mod common;
 

@@ -22,8 +22,8 @@ These are the defaults. Every binding is remappable — see
 | `Esc`          | Close an overlay; leave History view    |
 
 `n`, `w`, `f`, `t`, and `m` work in every view (Status, History, and the review
-view), though cross-file scroll (`f`) only scrolls continuously across file
-boundaries in Status and Review — the History view is excluded. While the
+view); cross-file scroll (`f`) scrolls continuously across file boundaries in
+all three — in History the stream is the selected commit's files. While the
 discard-confirmation modal is open, `n` is consumed as "no"
 (dismiss the modal) rather than toggling line numbers; the global binding
 resumes once the modal closes.

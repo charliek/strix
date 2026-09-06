@@ -502,15 +502,33 @@ struct LayoutInput<'a> {
 /// The two keys answer different questions; don't unify them (plan 006 §3.3).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FileId {
-    Status { section: Section, path: String },
-    Review { path: String },
+    Status {
+        section: Section,
+        path: String,
+    },
+    Review {
+        path: String,
+    },
+    /// A file of one *commit* (plan 009 §3.3). The OID is part of the identity:
+    /// History's stream is re-scoped whenever the selected commit changes, and
+    /// carrying the commit is what keeps a cursor or a strip hit from another
+    /// commit from resolving against the current one.
+    History {
+        commit: gix::ObjectId,
+        /// The **new** path for a rename — `CommitFile.path`, the same field
+        /// `history_diff_key` and `active_path` key on; `orig_path` stays inside
+        /// the `CommitFile` the diff and the header band are built from.
+        path: String,
+    },
 }
 
 impl FileId {
     /// The file's path, whichever view it came from.
     pub fn path(&self) -> &str {
         match self {
-            FileId::Status { path, .. } | FileId::Review { path } => path,
+            FileId::Status { path, .. }
+            | FileId::Review { path }
+            | FileId::History { path, .. } => path,
         }
     }
 }
@@ -649,7 +667,7 @@ impl SectionCache {
 /// half-open span of *that file's own* layout rows this segment draws.
 pub struct WindowSegment {
     /// The file's stream identity. `None` only where there is no stream entry —
-    /// History (never crossed) or an empty file list.
+    /// History's `●` details row, or an empty file list.
     pub id: Option<FileId>,
     pub path: String,
     /// The prepared section a *strip* segment draws from, owned (`Rc`) so a window
@@ -702,7 +720,8 @@ impl DiffWindow {
 #[derive(Clone)]
 pub(crate) struct WindowHit {
     /// The row's stream identity — `None` only where the window has no stream
-    /// entry at all (History, or an empty file list); always an anchor row.
+    /// entry at all (History's `●` details row, or an empty file list); always an
+    /// anchor row.
     pub(crate) id: Option<FileId>,
     /// The target within `id`'s own layout this row draws.
     pub(crate) target: RowTarget,
@@ -1156,8 +1175,9 @@ pub struct App {
     /// physical layout, so a change rebuilds it (see [`App::diff_layout`]).
     pub wrap_lines: bool,
     /// Whether scrolling past a diff's edge crosses into the next / previous
-    /// file's diff (Status + Review; History excluded). Off by default; from
-    /// `Config.cross_file_scroll`, toggled with `f` (plan §3.4).
+    /// file's diff, in all three views (History's stream is the selected commit's
+    /// files). Off by default; from `Config.cross_file_scroll`, toggled with `f`
+    /// (plan §3.4).
     pub cross_file_scroll: bool,
     /// Horizontal scroll offset for code content, in display columns (plan §3.5).
     /// Applies only when wrap is off; shifts unified content and both side-by-side
@@ -1223,9 +1243,10 @@ pub struct App {
     sections: RefCell<SectionCache>,
     /// Bumped by anything that can change which files the stream holds, or what
     /// any file's diff or rows contain: a status snapshot replacement, a review
-    /// relist, a comment mutation, a view change. Cached sections carry the value
-    /// they were built at and are dropped on access once it moves. Layout-key
-    /// changes need no bump — they invalidate by tag mismatch (plan 006 §3.3).
+    /// relist, a commit's file-list installation in History, a comment mutation, a
+    /// view change. Cached sections carry the value they were built at and are
+    /// dropped on access once it moves. Layout-key changes need no bump — they
+    /// invalidate by tag mismatch (plan 006 §3.3).
     stream_generation: Cell<u64>,
     /// The diff pane's physical [`LayoutRow`] list (code rows interleaved with
     /// multi-row comment boxes), rebuilt when the pane width or diff mode changes,
@@ -1250,9 +1271,9 @@ pub struct App {
     /// tagged with the [`WindowEpoch`] it was recorded under so a click drained
     /// after a later state change (in the same input batch, no redraw between)
     /// can detect the staleness instead of acting on it. Empty whenever the
-    /// window has nothing drawn (the early-return no-diff frame) or, off
-    /// cross-file scroll / in History, holds only anchor rows — so a click
-    /// always falls through to the unchanged path there.
+    /// window has nothing drawn (the early-return no-diff frame, and History's
+    /// details pane) or, off cross-file scroll, holds only anchor rows — so a
+    /// click always falls through to the unchanged path there.
     window_hits: RefCell<WindowHitMap>,
 
     /// The status view's worktree-comment inbox (the checked-out branch's
@@ -1290,6 +1311,12 @@ pub struct App {
     history_loaded_all: bool,
     selected_commit: usize,
     commit_files: Vec<CommitFile>,
+    /// Whether the last `commit_files` listing *failed* (as opposed to returning
+    /// an honestly empty commit). A refresh keeps an immutable commit's list
+    /// rather than re-listing it (plan 009 §3.4), which would otherwise strand a
+    /// transient listing error: the empty list it left behind would survive every
+    /// watcher tick until the user reselected the commit by hand.
+    commit_files_failed: bool,
     /// Row in the top "Committed Changes" list: 0 is the commit (`●`) row,
     /// `1..=commit_files.len()` index into `commit_files`.
     committed_row: usize,
@@ -1430,6 +1457,7 @@ impl App {
             history_loaded_all: false,
             selected_commit: 0,
             commit_files: Vec::new(),
+            commit_files_failed: false,
             committed_row: 0,
             history_diff: None,
             history_diff_key: None,
@@ -1819,8 +1847,8 @@ impl App {
             Action::Up => self.history_move(false),
             Action::Top => self.history_to_edge(false),
             Action::Bottom => self.history_to_edge(true),
-            Action::HalfPageDown => self.scroll_diff(true, self.half_page()),
-            Action::HalfPageUp => self.scroll_diff(false, self.half_page()),
+            Action::HalfPageDown => self.history_half_page(true),
+            Action::HalfPageUp => self.history_half_page(false),
             // Read-only view: staging ops, commenting, and comment navigation do
             // nothing.
             Action::ToggleStage
@@ -2177,8 +2205,8 @@ impl App {
     /// (Status staging pane / Review list). The list has no diff cursor to move, so
     /// with cross-file scroll on this is a plain wheel-sized tick in the stream
     /// domain (plan 006 §3.5): continuous through a boundary, no clamp-then-cross
-    /// step, no cursor. With cross-file off, in History, or while editing, it is
-    /// the plain clamping scroll it always was.
+    /// step, no cursor. With cross-file off, with no anchor, or while editing, it
+    /// is the plain clamping scroll it always was.
     fn list_scroll_half_page(&mut self, down: bool) {
         let step = self.half_page();
         if self.strip_anchor().is_some() {
@@ -3172,7 +3200,7 @@ impl App {
             FileId::Status { section, path } => self
                 .status_entry(*section, path)
                 .is_some_and(|entry| entry.change == Change::Conflicted),
-            FileId::Review { .. } => false,
+            FileId::Review { .. } | FileId::History { .. } => false,
         }
     }
 
@@ -3646,8 +3674,8 @@ impl App {
             self.load_history();
         }
         self.view = ViewMode::History;
-        // A view change re-scopes the stream (History has none); drop its sections.
-        self.bump_stream_generation();
+        // No bump here: the stream is re-scoped by `load_commit_files` below, which
+        // installs the selected commit's file list (plan 009 §3.4).
         self.last_click = None; // a view change resets the double-click tracker (§3.6)
                                 // Hidden left column ⇒ the Diff is the only visible pane to focus.
         self.history_focus = if self.show_changes {
@@ -3669,7 +3697,7 @@ impl App {
         // §3.3b). Belt to `enter_history`'s braces — a session can also start in
         // History, whose exit is the home view's first activation.
         self.clear_divergent_cursor();
-        // The stream is the home view's file list now, not History's nothing.
+        // The stream is the home view's file list now, not the commit's.
         self.bump_stream_generation();
         self.last_click = None; // a view change resets the double-click tracker (§3.6)
                                 // Respect the hidden-panel invariant in whichever home we return to:
@@ -3717,17 +3745,44 @@ impl App {
 
     /// Load the selected commit's changed-file list, resetting the top-pane
     /// selection to the commit (`●`) row.
+    ///
+    /// The single place that list — which *is* History's scroll stream — is
+    /// installed, so every exit takes the same steps, including the no-commit and
+    /// listing-error ones: reset the row, install (or clear) the list, and bump
+    /// `stream_generation` exactly once, retiring sections built against the
+    /// commit being left. That makes the contract "one bump per file-list
+    /// installation" rather than per commit *change*: a Graph re-click or an edge
+    /// no-op reloads the same commit and bumps too, but it also returns to `●`, so
+    /// nothing could have reached those sections anyway (plan 009 §3.4).
     fn load_commit_files(&mut self) {
         self.committed_row = 0;
         self.committed_state.borrow_mut().select(None);
-        let Some(commit) = self.commits.get(self.selected_commit) else {
-            self.commit_files.clear();
-            return;
+        let listed = self
+            .selected_commit_info()
+            .map(|commit| self.repo.commit_files(commit));
+        self.commit_files_failed = matches!(listed, Some(Err(_)));
+        self.commit_files = match listed {
+            Some(Ok(files)) => files,
+            Some(Err(err)) => {
+                tracing::warn!("listing commit files failed: {err:#}");
+                Vec::new()
+            }
+            None => Vec::new(),
         };
-        self.commit_files = self.repo.commit_files(commit).unwrap_or_else(|err| {
-            tracing::warn!("listing commit files failed: {err:#}");
-            Vec::new()
-        });
+        self.bump_stream_generation();
+    }
+
+    /// The one seam every *user* change of the committed-changes row goes through
+    /// (row 0 is the commit `●` details row; rows below index into
+    /// `commit_files`). The History analogue of [`App::select_review_file`]: a
+    /// no-op selection leaves the pane alone, so re-selecting the current row
+    /// never disturbs the scroll.
+    fn select_committed_row(&mut self, row: usize) {
+        let row = row.min(self.commit_files.len());
+        if row == self.committed_row {
+            return;
+        }
+        self.committed_row = row;
     }
 
     /// Pull in the next page of history when the Graph selection reaches the end
@@ -3783,14 +3838,26 @@ impl App {
                     self.select_commit_prev();
                 }
             }
-            HistoryFocus::CommittedChanges => {
-                if down {
-                    self.committed_row = (self.committed_row + 1).min(self.commit_files.len());
-                } else {
-                    self.committed_row = self.committed_row.saturating_sub(1);
-                }
-            }
+            HistoryFocus::CommittedChanges => self.select_committed_row(if down {
+                self.committed_row + 1
+            } else {
+                self.committed_row.saturating_sub(1)
+            }),
             HistoryFocus::Diff => self.scroll_diff(down, 1),
+        }
+    }
+
+    /// A half page in the history view, by focused sub-pane — the mirror of
+    /// `review_half_page`. With the Graph or the file list focused there is no
+    /// cursor to move, so it is a viewport tick that crosses file boundaries when
+    /// the stream is on; the Diff arm keeps the plain per-file clamp
+    /// `history_move` uses there.
+    fn history_half_page(&mut self, down: bool) {
+        match self.history_focus {
+            HistoryFocus::Diff => self.scroll_diff(down, self.half_page()),
+            HistoryFocus::Graph | HistoryFocus::CommittedChanges => {
+                self.list_scroll_half_page(down)
+            }
         }
     }
 
@@ -3805,7 +3872,7 @@ impl App {
                 self.load_commit_files();
             }
             HistoryFocus::CommittedChanges => {
-                self.committed_row = if bottom { self.commit_files.len() } else { 0 };
+                self.select_committed_row(if bottom { self.commit_files.len() } else { 0 });
             }
             HistoryFocus::Diff => {
                 self.diff_scroll
@@ -3866,8 +3933,8 @@ impl App {
     /// The height is only a fill target, so the whole terminal height stands in
     /// for the pane's: overshooting prepares at most a section the frame won't
     /// draw, while undershooting would leave the shortfall this is here to
-    /// prevent. History needs no derivation — it has no strip, so
-    /// [`App::ensure_diff_window`] is a no-op there.
+    /// prevent. History's diff pane sits in the same place, so the derivation
+    /// serves it too.
     fn diff_geometry_for(&self, cols: u16, rows: u16) -> (u16, u16) {
         let list = if self.show_changes {
             self.changes_pane_width(cols)
@@ -4106,8 +4173,8 @@ impl App {
         // §3.3c–e), resolved from the per-frame window hit map —
         // `diff_row_at`/`hit_target` only ever resolve rows inside the *anchor's*
         // own layout, so a strip row would otherwise be inert. An anchor-row hit
-        // (or no hit at all: outside the diff pane, History, or the shortfall
-        // region) falls through to the unchanged path below.
+        // (or no hit at all: outside the diff pane, on History's details pane, or
+        // in the shortfall region) falls through to the unchanged path below.
         if let Some(hit) = self.window_hit_at(pos) {
             if !hit.is_anchor {
                 self.strip_click(&hit, pos, now);
@@ -4481,8 +4548,7 @@ impl App {
         } else if committed.contains(pos) {
             self.history_focus = HistoryFocus::CommittedChanges;
             let row = self.committed_state.borrow().offset() + (pos.y - committed.y) as usize;
-            // Row 0 is the commit (●) row; rows below index into the file list.
-            self.committed_row = row.min(self.commit_files.len());
+            self.select_committed_row(row);
         } else if self.diff_area.get().contains(pos) {
             self.history_focus = HistoryFocus::Diff;
         }
@@ -4613,10 +4679,10 @@ impl App {
         }
     }
 
-    /// A wheel tick over the diff pane in a cursor-bearing view (Status or Review;
-    /// History routes to `scroll_diff` directly and never crosses). With cross-file
-    /// scroll off this is the plain per-file clamp it always was; with it on the
-    /// tick is a signed delta in the extended stream domain (plan 006 §3.2a).
+    /// A wheel tick over the diff pane, in any view. With cross-file scroll off —
+    /// or on History's `●` details row, which has no anchor — this is the plain
+    /// per-file clamp it always was; with it on the tick is a signed delta in the
+    /// extended stream domain (plan 006 §3.2a).
     fn wheel_scroll_diff(&mut self, down: bool) {
         if !self.cross_file_scroll {
             self.scroll_diff(down, SCROLL_STEP);
@@ -4653,7 +4719,7 @@ impl App {
             self.history_focus = HistoryFocus::CommittedChanges;
             self.history_move(down);
         } else if self.diff_area.get().contains(pos) {
-            self.scroll_diff(down, SCROLL_STEP);
+            self.wheel_scroll_diff(down);
         }
     }
 
@@ -4922,8 +4988,8 @@ impl App {
         }
         // Keep the visible window prepared: a selection change or a refresh can
         // leave a short anchor with an unfilled strip, and the render path may
-        // never compute (plan 006 §3.3). A no-op with cross-file scroll off, in
-        // History, or before the first frame (the pane has no geometry yet).
+        // never compute (plan 006 §3.3). A no-op with cross-file scroll off, with
+        // no anchor, or before the first frame (the pane has no geometry yet).
         let area = self.diff_area.get();
         self.ensure_diff_window(area.width, area.height);
     }
@@ -4935,16 +5001,30 @@ impl App {
         match self.view {
             ViewMode::Status => self.refresh(),
             ViewMode::History => {
-                let current = self.commits.get(self.selected_commit).map(|c| c.id);
-                let prev_row = self.committed_row;
+                let current = self.selected_commit_info().map(|c| c.id);
                 self.load_history();
                 let found = current.and_then(|id| self.commits.iter().position(|c| c.id == id));
-                self.selected_commit = found.unwrap_or(0);
-                self.load_commit_files();
-                // A watcher reload must not yank the cursor off the file being
-                // viewed: keep the row when the same commit is still selected.
-                if found.is_some() {
-                    self.committed_row = prev_row.min(self.commit_files.len());
+                match found {
+                    // A commit's file list and diffs are immutable, so re-finding
+                    // the same commit changes nothing but its index in the walk:
+                    // the list, the row, the scroll and the cached sections all
+                    // stay, and nothing bumps. That is what keeps a watcher tick
+                    // on every worktree save from recomputing the strip under a
+                    // reader (plan 009 §3.4).
+                    Some(index) => {
+                        self.selected_commit = index;
+                        // Unless the last listing *failed*: an honestly empty
+                        // commit stays empty, but a transient error would
+                        // otherwise leave History showing no files for as long as
+                        // the commit stayed selected (codex review finding).
+                        if self.commit_files_failed {
+                            self.load_commit_files();
+                        }
+                    }
+                    None => {
+                        self.selected_commit = 0;
+                        self.load_commit_files();
+                    }
                 }
                 self.sync_history_diff();
             }
@@ -5318,9 +5398,9 @@ impl App {
 
     /// Invalidate every cached section. Anything that can change which files the
     /// stream holds, or what a file's diff or rows contain, lands here: a status
-    /// snapshot replacement, a review relist, a comment mutation, a view change.
-    /// Layout-key changes need no bump — a stale tag is caught on access (plan 006
-    /// §3.3).
+    /// snapshot replacement, a review relist, a commit's file-list installation in
+    /// History, a comment mutation, a view change. Layout-key changes need no bump
+    /// — a stale tag is caught on access (plan 006 §3.3).
     fn bump_stream_generation(&self) {
         self.stream_generation.set(self.stream_generation.get() + 1);
     }
@@ -5410,6 +5490,11 @@ impl App {
         if key == self.history_diff_key {
             return;
         }
+        // Counts as a per-file diff computation (plan §3.4 laziness observable),
+        // as `sync_diff` and `sync_review_diff` count theirs: this is the anchor's
+        // own diff, the one `compute_section` never sees.
+        self.diff_compute_count
+            .set(self.diff_compute_count.get() + 1);
         self.history_diff = Some(self.repo.commit_file_diff(commit, file));
         self.history_diff_key = key;
         self.bump_diff_generation();
@@ -5661,8 +5746,8 @@ impl App {
 
     /// One file's comment placements, resolved exactly the way the active file's
     /// are: a non-empty text diff anchors boxes to lines, while an empty/binary one
-    /// has no line to anchor to and shows only its orphan block. `None` path
-    /// (History, or nothing selected) has neither.
+    /// has no line to anchor to and shows only its orphan block. A `None` path —
+    /// History's anchor, or nothing selected — has neither.
     fn file_placements(&self, path: Option<&str>, diff: Option<&FileDiff>) -> FilePlacements {
         let Some(path) = path else {
             return FilePlacements::default();
@@ -5679,15 +5764,17 @@ impl App {
         }
     }
 
-    /// The active file's header rows (plan 006 §3.1; History is never crossed, so
-    /// it has none). Its whole payload — marker, display path, counts — is resolved
-    /// once per layout build, so rendering never re-derives it. The stream's first
-    /// file gets the band alone; below it the band is led by a rule row (plan 008
-    /// §3.5), which is why this reads the anchor's stream index.
+    /// The active file's header rows (plan 006 §3.1; none on History's `●` details
+    /// row, which is outside the stream). Its whole payload — marker, display path,
+    /// counts — is resolved once per layout build, so rendering never re-derives
+    /// it. The stream's first file gets the band alone; below it the band is led by
+    /// a rule row (plan 008 §3.5), which is why this reads the anchor's stream
+    /// index.
     fn file_header_rows(&self) -> Vec<LayoutRow> {
         if !self.cross_file_scroll {
             return Vec::new();
         }
+        let position = self.stream_position();
         let header = match self.view {
             ViewMode::Status => self
                 .selected_file()
@@ -5696,40 +5783,45 @@ impl App {
             ViewMode::Review => self
                 .review_files()
                 .get(self.review_selected())
-                .map(review_header),
-            ViewMode::History => None,
+                .map(commit_file_header),
+            // Through `stream_position`, never `committed_row - 1`: the layout is
+            // also built on the details row (a click hit-test does it), where the
+            // subtraction would underflow (plan 009 §3.3).
+            ViewMode::History => position
+                .and_then(|index| self.commit_files.get(index))
+                .map(commit_file_header),
         };
-        header.map_or_else(Vec::new, |header| {
-            header_rows(header, self.stream_position() == Some(0))
-        })
+        header.map_or_else(Vec::new, |header| header_rows(header, position == Some(0)))
     }
 
     // --- The stream: identities, sections, window (plan 006 §3.3–3.4) ---
 
-    /// How many files the current view's scroll stream holds. History is never
-    /// crossed, so its stream is empty.
+    /// How many files the current view's scroll stream holds. In History that is
+    /// the selected commit's file list — the commit (`●`) details row is outside
+    /// the stream (plan 009 §3.2).
     fn stream_len(&self) -> usize {
         match self.view {
             ViewMode::Status => self.status.total(),
             ViewMode::Review => self.review_files().len(),
-            ViewMode::History => 0,
+            ViewMode::History => self.commit_files.len(),
         }
     }
 
-    /// The anchor's index in the stream, or `None` when the view has no stream
-    /// (History) or nothing is selected.
+    /// The anchor's index in the stream, or `None` when nothing is selected — in
+    /// History, that includes the `●` details row (top-pane row 0), which has no
+    /// anchor at all: no header rows, no strip, no crossing.
     fn stream_position(&self) -> Option<usize> {
         let index = match self.view {
             ViewMode::Status => self.selected,
             ViewMode::Review => self.review_selected(),
-            ViewMode::History => return None,
+            ViewMode::History => self.committed_row.checked_sub(1)?,
         };
         (index < self.stream_len()).then_some(index)
     }
 
     /// The anchor's index when the pane has a *strip* to walk below it: cross-file
-    /// scrolling on, and a stream the anchor sits in (History has none). The single
-    /// gate both the event-path fill and the read-only assembly ask.
+    /// scrolling on, and a stream the anchor sits in. The single gate both the
+    /// event-path fill and the read-only assembly ask.
     fn strip_anchor(&self) -> Option<usize> {
         // Crossing and strips are both off while the in-place editor is open
         // (plan 006 §3.3): the anchor's layout carries the editor box, no section
@@ -5754,7 +5846,10 @@ impl App {
             ViewMode::Review => Some(FileId::Review {
                 path: self.review_files().get(index)?.path.clone(),
             }),
-            ViewMode::History => None,
+            ViewMode::History => Some(FileId::History {
+                commit: self.selected_commit_info()?.id,
+                path: self.commit_files.get(index)?.path.clone(),
+            }),
         }
     }
 
@@ -5779,6 +5874,15 @@ impl App {
                 .review_files()
                 .iter()
                 .position(|file| file.path == *path),
+            // The commit half of the identity is the History analogue of the
+            // section-exact rule: a row belonging to a commit that is no longer
+            // selected resolves to nothing rather than to the same path here.
+            FileId::History { commit, path } => {
+                if self.selected_commit_info()?.id != *commit {
+                    return None;
+                }
+                self.commit_files.iter().position(|file| file.path == *path)
+            }
         }
     }
 
@@ -5803,7 +5907,16 @@ impl App {
                 let review = self.review.as_ref()?;
                 let file = review.files.iter().find(|file| file.path == *path)?;
                 let diff = self.repo.range_file_diff(&review.spec, file);
-                (diff, review_header(file))
+                (diff, commit_file_header(file))
+            }
+            FileId::History { commit, path } => {
+                let info = self.selected_commit_info()?;
+                if info.id != *commit {
+                    return None;
+                }
+                let file = self.commit_files.iter().find(|file| file.path == *path)?;
+                let diff = self.repo.commit_file_diff(info, file);
+                (diff, commit_file_header(file))
             }
         };
         // Counted only once the file resolved and its diff was actually read —
@@ -5875,8 +5988,9 @@ impl App {
     /// so the viewport bottom can never pass the last row the stream offers. Walks
     /// prepared sections only — it never computes, which is what keeps it callable
     /// from the render path; `wheel_scroll_window` ensures first, then clamps
-    /// against the filled window. With cross-file scroll off (or in History) the
-    /// strip is empty and this *is* the anchor-content clamp.
+    /// against the filled window. With cross-file scroll off (or with no anchor,
+    /// as on History's details row) the strip is empty and this *is* the
+    /// anchor-content clamp.
     ///
     /// The walk stops once the result exceeds the anchor's own row count: no legal
     /// offset can reach past that (renormalization keeps `o <= R_anchor`), so
@@ -6036,8 +6150,8 @@ impl App {
     /// current offset, then each following file's prepared section until the
     /// viewport is full or the stream ends. Read-only — a file the cache doesn't
     /// hold ends the window as a shortfall rather than computing anything, so a
-    /// frame can never block on a repo read. History is always the single anchor
-    /// segment (it is never crossed).
+    /// frame can never block on a repo read. History's `●` details row has no
+    /// anchor at all, so it is always the single `id == None` segment.
     pub fn diff_window(&self, width: u16, height: u16) -> DiffWindow {
         let viewport = height as usize;
         let rows = self.diff_layout(width).len();
@@ -6239,6 +6353,15 @@ impl App {
                     review.diff = Some(section.diff.clone());
                     review.diff_key = Some(diff_key);
                 }
+            }
+            FileId::History { commit, path } => {
+                // The list follows the anchor: `committed_row` is one past the
+                // stream index, row 0 being the commit `●` (plan 009 §3.5). The
+                // renderer re-selects `committed_state` from it every frame, so
+                // the list scrolls the arriving file into view by itself.
+                self.select_committed_row(to + 1);
+                self.history_diff = Some(section.diff.clone());
+                self.history_diff_key = Some((*commit, path.clone()));
             }
         }
         // The arriving file's rows *are* its section's (C2 builds both through one
@@ -6772,7 +6895,7 @@ impl App {
         self.review_focus() == ReviewFocus::List
     }
 
-    /// Count of per-file diff computations so far (Status + Review). A test-only
+    /// Count of per-file diff computations so far, in all three views. A test-only
     /// observable proving a cross-file crossing computes exactly the destination
     /// file's diff — nothing eager (plan §3.4 laziness).
     #[doc(hidden)]
@@ -7932,9 +8055,9 @@ fn status_header(section: Section, entry: &FileEntry, diff: &FileDiff) -> FileHe
     }
 }
 
-/// The header payload for a reviewed file, whose `+a −d` come from the range's
-/// numstat rather than a recount.
-fn review_header(file: &CommitFile) -> FileHeaderRow {
+/// The header payload for a committed file — a reviewed range's or a single
+/// commit's — whose `+a −d` come from git's numstat rather than a recount.
+fn commit_file_header(file: &CommitFile) -> FileHeaderRow {
     let (prefix, name) = split_label(&file.path, file.orig_path.as_deref());
     FileHeaderRow {
         marker: file.change.marker(),

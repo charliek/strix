@@ -121,6 +121,12 @@ fn render_graph(frame: &mut Frame, area: Rect, app: &App) {
 
 /// The right pane when the commit row is selected: a `git show`-style summary.
 fn render_details(frame: &mut Frame, area: Rect, app: &App) {
+    // This pane records no window hits of its own, so the previous frame's have to
+    // go: stepping from a file row at offset 0 up to `●` leaves the hit map's whole
+    // epoch (layout generation, stream generation, view, offset, pane area)
+    // unchanged, and a stale strip row would route a click here into `strip_click`
+    // (plan 009 §3.6).
+    app.set_window_hits(Vec::new());
     let theme = &app.theme;
     let focused = app.history_focus() == HistoryFocus::Diff;
     let block = panel_block(" Commit ", focused, theme);
