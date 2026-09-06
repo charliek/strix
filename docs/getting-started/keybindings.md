@@ -131,9 +131,9 @@ first parent) when a file is selected.
 |-----------------|------------------------------------------------------------------|
 | `Tab`           | Cycle focus: Graph → Committed Changes → Diff                    |
 | `h`, `l`, `←`, `→` | Step focus left / right across the three panes               |
-| `j`, `k`, `↓`, `↑` | Move in the focused pane (commit / file / diff scroll)        |
+| `j`, `k`, `↓`, `↑` | Move in the focused pane: commit / file selection, or the diff cursor (plain scroll on the `●` row) |
 | `g`, `G`        | Jump to the first / last item in the focused pane                |
-| `Ctrl-d`, `Ctrl-u` | Scroll the diff (or details) a half page                      |
+| `Ctrl-d`, `Ctrl-u` | Move the diff cursor a half page (plain scroll on the `●` row) |
 | `d`             | Toggle unified / side-by-side for file diffs                     |
 | `b`             | Show / hide the left column (Graph + Committed Changes)          |
 

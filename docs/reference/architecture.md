@@ -219,9 +219,8 @@ context pair and a modified pair never carry the filler tint on either side.
 
 ## Diff pane: rows, cursor, and comments
 
-The diff pane is shared by Status, Review, and History, but only Status and
-Review have a cursor (History reuses the rendering, not the input model). The
-cursor addresses a **logical** `RowTarget` — `Code(diff_index)`,
+The diff pane is shared by Status, Review, and History, each with its own
+cursor. The cursor addresses a **logical** `RowTarget` — `Code(diff_index)`,
 `Comment(id)`, or `Orphan(id)` — never a raw row index. A separate, **physical**
 layout (`Vec<LayoutRow>`, each row carrying its `RowTarget`, a `subrow` index,
 an optional side-by-side column, and its render content) is rebuilt from that
@@ -238,10 +237,10 @@ rebuilds the layout while preserving the logical target the cursor was on. A
 the per-frame maps the renderer records instead (`HitTarget`/`ClickRegion` for
 the anchor, the `WindowHit` map for strip rows; see **Mouse** below).
 `DiffPaneState` (the cursor, the open in-place editor if any, and the comment
-boxes' `[x]` click rects recorded during render) is owned per view that *has*
-a cursor — Status and Review each get their own; the scroll offset, the
-height metrics, and the row-layout cache itself stay App-global, shared with
-History.
+boxes' `[x]` click rects recorded during render) is owned per view — Status,
+Review, and History each get their own; the scroll offset, the height
+metrics, and the row-layout cache itself stay App-global, shared across all
+three.
 
 **Line wrap.** With `wrap_lines` on (key `w`), a wrapped code line's
 `LayoutRow`s carry a `Seg` each — a `start_char`/`end_char` window into the
@@ -281,7 +280,16 @@ materializes it: `App::diff_window` renders a viewport-sized `DiffWindow` —
 the selected file (the *anchor*) from the current scroll offset, then as many
 following files' prepared `FileSection`s (each a `WindowSegment`) as fit — and
 `App::ensure_diff_window` prepares exactly what that window needs on the event
-path, never during render.
+path, never during render. In History the stream is the **selected commit's**
+file list, not the whole repo; the commit `●` details row sits outside it —
+no anchor, no header rows, no strip — and keeps the plain paragraph scrolling
+it always had. Crossing never changes the selected commit: the first file's
+first row and the last file's last row are hard edges, not a handoff to an
+adjacent commit. Section identities carry the commit's oid
+(`FileId::History { commit, path }`), so a cached section can never resolve
+against a different commit's file at the same path; the committed-changes
+list's own selection follows the anchor — moving with it, the way the Status
+and Review file lists already do — when a flip crosses a file boundary.
 
 **The file header's two rows.** The stream's first file leads with a single
 row, the header band; every file below it gets a separating `─` rule row
