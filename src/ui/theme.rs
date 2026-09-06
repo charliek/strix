@@ -19,6 +19,13 @@ pub struct Theme {
     pub title: Color,
     pub header_bg: Color,
     pub header_fg: Color,
+    /// Surface for the file-header band in the diff stream (plan 008 §3.1) —
+    /// distinct from `header_bg`, which is the top bar only.
+    pub file_header_bg: Color,
+    /// Surface behind the basename chip on the file-header band; its own
+    /// token so the chip stays visible when the cursor row repaints the rest
+    /// of the band in `selection_bg`.
+    pub file_header_chip_bg: Color,
     pub footer_bg: Color,
     pub footer_fg: Color,
     pub footer_key: Color,
@@ -194,6 +201,8 @@ impl Theme {
             title: rgb(122, 162, 247),
             header_bg: rgb(22, 22, 30),
             header_fg: rgb(192, 202, 245),
+            file_header_bg: rgb(40, 42, 56),
+            file_header_chip_bg: rgb(55, 58, 75),
             footer_bg: rgb(22, 22, 30),
             footer_fg: rgb(86, 95, 137),
             footer_key: rgb(122, 162, 247),
@@ -234,6 +243,8 @@ impl Theme {
             title: rgb(95, 135, 215),
             header_bg: rgb(18, 18, 18),
             header_fg: rgb(228, 228, 228),
+            file_header_bg: rgb(57, 57, 57),
+            file_header_chip_bg: rgb(76, 76, 76),
             footer_bg: rgb(18, 18, 18),
             footer_fg: rgb(128, 128, 128),
             footer_key: rgb(95, 135, 215),
@@ -274,6 +285,8 @@ impl Theme {
             title: rgb(64, 120, 242),
             header_bg: rgb(234, 234, 235),
             header_fg: rgb(56, 58, 66),
+            file_header_bg: rgb(233, 233, 233),
+            file_header_chip_bg: rgb(219, 219, 221),
             footer_bg: rgb(234, 234, 235),
             footer_fg: rgb(160, 161, 167),
             footer_key: rgb(64, 120, 242),
@@ -314,6 +327,8 @@ impl Theme {
             title: rgb(137, 180, 250),
             header_bg: rgb(24, 24, 37),
             header_fg: rgb(205, 214, 244),
+            file_header_bg: rgb(58, 59, 78),
+            file_header_chip_bg: rgb(76, 78, 99),
             footer_bg: rgb(24, 24, 37),
             footer_fg: rgb(108, 112, 134),
             footer_key: rgb(137, 180, 250),
@@ -354,6 +369,8 @@ impl Theme {
             title: rgb(250, 189, 47),
             header_bg: rgb(29, 32, 33),
             header_fg: rgb(235, 219, 178),
+            file_header_bg: rgb(69, 67, 61),
+            file_header_chip_bg: rgb(89, 85, 74),
             footer_bg: rgb(29, 32, 33),
             footer_fg: rgb(146, 131, 116),
             footer_key: rgb(250, 189, 47),
@@ -447,6 +464,10 @@ struct ColorsFile {
     title: Option<String>,
     header_bg: Option<String>,
     header_fg: Option<String>,
+    /// Unset falls back to the base preset's `file_header_bg`.
+    file_header_bg: Option<String>,
+    /// Unset falls back to the base preset's `file_header_chip_bg`.
+    file_header_chip_bg: Option<String>,
     footer_bg: Option<String>,
     footer_fg: Option<String>,
     footer_key: Option<String>,
@@ -489,6 +510,8 @@ impl ColorsFile {
         set(&self.title, &mut theme.title);
         set(&self.header_bg, &mut theme.header_bg);
         set(&self.header_fg, &mut theme.header_fg);
+        set(&self.file_header_bg, &mut theme.file_header_bg);
+        set(&self.file_header_chip_bg, &mut theme.file_header_chip_bg);
         set(&self.footer_bg, &mut theme.footer_bg);
         set(&self.footer_fg, &mut theme.footer_fg);
         set(&self.footer_key, &mut theme.footer_key);

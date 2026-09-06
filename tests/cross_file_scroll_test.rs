@@ -1,6 +1,7 @@
 //! Cross-file scroll (plan 006): with `f` on, the diff pane is a *continuous
 //! stream* — the anchor file's rows from the current offset, then the following
-//! files' layouts, each led by its header row. A wheel tick is a signed delta in
+//! files' layouts, each led by its header (a band, preceded by a rule row for
+//! every file but the stream's first). A wheel tick is a signed delta in
 //! that extended domain (§3.2a), renormalized across boundaries, clamped so the
 //! viewport bottom never passes the last row the stream offers (§3.2b), with the
 //! border title following the anchor (§3.2c).
@@ -52,9 +53,10 @@ fn multi_status_repo() -> TempDir {
     repo
 }
 
-/// A tall `a.txt` (62 rows) followed by a `b.txt` deep enough (42 rows) that its
-/// header can legitimately pass the top of a 20-row viewport — the fixture the
-/// handoff frames are pinned against.
+/// A tall `a.txt` (62 rows) followed by a `b.txt` deep enough (43 rows — it is
+/// not the stream's first file, so its header carries a rule row) that its header
+/// can legitimately pass the top of a 20-row viewport — the fixture the handoff
+/// frames are pinned against.
 fn handoff_repo() -> TempDir {
     let repo = init_repo();
     let a: String = (0..60).map(|i| format!("alpha {i}\n")).collect();
@@ -451,10 +453,16 @@ fn side_by_side_hands_off_the_same_way() {
         );
         assert_eq!(title.contains("b.txt"), expected_flip, "title: {title}");
         if !expected_flip && app.diff_scroll.get() == rows[0] {
-            // The boundary frame: b.txt's header leads the viewport, spanning the
-            // whole pane — no centre divider splits it (plan 006 §3.4).
-            let header: String = next[0].iter().map(|c| c.0.as_str()).collect();
-            assert!(header.contains("b.txt"), "the header row: {header}");
+            // The boundary frame: b.txt's header leads the viewport — its rule row
+            // then its band, both spanning the whole pane with no centre divider
+            // splitting them (plan 006 §3.4, plan 008 §3.5).
+            let rule: String = next[0].iter().map(|c| c.0.as_str()).collect();
+            assert!(
+                rule.trim_end().chars().all(|c| c == '─'),
+                "the rule row: {rule}"
+            );
+            let header: String = next[1].iter().map(|c| c.0.as_str()).collect();
+            assert!(header.contains("b.txt"), "the band row: {header}");
             assert!(!header.contains('│'), "full-width in SBS: {header}");
         }
         body = next;
@@ -922,7 +930,7 @@ fn a_reload_mid_window_re_derives_the_strip() {
         .as_ref()
         .expect("b.txt is still the strip");
     assert!(
-        strip.rows.len() < 42,
+        strip.rows.len() < 43,
         "the strip re-derived from the rewritten file, not a stale section"
     );
 }
@@ -1166,10 +1174,15 @@ fn k_above_the_anchors_first_stop_flips_onto_the_previous_files_last_target() {
         top.contains("alpha 59"),
         "a.txt's last row leads the pane: {top}"
     );
-    let below = body_text(&body, 1);
+    let rule = body_text(&body, 1);
+    assert!(
+        rule.trim_end().chars().all(|c| c == '─'),
+        "the file just left is separated by its rule row: {rule}"
+    );
+    let below = body_text(&body, 2);
     assert!(
         below.contains("b.txt"),
-        "the file just left continues right below it: {below}"
+        "and its band continues right below that: {below}"
     );
 }
 
@@ -1408,11 +1421,14 @@ fn the_walk_crosses_a_staged_unstaged_same_path_boundary() {
     );
 
     // Walking on flips exactly when the reveal renormalizes past the boundary.
+    // The step above already spent *two* rows, not one: the arriving header is a
+    // two-row target and a reveal shows a target's whole span (plan 008 §3.5), so
+    // the flip lands one press earlier than it did with a one-row header.
     let presses = press_until_flip(&mut app, 'j', W, H);
     assert_eq!(
         presses,
-        viewport_at(H),
-        "one press per row (the first is already spent) until the top passes \
+        viewport_at(H) - 1,
+        "one press per row (the first two are already spent) until the top passes \
          R_anchor"
     );
     assert_eq!(selected_path(&app), "dup.txt");
@@ -1695,14 +1711,28 @@ fn review_walks_both_directions() {
     assert!(title.contains(&first), "the title has not flipped: {title}");
     assert!(
         body_text(&body, v - 1).contains(&second),
-        "and the arriving header is the bottom row"
+        "and the arriving header's band is the bottom row"
+    );
+    assert!(
+        body_text(&body, v - 2).trim_end().chars().all(|c| c == '─'),
+        "its rule row arrived with it: {}",
+        body_text(&body, v - 2)
     );
 
-    // The anchor follows once the reveal renormalizes past the boundary.
+    // The anchor follows once the reveal renormalizes past the boundary — one
+    // press sooner than with a one-row header, because the step onto the header
+    // revealed both of its rows at once (plan 008 §3.5).
     let presses = press_until_flip(&mut app, 'j', W, h);
-    assert_eq!(presses, v, "one press per row past the first stop");
+    assert_eq!(presses, v - 1, "one press per row past the first stop");
     assert_eq!(app.review_selected(), 1);
-    assert_eq!(app.diff_scroll.get(), 1, "one row past the top");
+    // Two rows past the top, not one: the press that flips walks clear of the
+    // (short) second file onto the *third* file's header, and revealing that
+    // two-row target pulls both of its rows in at once (plan 008 §3.5).
+    assert_eq!(
+        app.diff_scroll.get(),
+        2,
+        "past the top by the header it revealed"
+    );
     let (title, _) = frame(&app, h);
     assert!(title.contains(&second), "the title flipped: {title}");
 
@@ -1722,8 +1752,13 @@ fn review_walks_both_directions() {
         "the title followed the anchor: {title}"
     );
     assert!(
-        body_text(&body, 1).contains(&second),
-        "the file just left continues below it: {}",
+        body_text(&body, 1).trim_end().chars().all(|c| c == '─'),
+        "the file just left is separated by its rule row: {}",
         body_text(&body, 1)
+    );
+    assert!(
+        body_text(&body, 2).contains(&second),
+        "and its band continues below that: {}",
+        body_text(&body, 2)
     );
 }

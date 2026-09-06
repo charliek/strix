@@ -147,6 +147,87 @@ fn a_theme_with_the_retired_gutter_keys_still_resolves_and_inherits_filler() {
     assert_eq!(theme.filler_bg, gruvbox.filler_bg);
 }
 
+// --- file-header band/chip colours (plan 008 §3.1, C1) ---
+
+/// Sum of the per-channel differences between two RGB colours. A plain
+/// `assert_ne!` would pass on a one-unit difference — which is exactly the bug
+/// plan 008 fixes, where the old band sat four units from the pane background
+/// and read as the same surface. These colours have to be *perceptibly* apart.
+fn channel_distance(a: Color, b: Color) -> u32 {
+    let rgb = |c: Color| match c {
+        Color::Rgb(r, g, b) => (r as i32, g as i32, b as i32),
+        other => panic!("preset colours are truecolor, got {other:?}"),
+    };
+    let (ar, ag, ab) = rgb(a);
+    let (br, bg, bb) = rgb(b);
+    ((ar - br).abs() + (ag - bg).abs() + (ab - bb).abs()) as u32
+}
+
+/// The margin every pair below clears; the tightest real pair is the light
+/// preset's band against its filler tint, at 16. `band vs selection` is the
+/// one that shapes the palette: on three presets `selection_bg` is itself a
+/// subtle lift of `bg`, so the band has to sit above it or the cursor would
+/// be invisible on the header row.
+const APART: u32 = 12;
+
+#[test]
+fn every_preset_sets_perceptibly_distinct_file_header_colours() {
+    for name in Theme::PRESETS {
+        let theme = Theme::preset(name).unwrap();
+        for (label, a, b) in [
+            ("band vs pane bg", theme.file_header_bg, theme.bg),
+            ("band vs filler", theme.file_header_bg, theme.filler_bg),
+            (
+                "band vs selection",
+                theme.file_header_bg,
+                theme.selection_bg,
+            ),
+            (
+                "chip vs band",
+                theme.file_header_chip_bg,
+                theme.file_header_bg,
+            ),
+            ("chip vs pane bg", theme.file_header_chip_bg, theme.bg),
+            (
+                "chip vs selection",
+                theme.file_header_chip_bg,
+                theme.selection_bg,
+            ),
+        ] {
+            let distance = channel_distance(a, b);
+            assert!(
+                distance >= APART,
+                "{name}: {label} are only {distance} apart ({a:?} vs {b:?})"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_custom_theme_without_file_header_colours_falls_back_to_the_base_preset() {
+    // `mine` overrides an unrelated colour but not file_header_bg/
+    // file_header_chip_bg, so an existing user theme file predating this
+    // field is unaffected (plan 008 §3.1).
+    let dir = config_with_themes(&[("mine", "base = \"gruvbox\"\n[colors]\nadd = \"#00ff00\"\n")]);
+
+    let theme = Theme::resolve("mine", Some(dir.path())).1;
+    let gruvbox = Theme::preset("gruvbox").unwrap();
+    assert_eq!(theme.file_header_bg, gruvbox.file_header_bg);
+    assert_eq!(theme.file_header_chip_bg, gruvbox.file_header_chip_bg);
+}
+
+#[test]
+fn a_custom_theme_can_override_the_file_header_colours() {
+    let dir = config_with_themes(&[(
+        "mine",
+        "base = \"gruvbox\"\n[colors]\nfile_header_bg = \"#00ff00\"\nfile_header_chip_bg = \"#ff0000\"\n",
+    )]);
+
+    let theme = Theme::resolve("mine", Some(dir.path())).1;
+    assert_eq!(theme.file_header_bg, Color::Rgb(0, 255, 0));
+    assert_eq!(theme.file_header_chip_bg, Color::Rgb(255, 0, 0));
+}
+
 // --- resolve: canonical name reporting (§3.5) ---
 
 #[test]

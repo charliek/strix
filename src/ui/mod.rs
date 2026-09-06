@@ -492,9 +492,14 @@ impl MarkerTone {
 }
 
 /// The spans for one changed-file row: a bold change marker, the display path,
-/// then `+a −d` line stats (or `(binary)`). The single source shared by the
-/// review file list, the history commit-detail per-file breakdown, and the diff
-/// pane's file-header row (plan 006 §3.1), so the three can't drift apart.
+/// then `+a −d` line stats (or `(binary)`). Shared by the review file list and
+/// the history commit-detail per-file breakdown, so the two can't drift apart.
+///
+/// The diff pane's file-header band drew these spans too until plan 008 §3.2:
+/// it now builds its own (a tone bar, a dim directory prefix, the basename on a
+/// chip, right-aligned counts), because a chip reads as noise in a 30-column
+/// list. The two stay consistent in *content* by construction — same
+/// [`MarkerTone`], same [`CommitStat`] — rather than by sharing spans.
 pub(crate) fn stat_spans(
     marker: char,
     tone: MarkerTone,
