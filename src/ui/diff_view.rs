@@ -110,7 +110,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
 
     // The file the cursor addresses and the `[start, end)` rows of its target in
     // *that file's own* layout, to paint with the selection background — `None`
-    // outside a cursor-bearing view or while its file list is focused (plan §3.4).
+    // while the view's list pane is focused rather than the diff (plan §3.4).
     // A comment box spans several rows.
     let cursor = app.cursor_highlight_span();
 

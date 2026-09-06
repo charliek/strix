@@ -263,9 +263,10 @@ enum ClickRegion {
 /// mode toggle, or comment mutation bumps it), so any relayout between the two
 /// clicks — including a scroll that moved rows — makes the equality fail; `view`
 /// and `file` guard against a view switch or a file change producing the same
-/// row index. Only produced for the cursor-bearing views' (Status/Review) diff
-/// rows: a click in the file list, the marker zone, or History yields `None`, so
-/// those never open the editor.
+/// row index. Only produced for a diff row: a click in the file list or the
+/// marker zone yields `None`, so those never open the editor. History resolves
+/// one like any other view, but its double-click arm is inert (no comments), so
+/// there it only feeds the tracker.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct HitTarget {
     generation: u64,
@@ -1002,13 +1003,13 @@ impl CommentEdit {
     }
 }
 
-/// A diff pane's cursor + editor state, owned by each view that has a cursor.
-/// The cursor names a [`CursorAddress`] — a file plus one of its logical
-/// [`RowTarget`]s, never a physical row: `None` is the reset state (the anchor's
-/// first target), resolved once the layout exists — a file change or mode toggle
-/// resets before the new layout is built, so the concrete target isn't yet known.
-/// Scroll/metrics/row caches stay App-global (History shares them and has no
-/// cursor).
+/// A diff pane's cursor + editor state, owned once per view (`status_pane`,
+/// `review.pane`, `history_pane`). The cursor names a [`CursorAddress`] — a file
+/// plus one of its logical [`RowTarget`]s, never a physical row: `None` is the
+/// reset state (the anchor's first target), resolved once the layout exists — a
+/// file change or mode toggle resets before the new layout is built, so the
+/// concrete target isn't yet known. Scroll/metrics/row caches stay App-global,
+/// shared by whichever view is showing.
 ///
 /// The field is written **only** by `App::write_cursor` and the setters above it
 /// (plan 007 §3.3a); nothing else assigns it.
@@ -1320,6 +1321,11 @@ pub struct App {
     /// Row in the top "Committed Changes" list: 0 is the commit (`●`) row,
     /// `1..=commit_files.len()` index into `commit_files`.
     committed_row: usize,
+    /// History's own diff-pane cursor, the third `DiffPaneState` beside
+    /// `status_pane` and `review.pane` (plan 009 §3.1). Its `editing` slot exists
+    /// but can never open: History authors no comments, so nothing reaches
+    /// `set_editor`.
+    history_pane: DiffPaneState,
     history_diff: Option<FileDiff>,
     history_diff_key: Option<(gix::ObjectId, String)>,
     /// Height (rows) of the top "Committed Changes" sub-pane; the Graph fills the
@@ -1459,6 +1465,7 @@ impl App {
             commit_files: Vec::new(),
             commit_files_failed: false,
             committed_row: 0,
+            history_pane: DiffPaneState::default(),
             history_diff: None,
             history_diff_key: None,
             committed_height: DEFAULT_COMMITTED_HEIGHT,
@@ -1994,7 +2001,8 @@ impl App {
     }
 
     /// Move the diff cursor to the first or last physical row (g/G in the diff
-    /// pane), then reveal it. Shared by the review and status views' diff panes.
+    /// pane), then reveal it. Shared by every view's diff pane — status, review
+    /// and, on a file row, history.
     fn cursor_to_edge(&mut self, bottom: bool) {
         let count = self.review_row_count();
         let idx = if bottom { count.saturating_sub(1) } else { 0 };
@@ -2201,12 +2209,13 @@ impl App {
         }
     }
 
-    /// A half-page scroll of the diff viewport while the *file list* is focused
-    /// (Status staging pane / Review list). The list has no diff cursor to move, so
-    /// with cross-file scroll on this is a plain wheel-sized tick in the stream
-    /// domain (plan 006 §3.5): continuous through a boundary, no clamp-then-cross
-    /// step, no cursor. With cross-file off, with no anchor, or while editing, it
-    /// is the plain clamping scroll it always was.
+    /// A half-page scroll of the diff viewport while a *list* pane is focused
+    /// (Status staging pane / Review list / History's Graph and committed
+    /// changes). A list has no diff cursor to move, so with cross-file scroll on
+    /// this is a plain wheel-sized tick in the stream domain (plan 006 §3.5):
+    /// continuous through a boundary, no clamp-then-cross step, no cursor. With
+    /// cross-file off, with no anchor, or while editing, it is the plain clamping
+    /// scroll it always was.
     fn list_scroll_half_page(&mut self, down: bool) {
         let step = self.half_page();
         if self.strip_anchor().is_some() {
@@ -2470,8 +2479,8 @@ impl App {
     // moved without the file it belongs to), and the divergence sweep below has
     // exactly one place to hook.
 
-    /// The one place the cursor field is assigned. A no-op in a view with no
-    /// cursor (History).
+    /// The one place the cursor field is assigned. A no-op when there is no pane
+    /// to write to (review without a session).
     fn write_cursor(&mut self, address: Option<CursorAddress>) {
         if let Some(pane) = self.active_pane_mut() {
             pane.cursor = address;
@@ -2483,9 +2492,12 @@ impl App {
     /// the anchor's layout). Divergence, if any, ends here: the address is
     /// rebuilt around the current anchor rather than carried over.
     fn set_cursor_on_anchor(&mut self, target: Option<RowTarget>) {
-        let address = target
-            .zip(self.active_file_id())
-            .map(|(target, file)| CursorAddress { file, target });
+        // `active_file_id` clones the path, so only ask for it once there *is* a
+        // target to pair with: the bare `None` reset is the common call.
+        let address = target.and_then(|target| {
+            self.active_file_id()
+                .map(|file| CursorAddress { file, target })
+        });
         self.write_cursor(address);
     }
 
@@ -2734,14 +2746,14 @@ impl App {
     }
 
     /// The active view's diff-pane cursor/editor state: the status view's own
-    /// (`status_pane`) or the review session's (`review.pane`). History has no
-    /// cursor, so `None`. This is what lets the cursor seam serve both
-    /// cursor-bearing views from one implementation.
+    /// (`status_pane`), the review session's (`review.pane`), or the history
+    /// view's (`history_pane`). `None` only in review without a session. This is
+    /// what lets the cursor seam serve all three views from one implementation.
     fn active_pane(&self) -> Option<&DiffPaneState> {
         match self.view {
             ViewMode::Status => Some(&self.status_pane),
             ViewMode::Review => self.review.as_ref().map(|review| &review.pane),
-            ViewMode::History => None,
+            ViewMode::History => Some(&self.history_pane),
         }
     }
 
@@ -2749,7 +2761,7 @@ impl App {
         match self.view {
             ViewMode::Status => Some(&mut self.status_pane),
             ViewMode::Review => self.review.as_mut().map(|review| &mut review.pane),
-            ViewMode::History => None,
+            ViewMode::History => Some(&mut self.history_pane),
         }
     }
 
@@ -2884,12 +2896,12 @@ impl App {
         self.review_reveal_cursor();
     }
 
-    /// Focus the diff pane in whichever cursor-bearing view is active.
+    /// Focus the diff pane in whichever view is active.
     fn focus_active_diff(&mut self) {
         match self.view {
             ViewMode::Status => self.focus = Focus::Diff,
             ViewMode::Review => self.set_review_focus(ReviewFocus::Diff),
-            ViewMode::History => {}
+            ViewMode::History => self.history_focus = HistoryFocus::Diff,
         }
     }
 
@@ -3071,9 +3083,9 @@ impl App {
     }
 
     /// Install `edit` as the active pane's in-place editor, drop the cached row
-    /// layout so it re-expands with the editor box, and reveal the caret. A no-op
-    /// in a cursor-less view (History), where `authoring_identity` already
-    /// returned `None` and this is never reached.
+    /// layout so it re-expands with the editor box, and reveal the caret. Never
+    /// reached in History: `authoring_identity` returns `None` there, so the
+    /// pane's `editing` slot exists but stays empty.
     fn set_editor(&mut self, edit: CommentEdit) {
         // The editor box renders inline in the *anchor's* rows, so it can only
         // ever open on a converged cursor — §3.3g's convergence runs before every
@@ -3562,11 +3574,10 @@ impl App {
             .unwrap_or(0)
     }
 
-    /// Whether the cursor highlight is painted at all: only in a cursor-bearing
-    /// view (status or review) with the diff pane focused (plan §3.4), so it
-    /// never shows while the file list is focused or in History — and never while
-    /// the in-place editor is open, whose box shows a caret instead (the row
-    /// underneath it isn't highlighted either).
+    /// Whether the cursor highlight is painted at all: only with the diff pane
+    /// focused (plan §3.4), so it never shows while a file list or the Graph is
+    /// focused — and never while the in-place editor is open, whose box shows a
+    /// caret instead (the row underneath it isn't highlighted either).
     fn cursor_highlight_visible(&self) -> bool {
         !self.editing() && self.diff_focused() && self.active_pane().is_some()
     }
@@ -3588,8 +3599,8 @@ impl App {
     /// (plan 007 §3.3i). The renderer matches this per window segment, so a
     /// divergent cursor highlights its strip row while the anchor stays put; for
     /// an anchor cursor it is [`App::review_cursor_highlight`] plus the anchor's
-    /// identity, and the same gates apply (nothing while the editor is open, the
-    /// file list is focused, or in History).
+    /// identity, and the same gates apply (nothing while the editor is open or a
+    /// list pane is focused).
     pub fn cursor_highlight_span(&self) -> Option<(FileId, Range<usize>)> {
         if !self.cursor_highlight_visible() {
             return None;
@@ -3667,8 +3678,9 @@ impl App {
 
     fn enter_history(&mut self) {
         // Before the view changes, while the home pane is still the active one:
-        // History has no cursor pane, so a divergent address left behind would be
-        // unreachable by the sweep until the user came back (plan 007 §3.3b).
+        // the sweep only ever inspects the *active* view's pane, so a divergent
+        // address left behind would outlive its window until the user came back
+        // (plan 007 §3.3b).
         self.clear_divergent_cursor();
         if self.commits.is_empty() {
             self.load_history();
@@ -3691,6 +3703,12 @@ impl App {
     }
 
     fn exit_history(&mut self) {
+        // Before the view changes, while `history_pane` is still the active one:
+        // a divergent address left there would outlive the stream it names (the
+        // mirror of `enter_history`'s pre-switch clear, plan 009 §3.1). A
+        // *converged* History cursor may stay — re-entry resets it through
+        // `load_commit_files`.
+        self.clear_divergent_cursor();
         // Return to the session's home view (status or review), not always status.
         self.view = self.home_view();
         // The stream is re-scoped; the home pane's cursor converges (plan 007
@@ -3748,15 +3766,20 @@ impl App {
     ///
     /// The single place that list — which *is* History's scroll stream — is
     /// installed, so every exit takes the same steps, including the no-commit and
-    /// listing-error ones: reset the row, install (or clear) the list, and bump
-    /// `stream_generation` exactly once, retiring sections built against the
-    /// commit being left. That makes the contract "one bump per file-list
-    /// installation" rather than per commit *change*: a Graph re-click or an edge
-    /// no-op reloads the same commit and bumps too, but it also returns to `●`, so
-    /// nothing could have reached those sections anyway (plan 009 §3.4).
+    /// listing-error ones: reset the row and the cursor, install (or clear) the
+    /// list, and bump `stream_generation` exactly once, retiring sections built
+    /// against the commit being left. That makes the contract "one bump per
+    /// file-list installation" rather than per commit *change*: a Graph re-click
+    /// or an edge no-op reloads the same commit and bumps too, but it also
+    /// returns to `●`, so nothing could have reached those sections anyway (plan
+    /// 009 §3.4).
     fn load_commit_files(&mut self) {
         self.committed_row = 0;
         self.committed_state.borrow_mut().select(None);
+        // The arriving list is a different stream: any address into the old one is
+        // meaningless, divergent or not. `enter_history` switches the view before
+        // calling this, so the write lands on `history_pane` (plan 009 §3.1).
+        self.set_cursor_on_anchor(None);
         let listed = self
             .selected_commit_info()
             .map(|commit| self.repo.commit_files(commit));
@@ -3783,6 +3806,9 @@ impl App {
             return;
         }
         self.committed_row = row;
+        // `None` is the top-of-layout reset; the arriving row's layout doesn't
+        // exist yet (it's built by the trailing `sync_active`).
+        self.set_cursor_on_anchor(None);
     }
 
     /// Pull in the next page of history when the Graph selection reaches the end
@@ -3843,18 +3869,25 @@ impl App {
             } else {
                 self.committed_row.saturating_sub(1)
             }),
-            HistoryFocus::Diff => self.scroll_diff(down, 1),
+            // The `●` details row is a paragraph, not a diff: it has no cursor
+            // rows and scrolls by `diff_scroll`, so there j/k stay a row scroll
+            // (plan 009 §3.6).
+            HistoryFocus::Diff if self.history_shows_details() => self.scroll_diff(down, 1),
+            HistoryFocus::Diff => self.review_move_cursor(down, 1),
         }
     }
 
     /// A half page in the history view, by focused sub-pane — the mirror of
     /// `review_half_page`. With the Graph or the file list focused there is no
     /// cursor to move, so it is a viewport tick that crosses file boundaries when
-    /// the stream is on; the Diff arm keeps the plain per-file clamp
-    /// `history_move` uses there.
+    /// the stream is on; with the Diff focused it moves the cursor, except on the
+    /// `●` details row, which keeps the paragraph scroll (plan 009 §3.6).
     fn history_half_page(&mut self, down: bool) {
         match self.history_focus {
-            HistoryFocus::Diff => self.scroll_diff(down, self.half_page()),
+            HistoryFocus::Diff if self.history_shows_details() => {
+                self.scroll_diff(down, self.half_page())
+            }
+            HistoryFocus::Diff => self.review_move_cursor(down, self.half_page() as usize),
             HistoryFocus::Graph | HistoryFocus::CommittedChanges => {
                 self.list_scroll_half_page(down)
             }
@@ -3874,10 +3907,14 @@ impl App {
             HistoryFocus::CommittedChanges => {
                 self.select_committed_row(if bottom { self.commit_files.len() } else { 0 });
             }
-            HistoryFocus::Diff => {
+            // On a file row g/G are the cursor's edges within the *current* file,
+            // exactly as in Review; the `●` details paragraph keeps the viewport
+            // edges it has no cursor for (plan 009 §3.6).
+            HistoryFocus::Diff if self.history_shows_details() => {
                 self.diff_scroll
                     .set(if bottom { self.diff_max_scroll() } else { 0 });
             }
+            HistoryFocus::Diff => self.cursor_to_edge(bottom),
         }
     }
 
@@ -4258,8 +4295,8 @@ impl App {
 
     /// The semantic [`HitTarget`] a click position resolves to, or `None` when it
     /// isn't a double-click candidate: outside the diff pane, past its last row, on
-    /// the in-place editor, or in a view with no diff cursor (History). Reuses the
-    /// C1 physical→logical seam (`review_target_at`) for the row and C6's recorded
+    /// the in-place editor, or with no pane at all. Reuses the C1
+    /// physical→logical seam (`review_target_at`) for the row and C6's recorded
     /// `[x]` rects (`comment_close_rect`) to split a box's close cell from its body.
     fn hit_target(&self, pos: Position) -> Option<HitTarget> {
         self.active_pane()?;
@@ -4303,7 +4340,8 @@ impl App {
     /// §3.6): place the cursor on the clicked row (Review's single-click routing
     /// already did; Status's did not), then run the view's comment action — which
     /// adds on a code line, edits a human note, or flashes an agent note read-only,
-    /// exactly like the `c` key. A no-op in History (no cursor / no `hit_target`).
+    /// exactly like the `c` key. History authors no comments, so there it is
+    /// idempotent with the single click: it places the same cursor and stops.
     fn double_click_comment(&mut self, pos: Position) {
         self.place_diff_cursor(pos);
         match self.view {
@@ -4313,9 +4351,10 @@ impl App {
         }
     }
 
-    /// Focus the diff pane and move its cursor onto the clicked physical row, so
-    /// the editor anchors where the user double-clicked. A no-op for a click
-    /// outside the diff or past its last row (the cursor stays put).
+    /// Focus the diff pane and move its cursor onto the clicked physical row —
+    /// History's single click, and the double-click path, where it is what makes
+    /// the editor anchor where the user clicked. A no-op for a click outside the
+    /// diff or past its last row (the cursor stays put).
     fn place_diff_cursor(&mut self, pos: Position) {
         self.focus_active_diff();
         let Some(row) = self.diff_row_at(pos) else {
@@ -4534,7 +4573,7 @@ impl App {
 
     /// Route a click in the history view to its sub-pane: the Graph selects a
     /// commit, the Committed Changes list selects the commit row or a file, the
-    /// diff pane just takes focus.
+    /// diff pane takes focus and moves its cursor to the clicked row.
     fn history_click(&mut self, pos: Position) {
         let graph = self.graph_area.get();
         let committed = self.committed_area.get();
@@ -4550,7 +4589,11 @@ impl App {
             let row = self.committed_state.borrow().offset() + (pos.y - committed.y) as usize;
             self.select_committed_row(row);
         } else if self.diff_area.get().contains(pos) {
-            self.history_focus = HistoryFocus::Diff;
+            // The same focus-and-place the double-click path already uses. On the
+            // `●` details row the layout is empty, so no row matches and the click
+            // only focuses. A strip row never gets here — `on_left_down` routes
+            // those to `strip_click`.
+            self.place_diff_cursor(pos);
         }
     }
 
@@ -7079,8 +7122,8 @@ impl App {
     }
 
     /// Record the `[x]` close-cell rects of the comment boxes drawn this frame, on
-    /// the active view's pane (Status or Review; History has no cursor pane, so a
-    /// no-op). C8 hit-tests a click against these to delete a note.
+    /// the active view's pane. C8 hit-tests a click against these to delete a note;
+    /// History draws no boxes, so its map stays empty.
     pub fn set_x_rects(&self, rects: HashMap<u64, Rect>) {
         if let Some(pane) = self.active_pane() {
             *pane.x_rects.borrow_mut() = rects;

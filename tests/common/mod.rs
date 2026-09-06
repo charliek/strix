@@ -10,7 +10,7 @@ use std::time::Duration;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
-use strix::app::{App, DiffWindow, FileId, HistoryFocus, RowTarget};
+use strix::app::{App, DiffWindow, FileId, HistoryFocus, LayoutRow, RowTarget};
 use strix::comments::{Branch, Comment, Store};
 use strix::config::Config;
 use strix::crossterm::event::{
@@ -198,6 +198,12 @@ pub fn row_has_fg(buf: &Buffer, y: u16, fg: Color) -> bool {
 /// Whether any cell in buffer row `y` carries background colour `bg`.
 pub fn row_has_bg(buf: &Buffer, y: u16, bg: Color) -> bool {
     let area = buf.area;
+    (area.x..area.x + area.width).any(|x| buf.cell((x, y)).map(|c| c.bg) == Some(bg))
+}
+
+/// Whether any cell of buffer row `y` **inside the diff pane** carries `bg` (the
+/// file list draws its own selection background, which must not count).
+pub fn diff_row_has_bg(buf: &Buffer, area: Rect, y: u16, bg: Color) -> bool {
     (area.x..area.x + area.width).any(|x| buf.cell((x, y)).map(|c| c.bg) == Some(bg))
 }
 
@@ -641,6 +647,59 @@ pub fn prepare_window(app: &mut App) {
 pub fn window_of(app: &App) -> DiffWindow {
     let area = app.diff_area();
     app.diff_window(area.width, area.height)
+}
+
+/// One row the window draws: its screen position and the identity the renderer
+/// records for it in the hit map.
+pub struct WindowRow {
+    pub y: u16,
+    pub anchor: bool,
+    pub file: FileId,
+    pub target: RowTarget,
+}
+
+/// Every row of the current window in screen order — the same walk the renderer
+/// does when it records the hit map, so a click at `row.y` resolves to `row`.
+pub fn window_rows(app: &App) -> Vec<WindowRow> {
+    let diff = app.diff_area();
+    let window = window_of(app);
+    let layout = app.diff_layout(diff.width);
+    let mut out = Vec::new();
+    let mut y = diff.y;
+    for segment in &window.segments {
+        let rows: &[LayoutRow] = match &segment.section {
+            None => &layout[segment.row_range.clone()],
+            Some(section) => &section.rows[segment.row_range.clone()],
+        };
+        for row in rows {
+            if let Some(file) = segment.id.clone() {
+                out.push(WindowRow {
+                    y,
+                    anchor: segment.is_anchor(),
+                    file,
+                    target: row.target,
+                });
+            }
+            y += 1;
+        }
+    }
+    out
+}
+
+/// The first strip row matching `pred`, panicking with the window's shape when
+/// there is none.
+pub fn strip_row(app: &App, what: &str, mut pred: impl FnMut(&WindowRow) -> bool) -> WindowRow {
+    window_rows(app)
+        .into_iter()
+        .find(|row| !row.anchor && pred(row))
+        .unwrap_or_else(|| panic!("no strip row matching {what} in the current window"))
+}
+
+/// The first strip row that is a file header.
+pub fn strip_header_row(app: &App) -> WindowRow {
+    strip_row(app, "a file header", |row| {
+        row.target == RowTarget::FileHeader
+    })
 }
 
 /// Build `app_for(repo, cfg)` and render one frame at [`STREAM_W`]×`h`, so the

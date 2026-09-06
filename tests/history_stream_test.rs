@@ -9,12 +9,19 @@
 
 mod common;
 
+use std::time::Instant;
+
 use common::{
-    cell_bg, cell_symbol, click, commit_at, config, ctrl, dump, git, git_env, history_select_row,
-    init_repo_with_multi_file_commit, key, mouse, prepare_window, press, render_buffer,
-    rendered_app, row_of, window_of, write,
+    cell_bg, cell_symbol, click, commit_at, config, ctrl, diff_row_has_bg, dump, esc, git, git_env,
+    history_select_row, init_repo_with_multi_file_commit, key, mouse, ms, prepare_window, press,
+    render_buffer, rendered_app, row_of, seed_store, strip_header_row, strip_row, tab, window_of,
+    write,
 };
-use strix::app::{App, FileId, HeaderPart, HistoryFocus, RowContent, RowTarget, ViewMode};
+use strix::app::{
+    App, CursorAddress, FileId, HeaderPart, HistoryFocus, LayoutRow, RowContent, RowTarget,
+    ViewMode,
+};
+use strix::comments::{Comment, Scope, Side, Source};
 use strix::crossterm::event::MouseEventKind;
 use strix::git::{FileDiff, LineKind};
 use tempfile::TempDir;
@@ -729,4 +736,549 @@ fn the_stream_generation_advances_once_per_file_list_installation() {
     app.on_key(key('i'));
     assert_eq!(app.view, ViewMode::Status);
     assert_eq!(app.stream_generation(), generation + 1);
+}
+
+// --- C2: History's diff cursor ----------------------------------------------
+//
+// `history_pane` gives the History diff pane the same `DiffPaneState` Status and
+// Review own, so the whole cursor seam — placement, the walk, divergence, the
+// highlight — starts working there by construction. The commit `●` row is the
+// one exception: it is a paragraph, not a diff, so its keys stay a plain scroll.
+
+/// Two tall files in HEAD (`a.txt` and `b.txt` rewritten to 60 lines each), so
+/// either can lead the window and a half page has room to cross between them.
+fn two_tall_files_repo() -> TempDir {
+    let repo = init_repo_with_multi_file_commit();
+    let path = repo.path();
+    let alpha: String = (0..60).map(|i| format!("alpha {i}\n")).collect();
+    let beta: String = (0..60).map(|i| format!("beta {i}\n")).collect();
+    write(path, "a.txt", &alpha);
+    write(path, "b.txt", &beta);
+    git(path, &["add", "."]);
+    commit_at(path, "grow a and b", "2021-01-04T00:00:00");
+    repo
+}
+
+/// HEAD edits one line of `a.txt` and rewrites `b.txt` to 60 lines, so a walk
+/// that steps off the short first file stays inside the second one long enough
+/// for the anchor to follow it across.
+fn tall_second_file_repo() -> TempDir {
+    let repo = init_repo_with_multi_file_commit();
+    let path = repo.path();
+    let beta: String = (0..60).map(|i| format!("beta {i}\n")).collect();
+    write(path, "a.txt", "alpha one\nalpha again\nalpha three\n");
+    write(path, "b.txt", &beta);
+    git(path, &["add", "."]);
+    commit_at(path, "grow b", "2021-01-04T00:00:00");
+    repo
+}
+
+/// A HEAD whose commit message is far taller than any viewport here, so the
+/// details paragraph has somewhere to scroll.
+fn long_message_repo() -> TempDir {
+    let repo = init_repo_with_multi_file_commit();
+    let path = repo.path();
+    write(path, "a.txt", "alpha one\nalpha again\nalpha three\n");
+    git(path, &["add", "."]);
+    let message: String = (0..40).map(|i| format!("message line {i}\n")).collect();
+    commit_at(path, &message, "2021-01-04T00:00:00");
+    repo
+}
+
+/// Focus the History diff pane from wherever focus is now.
+fn focus_diff(app: &mut App, h: u16) {
+    for _ in 0..3 {
+        if app.diff_focused() {
+            break;
+        }
+        app.on_key(key('l'));
+    }
+    assert!(app.diff_focused(), "the diff pane never took focus");
+    let _ = dump(app, W, h);
+}
+
+/// Press `ch` until the committed-changes row reaches `want`, rendering between
+/// presses as the event loop does.
+fn press_until_row(app: &mut App, ch: char, want: usize, h: u16) {
+    for _ in 0..400 {
+        app.on_key(key(ch));
+        let _ = dump(app, W, h);
+        if app.committed_row() == want {
+            return;
+        }
+    }
+    panic!("committed row {want} was never reached by `{ch}`");
+}
+
+/// Walk the cursor down until it leaves the anchor, returning the file it landed
+/// in. Panics rather than looping forever when the walk never diverges.
+fn walk_until_divergent(app: &mut App, h: u16) -> FileId {
+    for _ in 0..400 {
+        app.on_key(key('j'));
+        let _ = dump(app, W, h);
+        if app.cursor_divergent() {
+            return app.cursor_address().expect("a divergent cursor").file;
+        }
+    }
+    panic!("the walk never left the anchor");
+}
+
+// --- A6: the keyboard walk --------------------------------------------------
+
+#[test]
+fn the_history_diff_pane_walks_the_cursor_across_the_commits_files() {
+    let repo = tall_second_file_repo();
+    let mut app = history_app(&repo, true, SHORT_H);
+    history_select_row(&mut app, 1, W, SHORT_H);
+    focus_diff(&mut app, SHORT_H);
+    let a_rows = app.diff_row_count();
+    let b_id = hist(&app, 0, "b.txt");
+
+    // `G`/`g` are the *current file's* edges, exactly as in Review — not the
+    // stream's (plan 009 §3.1).
+    app.on_key(key('G'));
+    assert_eq!(app.review_cursor(), a_rows - 1, "a.txt's last target");
+    assert_eq!(app.committed_row(), 1, "and the anchor has not moved");
+    assert!(!app.cursor_divergent());
+
+    // One more step walks off a.txt's end onto b.txt's header: divergent, with
+    // the anchor and the list still on a.txt.
+    app.on_key(key('j'));
+    let _ = dump(&app, W, SHORT_H);
+    assert_eq!(
+        app.cursor_address(),
+        Some(CursorAddress {
+            file: b_id.clone(),
+            target: RowTarget::FileHeader,
+        }),
+        "the walk stepped onto the next file's header"
+    );
+    assert!(app.cursor_divergent());
+    assert_eq!(app.committed_row(), 1, "the anchor did not follow yet");
+    assert_eq!(app.active_diff_path().as_deref(), Some("a.txt"));
+
+    // Keep walking: the reveal eventually renormalizes past the boundary, and the
+    // list follows the anchor.
+    press_until_row(&mut app, 'j', 2, SHORT_H);
+    assert!(!app.cursor_divergent(), "the flip converged the cursor");
+    assert_eq!(app.active_diff_path().as_deref(), Some("b.txt"));
+    assert_eq!(
+        app.cursor_address().map(|address| address.file),
+        Some(b_id),
+        "still the file the cursor walked into"
+    );
+
+    // `g` is b.txt's own first target now, not the stream's.
+    app.on_key(key('g'));
+    assert_eq!(app.review_cursor(), 0);
+    assert_eq!(app.committed_row(), 2, "g never leaves the current file");
+
+    // And `k` walks back the other way.
+    press_until_row(&mut app, 'k', 1, SHORT_H);
+    assert_eq!(app.active_diff_path().as_deref(), Some("a.txt"));
+    assert!(!app.cursor_divergent());
+}
+
+// --- A7: clicks -------------------------------------------------------------
+
+#[test]
+fn a_click_in_the_history_diff_pane_places_the_cursor() {
+    let repo = init_repo_with_multi_file_commit();
+    let mut app = history_app(&repo, false, H);
+
+    // (a) The `●` details row has no rows to address, so a click only focuses.
+    let area = app.diff_area();
+    app.on_mouse(click(area.x + 2, area.y + 1));
+    assert_eq!(app.history_focus(), HistoryFocus::Diff);
+    assert_eq!(app.cursor_address(), None, "and grows no cursor");
+
+    // (b) On a file row the click lands on the row under the pointer, exactly as
+    // `review_click` does.
+    history_select_row(&mut app, 1, W, H);
+    let area = app.diff_area();
+    app.on_mouse(click(area.x + 2, area.y + 2));
+    assert_eq!(app.history_focus(), HistoryFocus::Diff);
+    assert_eq!(
+        app.cursor_address().map(|address| address.file),
+        Some(hist(&app, 0, "a.txt"))
+    );
+    assert_eq!(app.review_cursor(), 2, "the third row of the anchor");
+}
+
+#[test]
+fn a_history_strip_click_places_a_divergent_cursor_and_a_double_click_converges() {
+    let repo = init_repo_with_multi_file_commit();
+    let mut app = history_app(&repo, true, SHORT_H);
+    history_select_row(&mut app, 1, W, SHORT_H);
+    prepare_window(&mut app);
+    let _ = dump(&app, W, SHORT_H);
+    let x = app.diff_area().x + 2;
+
+    // A single click on a strip code row is pure placement: the cursor diverges
+    // onto b.txt and nothing else moves.
+    let code_y = strip_row(&app, "a strip code row", |row| {
+        matches!(row.target, RowTarget::Code(_))
+    })
+    .y;
+    let before = (app.committed_row(), app.diff_scroll.get());
+    app.on_mouse(click(x, code_y));
+    assert_eq!(app.history_focus(), HistoryFocus::Diff);
+    assert!(
+        app.cursor_divergent(),
+        "the click placed a divergent cursor"
+    );
+    assert_eq!(
+        app.cursor_address().map(|address| address.file),
+        Some(hist(&app, 0, "b.txt"))
+    );
+    assert_eq!(
+        (app.committed_row(), app.diff_scroll.get()),
+        before,
+        "and moved the view not at all"
+    );
+
+    // A double-click on a strip *code* row authors nothing: History has no
+    // comments, so the second click is inert past the placement.
+    let t = Instant::now();
+    app.on_mouse_at(click(x, code_y), t);
+    app.on_mouse_at(click(x, code_y), t + ms(150));
+    assert!(!app.editor_open(), "History never opens the editor");
+
+    // A double-click on the strip's file *header* converges: the anchor flips and
+    // the committed-changes list follows it.
+    let _ = dump(&app, W, SHORT_H);
+    let header_y = strip_header_row(&app).y;
+    let t = Instant::now();
+    app.on_mouse_at(click(x, header_y), t);
+    app.on_mouse_at(click(x, header_y), t + ms(150));
+    assert_eq!(app.committed_row(), 2, "the list followed the flip");
+    assert_eq!(app.active_diff_path().as_deref(), Some("b.txt"));
+    assert!(!app.cursor_divergent());
+}
+
+// --- A8: the cursor highlight -----------------------------------------------
+
+#[test]
+fn the_history_cursor_row_is_painted_only_while_the_diff_is_focused() {
+    let repo = init_repo_with_multi_file_commit();
+    let mut app = history_app(&repo, true, H);
+    history_select_row(&mut app, 1, W, H);
+    focus_diff(&mut app, H);
+    let sel = app.theme.selection_bg;
+
+    // Step off the band onto a code row: the header carries its own styling and
+    // never goes through `mark_cursor_row`.
+    app.on_key(key('j'));
+    let _ = dump(&app, W, H);
+    let span = app.cursor_window_span().expect("the cursor is on screen");
+    let y = app.diff_area().y + span.start as u16;
+    assert!(
+        diff_row_has_bg(&render_buffer(&app, W, H), app.diff_area(), y, sel),
+        "the cursor row carries the selection background while the diff is focused"
+    );
+
+    app.on_key(key('h')); // back to the committed-changes list
+    let _ = dump(&app, W, H);
+    assert!(
+        !diff_row_has_bg(&render_buffer(&app, W, H), app.diff_area(), y, sel),
+        "and loses it as soon as a list pane is focused"
+    );
+}
+
+// --- A9: the half page ------------------------------------------------------
+
+#[test]
+fn a_history_half_page_scrolls_with_a_list_focused_and_walks_with_the_diff() {
+    let repo = two_tall_files_repo();
+    let mut app = history_app(&repo, true, H);
+    history_select_row(&mut app, 1, W, H);
+    prepare_window(&mut app);
+    let half = (app.diff_area().height / 2).max(1) as usize;
+    let a_rows = app.diff_row_count();
+    assert!(a_rows > 2 * half, "a.txt is taller than a page");
+
+    // The committed-changes list has no cursor: Ctrl-d is a viewport tick.
+    app.on_key(ctrl('d'));
+    assert_eq!(app.diff_scroll.get(), half);
+    assert_eq!(app.committed_row(), 1, "well inside the tall anchor");
+    assert_eq!(
+        app.cursor_address().map(|address| address.target),
+        Some(RowTarget::FileHeader),
+        "and moved no cursor"
+    );
+
+    // Parked at a.txt's last row, the same tick renormalizes into b.txt.
+    app.diff_scroll.set(a_rows - 1);
+    prepare_window(&mut app);
+    let _ = dump(&app, W, H);
+    app.on_key(ctrl('d'));
+    assert_eq!(app.committed_row(), 2, "the tick crossed the boundary");
+    assert_eq!(app.active_diff_path().as_deref(), Some("b.txt"));
+
+    // With the diff focused it is the cursor's half page instead, and the list
+    // stays where it is while the walk is still inside the anchor.
+    history_select_row(&mut app, 1, W, H);
+    focus_diff(&mut app, H);
+    assert_eq!(app.review_cursor(), 0, "back on the band");
+    app.on_key(ctrl('d'));
+    let _ = dump(&app, W, H);
+    assert_eq!(app.review_cursor(), half, "the cursor moved a half page");
+    assert_eq!(app.committed_row(), 1, "and the list stayed put");
+}
+
+// --- A13: no comments -------------------------------------------------------
+
+#[test]
+fn the_history_diff_pane_authors_no_comments() {
+    let repo = init_repo_with_multi_file_commit();
+    // A worktree comment on the very file the stream anchors on. History's
+    // comment set is empty by construction, so none of it may reach the layout.
+    seed_store(
+        repo.path(),
+        "main",
+        None,
+        vec![Comment {
+            scope: Scope::WorkTree,
+            id: 1,
+            source: Source::Human,
+            file: "a.txt".to_string(),
+            side: Side::New,
+            line: 1,
+            text: "a note the history view must not draw".to_string(),
+            context: None,
+            orphaned: false,
+            created_at: 1_700_000_000,
+            base: None,
+            stale: false,
+        }],
+    );
+    let mut app = history_app(&repo, true, H);
+    history_select_row(&mut app, 1, W, H);
+    focus_diff(&mut app, H);
+    app.on_key(key('j')); // a code row
+
+    press(&mut app, 'c');
+    assert!(!app.editor_open(), "`c` is inert in History");
+
+    // A code-row double-click is idempotent with the single click: it places the
+    // same cursor and stops.
+    let area = app.diff_area();
+    let t = Instant::now();
+    app.on_mouse_at(click(area.x + 2, area.y + 2), t);
+    let placed = app.cursor_address();
+    app.on_mouse_at(click(area.x + 2, area.y + 2), t + ms(150));
+    assert!(!app.editor_open());
+    assert_eq!(
+        app.cursor_address(),
+        placed,
+        "the second click changed nothing"
+    );
+
+    // And no comment reaches the layout — in the anchor *or* the strip, as a
+    // box or as an orphan block. Seeded first, so this proves History's empty
+    // comment set rather than passing for want of any comment at all.
+    let width = app.diff_area().width;
+    let boxes = |rows: &[LayoutRow]| {
+        rows.iter()
+            .any(|row| matches!(row.target, RowTarget::Comment(_) | RowTarget::Orphan(_)))
+    };
+    assert!(!boxes(&app.diff_layout(width)), "the anchor draws none");
+    let win = window_of(&app);
+    for segment in win.segments.iter().filter_map(|s| s.section.as_ref()) {
+        assert!(!boxes(&segment.rows), "no strip section draws one either");
+    }
+}
+
+// --- A14: leaving and re-entering -------------------------------------------
+
+#[test]
+fn leaving_history_keeps_the_home_cursor_and_re_entry_resets_its_own() {
+    let repo = init_repo_with_multi_file_commit();
+    write(
+        repo.path(),
+        "a.txt",
+        "alpha one\nalpha edited\nalpha three\nalpha four\n",
+    );
+    let mut app = rendered_app(&repo, config(true, false), H);
+
+    // Park a converged cursor in the status pane.
+    press(&mut app, 'l');
+    press(&mut app, 'j');
+    let _ = dump(&app, W, H);
+    let home = app.cursor_address().expect("a status cursor");
+    let home_row = app.review_cursor();
+    assert!(home_row > 0, "the status cursor moved off the top");
+
+    press(&mut app, 'i');
+    let _ = dump(&app, W, H);
+    assert_eq!(app.view, ViewMode::History);
+    history_select_row(&mut app, 1, W, H);
+    focus_diff(&mut app, H);
+    app.on_key(key('j'));
+    assert!(app.cursor_address().is_some(), "History has its own cursor");
+
+    // Esc home: the status cursor is exactly where it was left.
+    app.on_key(esc());
+    let _ = dump(&app, W, H);
+    assert_eq!(app.view, ViewMode::Status);
+    assert_eq!(app.cursor_address(), Some(home));
+    assert_eq!(app.review_cursor(), home_row);
+
+    // Re-entry lands on `●` with no cursor at all, and the first file row gives
+    // the implicit one: that file's first target.
+    press(&mut app, 'i');
+    let _ = dump(&app, W, H);
+    assert_eq!(app.committed_row(), 0);
+    assert_eq!(
+        app.cursor_address(),
+        None,
+        "the details row addresses nothing"
+    );
+    history_select_row(&mut app, 1, W, H);
+    assert_eq!(
+        app.cursor_address(),
+        Some(CursorAddress {
+            file: hist(&app, 0, "a.txt"),
+            target: RowTarget::FileHeader,
+        }),
+        "the implicit cursor is the arriving file's first target"
+    );
+}
+
+// --- A16: the details row keeps its paragraph scrolling ---------------------
+
+#[test]
+fn the_details_row_keeps_its_plain_scroll_keys() {
+    let repo = long_message_repo();
+    let mut app = history_app(&repo, true, SHORT_H);
+    assert!(app.history_shows_details());
+    focus_diff(&mut app, SHORT_H);
+    let half = (app.diff_area().height / 2).max(1) as usize;
+    assert!(
+        app.diff_max_scroll() > half,
+        "the commit message is taller than a page"
+    );
+
+    app.on_key(key('j'));
+    assert_eq!(app.diff_scroll.get(), 1, "j scrolls the paragraph by a row");
+    app.on_key(key('G'));
+    assert_eq!(app.diff_scroll.get(), app.diff_max_scroll());
+    app.on_key(key('g'));
+    assert_eq!(app.diff_scroll.get(), 0);
+    app.on_key(ctrl('d'));
+    assert_eq!(app.diff_scroll.get(), half, "and Ctrl-d by a half page");
+    assert_eq!(app.cursor_address(), None, "never growing a cursor");
+
+    // Same again with the left column hidden, where Diff is the only focus.
+    app.on_key(key('g'));
+    press(&mut app, 'b');
+    let _ = dump(&app, W, SHORT_H);
+    assert_eq!(app.history_focus(), HistoryFocus::Diff);
+    app.on_key(key('j'));
+    assert_eq!(app.diff_scroll.get(), 1);
+    app.on_key(key('G'));
+    assert_eq!(app.diff_scroll.get(), app.diff_max_scroll());
+    assert_eq!(app.cursor_address(), None);
+}
+
+// --- A18: resize ------------------------------------------------------------
+
+#[test]
+fn a_resize_re_prepares_the_history_window_and_drops_a_divergent_cursor() {
+    let repo = init_repo_with_multi_file_commit();
+    let mut app = history_app(&repo, true, SHORT_H);
+    history_select_row(&mut app, 1, W, SHORT_H);
+    focus_diff(&mut app, SHORT_H);
+    walk_until_divergent(&mut app, SHORT_H);
+
+    const NARROW_W: u16 = 90;
+    app.on_resize(NARROW_W, SHORT_H);
+    let _ = dump(&app, NARROW_W, SHORT_H);
+    assert!(
+        !app.cursor_divergent(),
+        "the resize dropped the divergent cursor"
+    );
+    assert!(
+        window_of(&app).segments.len() > 1,
+        "and re-prepared the strip at the new width"
+    );
+
+    // The same with the left column hidden: the diff pane fills the body and the
+    // resize still has geometry to derive.
+    press(&mut app, 'b');
+    let _ = dump(&app, NARROW_W, SHORT_H);
+    app.on_resize(W, SHORT_H);
+    let frame = dump(&app, W, SHORT_H);
+    assert!(frame.contains("a.txt"), "frame:\n{frame}");
+}
+
+// --- A19 (cursor): the hidden panel -----------------------------------------
+
+#[test]
+fn with_the_panel_hidden_a_strip_double_click_converges_and_the_reveal_drops_divergence() {
+    let repo = init_repo_with_multi_file_commit();
+    let mut app = history_app(&repo, true, SHORT_H);
+    history_select_row(&mut app, 1, W, SHORT_H);
+    press(&mut app, 'b'); // hide the left column; Diff is the only focus left
+    let _ = dump(&app, W, SHORT_H); // the pane grew: re-record its geometry first
+    prepare_window(&mut app);
+    let _ = dump(&app, W, SHORT_H);
+
+    let x = app.diff_area().x + 2;
+    let header_y = strip_header_row(&app).y;
+    let t = Instant::now();
+    app.on_mouse_at(click(x, header_y), t);
+    app.on_mouse_at(click(x, header_y), t + ms(150));
+    assert_eq!(
+        app.committed_row(),
+        2,
+        "the invisible list followed the flip"
+    );
+    assert_eq!(app.active_diff_path().as_deref(), Some("b.txt"));
+
+    // Diverge again, then reveal the panel: the reveal lands in the Graph, so the
+    // sweep drops the address that only the focused diff could hold.
+    let _ = dump(&app, W, SHORT_H);
+    walk_until_divergent(&mut app, SHORT_H);
+    let row = app.committed_row();
+    press(&mut app, 'b');
+    let frame = dump(&app, W, SHORT_H);
+    assert_eq!(app.history_focus(), HistoryFocus::Graph);
+    assert_eq!(app.committed_row(), row, "the reveal keeps the row");
+    assert!(!app.cursor_divergent(), "and drops the divergent cursor");
+    assert!(frame.contains("Committed Changes"), "frame:\n{frame}");
+}
+
+// --- A24: divergence lifetime -----------------------------------------------
+
+#[test]
+fn a_divergent_history_cursor_survives_a_refresh_and_dies_on_focus_loss() {
+    let repo = init_repo_with_multi_file_commit();
+    let mut app = history_app(&repo, true, H);
+    history_select_row(&mut app, 1, W, H);
+    focus_diff(&mut app, H);
+    let file = walk_until_divergent(&mut app, H);
+
+    // A watcher tick that re-finds the same commit keeps its list, so the address
+    // still resolves and stays put.
+    app.reload();
+    let _ = dump(&app, W, H);
+    assert!(app.cursor_divergent(), "a same-commit refresh keeps it");
+    assert_eq!(app.cursor_address().map(|a| a.file), Some(file));
+
+    // Tab out of the diff pane: the sweep drops it.
+    app.on_key(tab());
+    let _ = dump(&app, W, H);
+    assert!(!app.diff_focused());
+    assert!(!app.cursor_divergent(), "leaving the diff pane drops it");
+
+    // And a Graph click, which reloads the commit's list outright.
+    focus_diff(&mut app, H);
+    walk_until_divergent(&mut app, H);
+    let frame = dump(&app, W, H);
+    let y = row_of(&frame, "HEAD") as u16;
+    app.on_mouse(click(2, y));
+    let _ = dump(&app, W, H);
+    assert!(!app.cursor_divergent());
+    assert_eq!(app.cursor_address(), None, "back on the `●` row");
 }
