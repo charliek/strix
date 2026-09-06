@@ -21,12 +21,12 @@ use std::ops::Range;
 use std::time::Instant;
 
 use common::{
-    app_for, click, config, ctrl, dump, git, head_oid, init_repo, pane_title, prepare_window,
-    press, render_buffer, seed_store, staged, strix_dir, tab, unstaged, window_of, write,
+    app_for, click, config, ctrl, diff_row_has_bg, dump, git, head_oid, init_repo, pane_title,
+    prepare_window, press, render_buffer, seed_store, staged, strix_dir, tab, unstaged, window_of,
+    write,
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Color;
 use strix::app::{App, CursorAddress, FileId, Modal, RowTarget};
 use strix::comments::{self, Comment, Scope, Side, Source};
 use strix::crossterm::event::MouseEventKind;
@@ -140,12 +140,6 @@ fn diverged_on_b(repo: &TempDir) -> App {
         "the cursor names a file below the anchor"
     );
     app
-}
-
-/// Whether any cell of buffer row `y` **inside the diff pane** carries `bg`
-/// (the file list draws its own selection background, which must not count).
-fn diff_row_has_bg(buf: &Buffer, area: Rect, y: u16, bg: Color) -> bool {
-    (area.x..area.x + area.width).any(|x| buf.cell((x, y)).map(|c| c.bg) == Some(bg))
 }
 
 /// The text of buffer row `y` inside the diff pane.

@@ -30,7 +30,7 @@ wrap_lines = false
 # diff continues into the next file's diff (and past the top into the
 # previous one) as one continuous stream, each file led by its own header row.
 # Off by default (scrolling clamps at each file's edge); toggle at runtime with
-# `f`. Applies to the Status and Review diff panes; the History view is excluded.
+# `f`. Applies to the Status, Review and History diff panes.
 cross_file_scroll = false
 ```
 

@@ -17,15 +17,12 @@ mod common;
 use std::time::Instant;
 
 use common::{
-    click, config, git, head_oid, init_repo, init_repo_with_diverged_branches,
+    click, config, diff_row_has_bg, git, head_oid, init_repo, init_repo_with_diverged_branches,
     init_repo_with_history, mouse, ms, pane_title, prepare_window, press, render_buffer,
     rendered_app, seed_store, select, selected_path, short_status_repo, staged, store_text,
-    unstaged, window_of, write,
+    strip_header_row, strip_row, unstaged, window_of, window_rows, write, WindowRow,
 };
-use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
-use ratatui::style::Color;
-use strix::app::{App, FileId, Focus, HistoryFocus, LayoutRow, RowTarget, ViewMode};
+use strix::app::{App, Focus, HistoryFocus, RowTarget, ViewMode};
 use strix::comments::{Comment, Scope, Side, Source};
 use strix::config::Config;
 use strix::crossterm::event::{KeyCode, KeyEvent, MouseEventKind};
@@ -165,52 +162,6 @@ fn review_with_strip_comment_box() -> (TempDir, App) {
 
 // --- window-row lookup ------------------------------------------------------
 
-/// One row the window draws: its screen position and the identity the renderer
-/// records for it in the hit map.
-struct WindowRow {
-    y: u16,
-    anchor: bool,
-    file: FileId,
-    target: RowTarget,
-}
-
-/// Every row of the current window in screen order — the same walk the renderer
-/// does when it records the hit map, so a click at `row.y` resolves to `row`.
-fn window_rows(app: &App) -> Vec<WindowRow> {
-    let diff = app.diff_area();
-    let window = window_of(app);
-    let layout = app.diff_layout(diff.width);
-    let mut out = Vec::new();
-    let mut y = diff.y;
-    for segment in &window.segments {
-        let rows: &[LayoutRow] = match &segment.section {
-            None => &layout[segment.row_range.clone()],
-            Some(section) => &section.rows[segment.row_range.clone()],
-        };
-        for row in rows {
-            if let Some(file) = segment.id.clone() {
-                out.push(WindowRow {
-                    y,
-                    anchor: segment.is_anchor(),
-                    file,
-                    target: row.target,
-                });
-            }
-            y += 1;
-        }
-    }
-    out
-}
-
-/// The first strip row matching `pred`, panicking with the window's shape when
-/// there is none.
-fn strip_row(app: &App, what: &str, mut pred: impl FnMut(&WindowRow) -> bool) -> WindowRow {
-    window_rows(app)
-        .into_iter()
-        .find(|row| !row.anchor && pred(row))
-        .unwrap_or_else(|| panic!("no strip row matching {what} in the current window"))
-}
-
 /// The first strip *code* row (a hunk header counts as `Code` too, so skip the
 /// header row and take the row after it).
 fn strip_code_row(app: &App) -> WindowRow {
@@ -225,22 +176,10 @@ fn strip_code_row(app: &App) -> WindowRow {
     })
 }
 
-fn strip_header_row(app: &App) -> WindowRow {
-    strip_row(app, "a file header", |row| {
-        row.target == RowTarget::FileHeader
-    })
-}
-
 fn strip_box_row(app: &App, id: u64) -> WindowRow {
     strip_row(app, "a comment box", |row| {
         row.target == RowTarget::Comment(id) || row.target == RowTarget::Orphan(id)
     })
-}
-
-/// Whether any cell of buffer row `y` inside the diff pane carries `bg` (the
-/// file list paints its own selection background, which must not count).
-fn diff_row_has_bg(buf: &Buffer, area: Rect, y: u16, bg: Color) -> bool {
-    (area.x..area.x + area.width).any(|x| buf.cell((x, y)).map(|c| c.bg) == Some(bg))
 }
 
 // --- (c) a strip click places the cursor and moves nothing ------------------

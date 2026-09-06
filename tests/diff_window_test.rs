@@ -192,16 +192,18 @@ fn the_window_stops_at_the_viewport_edge_mid_file() {
 }
 
 #[test]
-fn the_history_window_is_the_single_anchor_segment() {
+fn the_history_details_row_is_the_single_anchor_segment() {
     let repo = init_repo_with_history();
     let mut app = app_for(&repo, false);
     press(&mut app, 'i');
     dump_frame(&app, W, H).unwrap();
 
+    // History enters on the commit ● row, which is outside the stream (plan
+    // 009 §3.2); the file rows below it are the stream proper.
     let win = window(&mut app);
-    assert_eq!(win.segments.len(), 1, "History is never crossed");
+    assert_eq!(win.segments.len(), 1, "the details row has no strip");
     assert!(win.segments[0].is_anchor());
-    assert_eq!(win.segments[0].id, None, "History has no stream identity");
+    assert_eq!(win.segments[0].id, None, "and no stream identity");
     assert_eq!(app.cached_section_count(), 0);
 }
 

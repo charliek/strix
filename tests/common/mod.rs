@@ -10,7 +10,7 @@ use std::time::Duration;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
-use strix::app::{App, DiffWindow, FileId, RowTarget};
+use strix::app::{App, DiffWindow, FileId, HistoryFocus, LayoutRow, RowTarget};
 use strix::comments::{Branch, Comment, Store};
 use strix::config::Config;
 use strix::crossterm::event::{
@@ -201,6 +201,12 @@ pub fn row_has_bg(buf: &Buffer, y: u16, bg: Color) -> bool {
     (area.x..area.x + area.width).any(|x| buf.cell((x, y)).map(|c| c.bg) == Some(bg))
 }
 
+/// Whether any cell of buffer row `y` **inside the diff pane** carries `bg` (the
+/// file list draws its own selection background, which must not count).
+pub fn diff_row_has_bg(buf: &Buffer, area: Rect, y: u16, bg: Color) -> bool {
+    (area.x..area.x + area.width).any(|x| buf.cell((x, y)).map(|c| c.bg) == Some(bg))
+}
+
 /// Run a git command in `dir`, asserting success.
 pub fn git(dir: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -243,7 +249,7 @@ fn setup_identity(path: &Path) {
 
 /// Commit staged changes with a fixed author + committer date, so history walks
 /// (which sort by commit time) are deterministic across runs.
-fn commit_at(path: &Path, message: &str, date: &str) {
+pub fn commit_at(path: &Path, message: &str, date: &str) {
     git_env(
         path,
         &[("GIT_AUTHOR_DATE", date), ("GIT_COMMITTER_DATE", date)],
@@ -279,6 +285,74 @@ pub fn init_repo_with_history() -> TempDir {
     git(path, &["add", "README.md"]);
     commit_at(path, "edit readme", "2021-01-03T00:00:00");
     dir
+}
+
+/// A repository whose HEAD commit touches five files at once — the fixture the
+/// History stream is driven against. Every commit uses a fixed, strictly
+/// increasing date, because the walk is ordered by commit time.
+///
+/// - commit 1 (root): adds `README.md` and `keep.txt`
+/// - commit 2: adds `a.txt`, `b.txt`, `c.txt` (three lines each, distinct text,
+///   so the two commits' sections can't be confused)
+/// - commit 3 (HEAD): edits one line in each of the three, renames `keep.txt` to
+///   `moved.txt` with a one-line edit, and adds the binary `blob.bin`
+pub fn init_repo_with_multi_file_commit() -> TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path();
+    setup_identity(path);
+    write(path, "README.md", "# test\n");
+    write(
+        path,
+        "keep.txt",
+        "keep one\nkeep two\nkeep three\nkeep four\n",
+    );
+    git(path, &["add", "."]);
+    commit_at(path, "init", "2021-01-01T00:00:00");
+
+    write(path, "a.txt", "alpha one\nalpha two\nalpha three\n");
+    write(path, "b.txt", "beta one\nbeta two\nbeta three\n");
+    write(path, "c.txt", "gamma one\ngamma two\ngamma three\n");
+    git(path, &["add", "."]);
+    commit_at(path, "add three", "2021-01-02T00:00:00");
+
+    write(path, "a.txt", "alpha one\nalpha edited\nalpha three\n");
+    write(path, "b.txt", "beta one\nbeta edited\nbeta three\n");
+    write(path, "c.txt", "gamma one\ngamma edited\ngamma three\n");
+    git(path, &["mv", "keep.txt", "moved.txt"]);
+    write(
+        path,
+        "moved.txt",
+        "keep one\nkeep edited\nkeep three\nkeep four\n",
+    );
+    std::fs::write(path.join("blob.bin"), [0u8, 1, 2, 0, 3, 4]).unwrap();
+    git(path, &["add", "-A"]);
+    commit_at(path, "touch five", "2021-01-03T00:00:00");
+    dir
+}
+
+/// Select the History view's committed-changes row `row` — 0 is the commit (`●`)
+/// details row, `n` is `commit_files[n - 1]` — from any History state, rendering
+/// first so the pane geometry every layout is keyed by exists. The Status-only
+/// [`select`] helper does not apply here.
+pub fn history_select_row(app: &mut App, row: usize, w: u16, h: u16) {
+    let _ = dump(app, w, h);
+    for _ in 0..4 {
+        if app.history_focus() == HistoryFocus::CommittedChanges {
+            break;
+        }
+        app.on_key(tab());
+    }
+    assert_eq!(
+        app.history_focus(),
+        HistoryFocus::CommittedChanges,
+        "tab never reached the committed-changes list"
+    );
+    app.on_key(key('g'));
+    for _ in 0..row {
+        app.on_key(key('j'));
+    }
+    assert_eq!(app.committed_row(), row, "row {row} was never reached");
+    let _ = dump(app, w, h);
 }
 
 /// A repository with a feature branch merged back into `main` (a real merge
@@ -573,6 +647,59 @@ pub fn prepare_window(app: &mut App) {
 pub fn window_of(app: &App) -> DiffWindow {
     let area = app.diff_area();
     app.diff_window(area.width, area.height)
+}
+
+/// One row the window draws: its screen position and the identity the renderer
+/// records for it in the hit map.
+pub struct WindowRow {
+    pub y: u16,
+    pub anchor: bool,
+    pub file: FileId,
+    pub target: RowTarget,
+}
+
+/// Every row of the current window in screen order — the same walk the renderer
+/// does when it records the hit map, so a click at `row.y` resolves to `row`.
+pub fn window_rows(app: &App) -> Vec<WindowRow> {
+    let diff = app.diff_area();
+    let window = window_of(app);
+    let layout = app.diff_layout(diff.width);
+    let mut out = Vec::new();
+    let mut y = diff.y;
+    for segment in &window.segments {
+        let rows: &[LayoutRow] = match &segment.section {
+            None => &layout[segment.row_range.clone()],
+            Some(section) => &section.rows[segment.row_range.clone()],
+        };
+        for row in rows {
+            if let Some(file) = segment.id.clone() {
+                out.push(WindowRow {
+                    y,
+                    anchor: segment.is_anchor(),
+                    file,
+                    target: row.target,
+                });
+            }
+            y += 1;
+        }
+    }
+    out
+}
+
+/// The first strip row matching `pred`, panicking with the window's shape when
+/// there is none.
+pub fn strip_row(app: &App, what: &str, mut pred: impl FnMut(&WindowRow) -> bool) -> WindowRow {
+    window_rows(app)
+        .into_iter()
+        .find(|row| !row.anchor && pred(row))
+        .unwrap_or_else(|| panic!("no strip row matching {what} in the current window"))
+}
+
+/// The first strip row that is a file header.
+pub fn strip_header_row(app: &App) -> WindowRow {
+    strip_row(app, "a file header", |row| {
+        row.target == RowTarget::FileHeader
+    })
 }
 
 /// Build `app_for(repo, cfg)` and render one frame at [`STREAM_W`]×`h`, so the
