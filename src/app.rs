@@ -1539,11 +1539,14 @@ impl App {
     /// Re-read status from disk, keeping the cursor on the same file (matched by
     /// section and path) when it survives, and forcing the open diff to
     /// recompute — its content may have changed in place even if its path did not.
-    pub fn refresh(&mut self) {
-        // A re-read can renumber, re-section, or drop the file a divergent cursor
-        // names; it snaps back to the anchor rather than chasing it (plan 007
-        // §3.3b — the deliberate "watcher tick mid-walk" trade).
-        self.clear_divergent_cursor();
+    fn refresh(&mut self) {
+        // No divergent-cursor clear here: the sweep in `normalize_cursor` is the
+        // policy (plan 007 §3.3b). The bump below retires every cached section, so
+        // this event's `ensure_diff_window` re-prepares the window and compares the
+        // rebuilt section against what the address last resolved against — which
+        // tells "nothing changed" apart from "the cursor's file changed", where an
+        // unconditional clear could not. A watcher tick on an unrelated save now
+        // leaves a reader's cursor where it is.
         let previous = self.selected_section_path();
         match self.repo.status() {
             Ok(status) => {
@@ -2563,8 +2566,10 @@ impl App {
     /// Drop a *divergent* cursor back to `None` — both fields, never a foreign
     /// target reinterpreted against the anchor (plan 007 §3.3b). An anchor cursor
     /// is untouched, which is what keeps every trigger below behaviour-identical
-    /// for the converged case: refresh / reload / relist, resize, the `w`/`n`/`d`/
-    /// `f` layout toggles, a view change, a list click.
+    /// for the converged case: resize, the `w`/`n`/`d`/`f` layout toggles, a view
+    /// change, a list click. A refresh / reload / relist is *not* on this list —
+    /// there the sweep in [`App::normalize_cursor`] decides, so an unrelated save
+    /// leaves the cursor alone (plan 003 §3.3).
     fn clear_divergent_cursor(&mut self) {
         if self.cursor_divergent() {
             self.write_cursor(None);
@@ -2587,8 +2592,8 @@ impl App {
     /// `Code(i)` denotes a *different line* while indexing just as happily. So the
     /// rebuilt diff is compared against `outgoing` — what the address last
     /// resolved against — and any difference drops it. That mirrors the anchor
-    /// cursor, which survives a same-file refresh only because
-    /// `recompute_status_diff` early-returns on an identical diff.
+    /// cursor, which survives a same-file refresh only because [`App::sync_diff`]
+    /// early-returns on an identical diff.
     fn normalize_cursor(&mut self, outgoing: Option<Rc<FileSection>>) {
         let Some(address) = self.divergent_address() else {
             return;
@@ -5099,9 +5104,10 @@ impl App {
     /// A resolution failure after startup (e.g. the branch was deleted) flashes an
     /// error and keeps the stale list; the next good refresh recovers.
     fn refresh_review(&mut self) {
-        // Same trade as the status refresh: a re-resolve can relist the range out
-        // from under a divergent cursor, so it snaps back (plan 007 §3.3b).
-        self.clear_divergent_cursor();
+        // Same policy as the status refresh: no clear here, the sweep decides (plan
+        // 007 §3.3b). A relist bumps, so the address is re-validated against the
+        // rebuilt sections and drops only if its file actually moved; the churn-
+        // guarded tick rebuilds nothing and keeps it.
         let Some(review) = self.review.as_ref() else {
             return;
         };
