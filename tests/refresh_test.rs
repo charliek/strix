@@ -6,6 +6,9 @@ use strix::crossterm::event::{KeyCode, KeyEvent};
 use strix::git::FileDiff;
 use strix::terminal::dump_frame;
 
+const W: u16 = 120;
+const H: u16 = 30;
+
 /// The current diff's text joined into one string, for content assertions.
 fn diff_text(app: &App) -> String {
     match &app.current_diff {
@@ -103,5 +106,107 @@ fn reload_keeps_the_scroll_position_for_the_same_file() {
         app.diff_scroll.get(),
         scrolled,
         "reloading the open file keeps the scroll position"
+    );
+}
+
+// --- C5 (issue #37): reload cost bounds --------------------------------------
+//
+// Before/after deltas around one isolated `reload()`, following the U2
+// convention (`tests/history_stream_test.rs`) — construction and the first
+// render already read, so absolute counts are brittle.
+
+/// The git-layer counters Review's churn guard is judged by.
+fn git_counts(app: &App) -> (u64, u64, u64) {
+    (
+        app.repo.subprocess_count(),
+        app.repo.object_read_count(),
+        app.repo.spec_diff_count(),
+    )
+}
+
+#[test]
+fn a_review_reload_on_an_unmoved_range_computes_no_diffs() {
+    let (_repo, mut app) = common::review_app("main");
+    let _ = common::dump(&app, W, H);
+    common::prepare_window(&mut app);
+    let (sub, obj, spec) = git_counts(&app);
+    let compute = app.diff_compute_count();
+
+    // Nothing on disk moved: the resolved (base, head) is unchanged, so the
+    // churn guard in `refresh_review` returns before relisting or touching any
+    // file's diff.
+    app.reload();
+
+    assert_eq!(
+        app.repo.spec_diff_count() - spec,
+        0,
+        "the churn guard keeps the list and every cached diff"
+    );
+    assert_eq!(
+        app.repo.object_read_count() - obj,
+        0,
+        "no diff recomputed means no blob read either"
+    );
+    assert!(
+        app.repo.subprocess_count() - sub <= 1,
+        "at most the range re-resolution's own probe, no relist"
+    );
+    assert_eq!(
+        app.diff_compute_count() - compute,
+        0,
+        "nor is any diff rebuilt in-process from a warm blob (review finding)"
+    );
+}
+
+#[test]
+fn a_status_reload_on_an_identical_snapshot_recomputes_only_the_window() {
+    let repo = common::three_modified_files();
+    let mut app = common::app_for(&repo, common::config(true, false));
+    let _ = common::dump(&app, W, H);
+    common::prepare_window(&mut app);
+
+    // The window's own file set, not `cached_section_count()` (which also
+    // counts stale/off-window LRU entries): the anchor segment plus every strip
+    // segment that actually holds a prepared section.
+    let window = common::window_of(&app);
+    let file_count = window
+        .segments
+        .iter()
+        .filter(|segment| segment.is_anchor() || segment.section.is_some())
+        .count();
+    assert!(
+        file_count > 1,
+        "the three-file fixture fills the anchor plus at least one strip segment"
+    );
+    let ids_before: Vec<_> = window.segments.iter().map(|s| s.id.clone()).collect();
+
+    let sub = app.repo.subprocess_count();
+    let compute = app.diff_compute_count();
+
+    // Nothing on disk changed, but Status's per-tick cost is deliberately "every
+    // window section recomputed" (plan §9 leaves scoping this to future work):
+    // the refresh bumps `stream_generation` once, retiring every cached section,
+    // and `reload`'s `sync_active` re-prepares exactly the window that was open.
+    app.reload();
+
+    assert_eq!(
+        app.repo.subprocess_count() - sub,
+        1,
+        "exactly the one `git status` read"
+    );
+    assert_eq!(
+        app.diff_compute_count() - compute,
+        file_count as u64,
+        "every section the prepared window holds is rebuilt, nothing more"
+    );
+
+    let ids_after: Vec<_> = common::window_of(&app)
+        .segments
+        .iter()
+        .map(|s| s.id.clone())
+        .collect();
+    assert_eq!(
+        ids_after, ids_before,
+        "the same files occupy the window, in the same order, after reload"
     );
 }
