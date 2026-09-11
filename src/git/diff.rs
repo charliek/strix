@@ -84,6 +84,7 @@ impl Repo {
     /// `<oid>:path`), or empty if it doesn't resolve — e.g. a newly added file
     /// has no HEAD blob. Shared with `history.rs` for commit-vs-parent diffs.
     pub(crate) fn object_bytes(&self, spec: &str) -> Vec<u8> {
+        self.object_read_count.set(self.object_read_count.get() + 1);
         self.gix()
             .rev_parse_single(BStr::new(spec))
             .ok()
@@ -101,6 +102,7 @@ impl Repo {
     /// the history and review layers, both of which diff blobs identified by
     /// revspec rather than by working-tree state.
     pub(crate) fn file_diff_from_specs(&self, old_spec: &str, new_spec: &str) -> FileDiff {
+        self.spec_diff_count.set(self.spec_diff_count.get() + 1);
         let old = self.object_bytes(old_spec);
         let new = self.object_bytes(new_spec);
         bytes_diff(&old, &new)

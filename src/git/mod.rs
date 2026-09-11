@@ -4,6 +4,7 @@ pub mod ops;
 pub mod review;
 pub mod status;
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -20,6 +21,13 @@ pub use status::{Change, FileEntry, Section, Status};
 pub struct Repo {
     gix: gix::Repository,
     workdir: PathBuf,
+    /// Subprocess attempts via [`Repo::run`], including failed runs.
+    subprocess_count: Cell<u64>,
+    /// Rev-parse/object-lookup attempts via `object_bytes`, including empty
+    /// specs and misses — not just successful blob loads.
+    object_read_count: Cell<u64>,
+    /// History/review spec-diff requests via `file_diff_from_specs`.
+    spec_diff_count: Cell<u64>,
 }
 
 impl Repo {
@@ -31,7 +39,13 @@ impl Repo {
             .workdir()
             .map(Path::to_path_buf)
             .context("bare repositories are not supported")?;
-        Ok(Repo { gix, workdir })
+        Ok(Repo {
+            gix,
+            workdir,
+            subprocess_count: Cell::new(0),
+            object_read_count: Cell::new(0),
+            spec_diff_count: Cell::new(0),
+        })
     }
 
     /// The working-tree root.
@@ -141,8 +155,32 @@ impl Repo {
         Ok(status::parse(&stdout))
     }
 
+    /// Attempt-count of `git` subprocesses via [`Repo::run`], including failed
+    /// runs. Test-only observable (plan 001 §3.2).
+    #[doc(hidden)]
+    pub fn subprocess_count(&self) -> u64 {
+        self.subprocess_count.get()
+    }
+
+    /// Attempt-count of rev-parse/object lookups in `object_bytes`, including
+    /// empty specs and misses — not just successful blob loads. Test-only
+    /// observable (plan 001 §3.2).
+    #[doc(hidden)]
+    pub fn object_read_count(&self) -> u64 {
+        self.object_read_count.get()
+    }
+
+    /// Count of history/review spec-diff requests via `file_diff_from_specs`,
+    /// not every `similar` computation (Status diffs go through other seams).
+    /// Test-only observable (plan 001 §3.2).
+    #[doc(hidden)]
+    pub fn spec_diff_count(&self) -> u64 {
+        self.spec_diff_count.get()
+    }
+
     /// Run a `git` subcommand in the working directory, returning its stdout.
     fn run(&self, args: &[&str]) -> Result<Vec<u8>> {
+        self.subprocess_count.set(self.subprocess_count.get() + 1);
         let output = Command::new("git")
             .arg("-C")
             .arg(&self.workdir)

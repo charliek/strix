@@ -191,7 +191,7 @@ fn operand(side: &str) -> &str {
 /// change. For a rename/copy the path portion is empty and the two following
 /// NUL fields are the old then new path (we key on the new path, matching
 /// `CommitFile::path`).
-fn parse_numstat(bytes: &[u8]) -> HashMap<String, CommitStat> {
+pub(crate) fn parse_numstat(bytes: &[u8]) -> HashMap<String, CommitStat> {
     let mut out = HashMap::new();
     let mut fields = bytes.split(|&b| b == 0).filter(|f| !f.is_empty());
     while let Some(field) = fields.next() {

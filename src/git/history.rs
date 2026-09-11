@@ -4,13 +4,14 @@
 //!
 //! Splits work the way the rest of the git layer does (see CLAUDE.md): the commit
 //! walk, commit metadata, and refs come from **gix** (object/ref discovery); the
-//! per-commit changed-file *list* comes from `git diff-tree` (the same
-//! ergonomics-driven CLI fallback `status` uses); and diff *content* + line stats
-//! reuse the in-process `similar` path over blob bytes.
+//! per-commit changed-file *list* comes from two `git diff-tree` passes
+//! (`--name-status` joined with `--numstat` by path, the same
+//! ergonomics-driven CLI fallback `status` uses); and diff *content* reuses the
+//! in-process `similar` path over blob bytes.
 
 use anyhow::{Context, Result};
 
-use crate::git::diff::stat_of;
+use crate::git::review::parse_numstat;
 use crate::git::{FileDiff, Repo};
 
 fn bstr_string(bytes: &[u8]) -> String {
@@ -185,44 +186,76 @@ impl Repo {
     }
 
     /// The files changed in `commit` relative to its first parent (root commit:
-    /// relative to the empty tree). Listed via `git diff-tree`; line stats are
-    /// computed in-process.
+    /// relative to the empty tree).
+    ///
+    /// Two `git diff-tree` passes joined by path: `--name-status` for the change
+    /// kind (rename source included) and `--numstat` for line counts (a `-` count
+    /// marks a binary change). No in-process diffing while listing.
     pub fn commit_files(&self, commit: &CommitInfo) -> Result<Vec<CommitFile>> {
         let id = commit.id.to_string();
-        let stdout = match commit.first_parent() {
-            Some(parent) => self.run(&[
-                "diff-tree",
-                "--no-commit-id",
-                "-r",
-                "-M",
-                "-z",
-                "--name-status",
-                &parent.to_string(),
-                &id,
-            ])?,
-            None => self.run(&[
-                "diff-tree",
-                "--no-commit-id",
-                "--root",
-                "-r",
-                "-M",
-                "-z",
-                "--name-status",
-                &id,
-            ])?,
+        let (name_status, numstat) = match commit.first_parent() {
+            Some(parent) => {
+                let parent = parent.to_string();
+                (
+                    self.run(&[
+                        "diff-tree",
+                        "--no-commit-id",
+                        "-r",
+                        "-M",
+                        "-z",
+                        "--name-status",
+                        &parent,
+                        &id,
+                    ])?,
+                    self.run(&[
+                        "diff-tree",
+                        "--no-commit-id",
+                        "-r",
+                        "-M",
+                        "-z",
+                        "--numstat",
+                        &parent,
+                        &id,
+                    ])?,
+                )
+            }
+            None => (
+                self.run(&[
+                    "diff-tree",
+                    "--no-commit-id",
+                    "--root",
+                    "-r",
+                    "-M",
+                    "-z",
+                    "--name-status",
+                    &id,
+                ])?,
+                self.run(&[
+                    "diff-tree",
+                    "--no-commit-id",
+                    "--root",
+                    "-r",
+                    "-M",
+                    "-z",
+                    "--numstat",
+                    &id,
+                ])?,
+            ),
         };
+        let stats = parse_numstat(&numstat);
 
-        let mut files = Vec::new();
-        for (change, path, orig_path) in parse_name_status(&stdout) {
-            let (old_spec, new_spec) = self.diff_specs(commit, &path, orig_path.as_deref(), change);
-            let stat = stat_of(&self.file_diff_from_specs(&old_spec, &new_spec));
-            files.push(CommitFile {
-                path,
-                orig_path,
-                change,
-                stat,
-            });
-        }
+        let files = parse_name_status(&name_status)
+            .into_iter()
+            .map(|(change, path, orig_path)| {
+                let stat = stats.get(&path).copied().unwrap_or_default();
+                CommitFile {
+                    path,
+                    orig_path,
+                    change,
+                    stat,
+                }
+            })
+            .collect();
         Ok(files)
     }
 

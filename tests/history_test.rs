@@ -1,6 +1,9 @@
 mod common;
 
-use common::{init_empty_repo, init_repo_with_branches, init_repo_with_history, setup_for_binary};
+use common::{
+    commit_at, git, init_empty_repo, init_repo, init_repo_with_branches, init_repo_with_history,
+    setup_for_binary, write,
+};
 use strix::git::{ChangeKind, CommitFile, CommitInfo, FileDiff, LineKind, Repo};
 
 fn commit<'a>(commits: &'a [CommitInfo], summary: &str) -> &'a CommitInfo {
@@ -76,7 +79,11 @@ fn root_commit_diffs_against_empty_tree() {
     assert!(root.parents.is_empty());
 
     let files = repo.commit_files(root).expect("files");
-    assert_eq!(file(&files, "README.md").change, ChangeKind::Added);
+    let readme = file(&files, "README.md");
+    assert_eq!(readme.change, ChangeKind::Added);
+    assert_eq!(readme.stat.added, 1);
+    assert_eq!(readme.stat.deleted, 0);
+    assert!(!readme.stat.binary);
 
     let diff = repo.commit_file_diff(root, file(&files, "README.md"));
     assert!(additions(&diff).iter().any(|l| l.contains("# test")));
@@ -116,6 +123,53 @@ fn binary_commit_file_is_detected() {
     let entry = file(&files, "bin.dat");
     assert!(entry.stat.binary);
     assert_eq!(repo.commit_file_diff(bin, entry), FileDiff::Binary);
+}
+
+#[test]
+fn rename_commit_file_joins_numstat_by_new_path() {
+    let dir = init_repo();
+    let path = dir.path();
+    write(path, "old.txt", "one\ntwo\nthree\n");
+    git(path, &["add", "."]);
+    commit_at(path, "add old", "2021-01-02T00:00:00");
+    git(path, &["mv", "old.txt", "new.txt"]);
+    write(path, "new.txt", "one\nTWO\nthree\n");
+    git(path, &["add", "-A"]);
+    commit_at(path, "rename with edit", "2021-01-03T00:00:00");
+
+    let repo = Repo::open(path).expect("open repo");
+    let commits = repo.history(50).expect("history");
+    let files = repo
+        .commit_files(commit(&commits, "rename with edit"))
+        .expect("files");
+    let entry = file(&files, "new.txt");
+    assert_eq!(entry.change, ChangeKind::Renamed);
+    assert_eq!(entry.orig_path.as_deref(), Some("old.txt"));
+    assert_eq!(entry.stat.added, 1);
+    assert_eq!(entry.stat.deleted, 1);
+    assert!(!entry.stat.binary);
+}
+
+#[test]
+fn deletion_commit_file_counts_deleted_lines() {
+    let dir = init_repo();
+    let path = dir.path();
+    write(path, "gone.txt", "one\ntwo\nthree\n");
+    git(path, &["add", "."]);
+    commit_at(path, "add gone", "2021-01-02T00:00:00");
+    git(path, &["rm", "-q", "gone.txt"]);
+    commit_at(path, "remove gone", "2021-01-03T00:00:00");
+
+    let repo = Repo::open(path).expect("open repo");
+    let commits = repo.history(50).expect("history");
+    let files = repo
+        .commit_files(commit(&commits, "remove gone"))
+        .expect("files");
+    let entry = file(&files, "gone.txt");
+    assert_eq!(entry.change, ChangeKind::Deleted);
+    assert_eq!(entry.stat.added, 0);
+    assert_eq!(entry.stat.deleted, 3);
+    assert!(!entry.stat.binary);
 }
 
 #[test]

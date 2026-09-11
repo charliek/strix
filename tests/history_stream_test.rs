@@ -1282,3 +1282,116 @@ fn a_divergent_history_cursor_survives_a_refresh_and_dies_on_focus_loss() {
     assert!(!app.cursor_divergent());
     assert_eq!(app.cursor_address(), None, "back on the `●` row");
 }
+
+// --- U2 (plan 001): git-layer cost counters ----------------------------------
+//
+// `Repo` counts subprocess attempts, object-lookup attempts, and spec-diff
+// requests. Assertions are before/after deltas around one isolated action —
+// construction and History entry already read, so absolute counts are brittle.
+
+/// The three git-layer counters in one tuple, for before/after deltas.
+fn counts(app: &App) -> (u64, u64, u64) {
+    (
+        app.repo.subprocess_count(),
+        app.repo.object_read_count(),
+        app.repo.spec_diff_count(),
+    )
+}
+
+#[test]
+fn selecting_a_commit_lists_without_blob_reads_or_spec_diffs() {
+    let repo = init_repo_with_multi_file_commit();
+    let mut app = history_app(&repo, true, H);
+    assert_eq!(app.selected_commit(), 0);
+
+    // The headline regression test for issue 26: pre-U1 `commit_files` diffed
+    // every file in-process for its stat, so this fails there (3 files → 3
+    // spec diffs, 6 blob reads); post-U1 the listing is two `diff-tree` passes.
+    let (sub, obj, spec) = counts(&app);
+    app.on_key(key('j'));
+    let _ = dump(&app, W, H);
+    assert_eq!(app.selected_commit(), 1);
+    assert_eq!(
+        app.history_files().len(),
+        3,
+        "the older commit's list actually arrived"
+    );
+    assert_eq!(
+        app.repo.spec_diff_count() - spec,
+        0,
+        "listing diffs nothing"
+    );
+    assert_eq!(
+        app.repo.object_read_count() - obj,
+        0,
+        "listing reads no blobs"
+    );
+    assert_eq!(
+        app.repo.subprocess_count() - sub,
+        2,
+        "listing is the name-status plus numstat passes"
+    );
+}
+
+#[test]
+fn opening_one_file_with_cross_file_off_diffs_exactly_that_file() {
+    let repo = init_repo_with_multi_file_commit();
+    let mut app = history_app(&repo, false, H);
+
+    let (sub, obj, spec) = counts(&app);
+    history_select_row(&mut app, 1, W, H);
+    assert_eq!(app.active_diff_path().as_deref(), Some("a.txt"));
+    assert_eq!(app.repo.spec_diff_count() - spec, 1, "one file diffed");
+    assert_eq!(
+        app.repo.object_read_count() - obj,
+        2,
+        "the old and new blob of that file"
+    );
+    assert_eq!(app.repo.subprocess_count() - sub, 0, "no relisting");
+}
+
+#[test]
+fn a_same_commit_refresh_computes_no_diffs_and_reads_no_blobs() {
+    let repo = init_repo_with_multi_file_commit();
+    let mut app = history_app(&repo, true, SHORT_H);
+    history_select_row(&mut app, 2, W, SHORT_H);
+    wheel(&mut app, true);
+    let _ = dump(&app, W, SHORT_H);
+
+    let (sub, obj, spec) = counts(&app);
+    app.reload();
+    let _ = dump(&app, W, SHORT_H);
+    assert_eq!(
+        app.active_diff_path().as_deref(),
+        Some("b.txt"),
+        "the refresh kept the warmed diff"
+    );
+    assert_eq!(app.repo.spec_diff_count() - spec, 0, "no added diffs");
+    assert_eq!(app.repo.object_read_count() - obj, 0, "no added blob reads");
+    assert!(
+        app.repo.subprocess_count() - sub <= 1,
+        "a same-commit refresh performs no listing"
+    );
+}
+
+#[test]
+fn an_in_window_scroll_reads_nothing() {
+    let repo = tall_head_file_repo();
+    let mut app = history_app(&repo, true, H);
+    history_select_row(&mut app, 1, W, H);
+    prepare_window(&mut app);
+    assert_eq!(app.active_diff_path().as_deref(), Some("a.txt"));
+
+    // One wheel tick inside the tall anchor cannot reach a file boundary.
+    let (sub, obj, spec) = counts(&app);
+    let scroll = app.diff_scroll.get();
+    wheel(&mut app, true);
+    assert_eq!(
+        app.diff_scroll.get(),
+        scroll + 3,
+        "the tick scrolled within a.txt"
+    );
+    assert_eq!(app.repo.spec_diff_count() - spec, 0);
+    assert_eq!(app.repo.object_read_count() - obj, 0);
+    assert_eq!(app.repo.subprocess_count() - sub, 0);
+}
