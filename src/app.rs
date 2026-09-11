@@ -7106,7 +7106,10 @@ impl App {
             .saturating_sub(MIN_GRAPH_HEIGHT)
             .max(MIN_COMMITTED_HEIGHT)
             .min(left_height);
-        self.committed_height.clamp(MIN_COMMITTED_HEIGHT, max)
+        // `max` drops below the minimum once both panes can no longer fit;
+        // `clamp` panics on an inverted range, so the floor follows it down.
+        self.committed_height
+            .clamp(MIN_COMMITTED_HEIGHT.min(max), max)
     }
 
     /// Whether the horizontal divider shows its active affordance.

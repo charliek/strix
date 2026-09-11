@@ -239,3 +239,15 @@ fn exit_history_with_hidden_changes_focuses_diff() {
     // Hidden-panel invariant: focus must be the only visible pane.
     assert_eq!(app.focus, strix::app::Focus::Diff);
 }
+
+/// Below the left column's two minimum heights the committed pane takes what
+/// is left and the graph collapses — no size may panic the renderer.
+#[test]
+fn history_renders_on_a_terminal_too_short_for_both_left_panes() {
+    let (_repo, mut app) = history_app();
+    app.on_key(key('i'));
+    for h in 1..=10 {
+        let out = common::dump(&app, W, h);
+        assert_eq!(out.lines().count(), h as usize, "frame at height {h}");
+    }
+}
