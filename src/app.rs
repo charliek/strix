@@ -17,8 +17,8 @@ use syntect::parsing::SyntaxReference;
 use crate::comments::{self, Comment, FileFacts, Scope, Side, Source};
 use crate::config::{Config, Setting};
 use crate::git::{
-    Change, CommitFile, CommitInfo, CommitStat, DiffLine, FileDiff, FileEntry, LineKind, RefLabel,
-    Repo, ReviewSpec, Section, Status,
+    Change, CommitFile, CommitInfo, CommitStat, DiffLine, FileDiff, FileEntry, HistoryKey,
+    LineKind, RefLabel, Repo, ReviewSpec, Section, Status,
 };
 use crate::graph::{self, GraphRow};
 use crate::keys::{Action, Keymap};
@@ -1308,6 +1308,10 @@ pub struct App {
     commits: Vec<CommitInfo>,
     refs: Vec<RefLabel>,
     graph_rows: Vec<GraphRow>,
+    /// What `commits` was walked from, when both the key read and the walk
+    /// succeeded. `None` means "unknown" and forces the next refresh to walk, so
+    /// a failure always retries (plan 003 §3.4).
+    history_key: Option<HistoryKey>,
     /// True once a walk returned fewer commits than requested — no more to load.
     history_loaded_all: bool,
     selected_commit: usize,
@@ -1460,6 +1464,7 @@ impl App {
             commits: Vec::new(),
             refs: Vec::new(),
             graph_rows: Vec::new(),
+            history_key: None,
             history_loaded_all: false,
             selected_commit: 0,
             commit_files: Vec::new(),
@@ -3698,9 +3703,11 @@ impl App {
         // address left behind would outlive its window until the user came back
         // (plan 007 §3.3b).
         self.clear_divergent_cursor();
-        if self.commits.is_empty() {
-            self.load_history();
-        }
+        // Unconditional, not `if commits.is_empty()` as it was while every entry
+        // meant a full walk: the key read is three cheap reads and walks only if
+        // something moved, so entering History after an external commit made
+        // while Status was up no longer shows a stale graph (review finding).
+        self.sync_history_walk();
         self.view = ViewMode::History;
         // No bump here: the stream is re-scoped by `load_commit_files` below, which
         // installs the selected commit's file list (plan 009 §3.4).
@@ -3756,25 +3763,69 @@ impl App {
         self.sync_active();
     }
 
-    /// Load (or reload) the commit walk + refs + graph layout, leaving `commits`
-    /// empty on an empty repo or error (the UI renders an empty-state hint).
-    /// Reloads walk at least as far as what's already paged in, so a refresh
-    /// never silently truncates history the user scrolled to.
-    fn load_history(&mut self) {
+    /// Rebuild the commit walk, but only when what the walk is made of actually
+    /// moved. An idle watcher tick is the common case, and re-decoding 500
+    /// commits to produce the list already on screen is the cost this skips
+    /// (plan 003 §3.4).
+    ///
+    /// The key is read *before* the walk and stored only once both it and the
+    /// walk succeeded, so a failure never records a key it did not produce and
+    /// the next tick retries. Refs that moved under an unchanged HEAD need no
+    /// walk at all: the same commits, differently badged.
+    fn sync_history_walk(&mut self) {
+        let key = match self.repo.history_key() {
+            Ok(key) => key,
+            Err(err) => {
+                tracing::debug!("history key unavailable: {err:#}");
+                self.history_key = None;
+                let refs = self.repo.ref_labels().unwrap_or_default();
+                self.load_history(refs);
+                return;
+            }
+        };
+        let same_walk = self
+            .history_key
+            .as_ref()
+            .is_some_and(|stored| stored.head == key.head && stored.shallow == key.shallow);
+        if !same_walk {
+            let walked = self.load_history(key.refs.clone());
+            self.history_key = walked.then_some(key);
+            return;
+        }
+        if self
+            .history_key
+            .as_ref()
+            .is_some_and(|stored| stored.refs != key.refs)
+        {
+            self.refs = key.refs.clone();
+            self.graph_rows = graph::layout(&self.commits, &self.refs);
+        }
+        self.history_key = Some(key);
+    }
+
+    /// Load (or reload) the commit walk + graph layout from `refs`, leaving
+    /// `commits` empty on an empty repo or error (the UI renders an empty-state
+    /// hint) and reporting whether the walk succeeded. Reloads walk at least as
+    /// far as what's already paged in, so a refresh never silently truncates
+    /// history the user scrolled to.
+    fn load_history(&mut self, refs: Vec<RefLabel>) -> bool {
         let want = self.commits.len().max(HISTORY_PAGE);
-        match self.repo.history(want) {
+        let walked = match self.repo.history(want) {
             Ok(commits) => {
                 self.history_loaded_all = commits.len() < want;
                 self.commits = commits;
+                true
             }
             Err(err) => {
                 tracing::warn!("history walk failed: {err:#}");
                 self.commits.clear();
                 self.history_loaded_all = true;
+                false
             }
-        }
-        self.refs = self.repo.ref_labels().unwrap_or_default();
+        };
+        self.refs = refs;
         self.graph_rows = graph::layout(&self.commits, &self.refs);
+        walked
     }
 
     /// Load the selected commit's changed-file list, resetting the top-pane
@@ -5065,7 +5116,7 @@ impl App {
             ViewMode::Status => self.refresh(),
             ViewMode::History => {
                 let current = self.selected_commit_info().map(|c| c.id);
-                self.load_history();
+                self.sync_history_walk();
                 let found = current.and_then(|id| self.commits.iter().position(|c| c.id == id));
                 match found {
                     // A commit's file list and diffs are immutable, so re-finding

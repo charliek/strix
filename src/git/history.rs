@@ -111,7 +111,10 @@ impl CommitFile {
 }
 
 /// The kind of ref pointing at a commit, for graph labels.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// The declared order is also the badge order (`Repo::history_key` sorts by it),
+/// so named refs read before the `HEAD` marker on a graph row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RefKind {
     LocalBranch,
     RemoteBranch,
@@ -127,6 +130,32 @@ pub struct RefLabel {
     pub kind: RefKind,
 }
 
+/// Everything [`Repo::history`] and its badges depend on. Two equal keys mean a
+/// re-walk would return the same commits with the same labels, so a refresh can
+/// skip it (plan 003 §3.4).
+///
+/// `refs/replace` and grafts are deliberately absent: unsupported here, and they
+/// self-heal on the next commit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryKey {
+    pub head: gix::ObjectId,
+    /// Sorted, so two reads compare element-wise — gix's ref iteration order is
+    /// not guaranteed stable. The sort runs over the whole record, so refs
+    /// sharing a name can't order ambiguously, and it leads with the kind
+    /// because this vector is also what badges the graph.
+    pub refs: Vec<RefLabel>,
+    /// The shallow boundary, `None` in a full clone. Deepening a shallow clone
+    /// lengthens the walk without moving a single ref.
+    pub shallow: Option<Vec<gix::ObjectId>>,
+}
+
+/// Sort by `(kind, name, target)`, kind first, so named refs read before the
+/// `HEAD` marker on a graph row and two reads compare element-wise regardless
+/// of gix's ref iteration order.
+fn sort_ref_labels(refs: &mut [RefLabel]) {
+    refs.sort_by(|a, b| (&a.kind, &a.name, &a.target).cmp(&(&b.kind, &b.name, &b.target)));
+}
+
 impl Repo {
     /// Walk the current branch's history (HEAD ancestry, full DAG so merges and
     /// their merged-in commits appear), newest first, up to `limit` commits.
@@ -138,6 +167,8 @@ impl Repo {
         use gix::revision::walk::Sorting;
         use gix::traverse::commit::simple::CommitTimeOrder;
 
+        self.history_walk_count
+            .set(self.history_walk_count.get() + 1);
         let head = self.gix().head_id().context("no commits yet")?;
         let walk = self
             .gix()
@@ -159,9 +190,54 @@ impl Repo {
         Ok(out)
     }
 
+    /// Read the current [`HistoryKey`] — HEAD, the sorted refs, and the shallow
+    /// boundary — resolving HEAD once and reusing it for both the key and its
+    /// synthetic `HEAD` ref label.
+    ///
+    /// Errors on an unborn HEAD or an unreadable `shallow` file; the caller
+    /// treats that as "no key" and walks unconditionally.
+    pub fn history_key(&self) -> Result<HistoryKey> {
+        let head = self.gix().head_id().context("no commits yet")?.detach();
+        let mut refs = self.local_branch_labels()?;
+        refs.push(RefLabel {
+            name: "HEAD".to_string(),
+            target: head,
+            kind: RefKind::Head,
+        });
+        sort_ref_labels(&mut refs);
+        let shallow = self
+            .gix()
+            .shallow_commits()
+            .context("reading the shallow boundary")?
+            .map(|boundary| boundary.iter().copied().collect());
+        Ok(HistoryKey {
+            head,
+            refs,
+            shallow,
+        })
+    }
+
     /// Refs pointing into history, for graph badges. Current-branch scope only
     /// shows labels whose target is in the walked set; the renderer filters.
+    /// Sorted by `(kind, name, target)` so badge order agrees with
+    /// [`Repo::history_key`] regardless of gix's ref iteration order.
     pub fn ref_labels(&self) -> Result<Vec<RefLabel>> {
+        let mut out = self.local_branch_labels()?;
+        if let Ok(head) = self.gix().head_id() {
+            out.push(RefLabel {
+                name: "HEAD".to_string(),
+                target: head.detach(),
+                kind: RefKind::Head,
+            });
+        }
+        sort_ref_labels(&mut out);
+        Ok(out)
+    }
+
+    /// Local-branch ref labels, in gix's (unordered) iteration order — the part
+    /// [`Repo::ref_labels`] and [`Repo::history_key`] share, each adding its own
+    /// already-resolved `HEAD` entry.
+    fn local_branch_labels(&self) -> Result<Vec<RefLabel>> {
         let mut out = Vec::new();
         let refs = self.gix().references().context("opening refs")?;
         for branch in refs.local_branches().context("listing local branches")? {
@@ -174,13 +250,6 @@ impl Repo {
                 name,
                 target: branch.id().detach(),
                 kind: RefKind::LocalBranch,
-            });
-        }
-        if let Ok(head) = self.gix().head_id() {
-            out.push(RefLabel {
-                name: "HEAD".to_string(),
-                target: head.detach(),
-                kind: RefKind::Head,
             });
         }
         Ok(out)

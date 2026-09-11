@@ -9,13 +9,14 @@
 
 mod common;
 
+use std::path::PathBuf;
 use std::time::Instant;
 
 use common::{
     cell_bg, cell_symbol, click, commit_at, config, ctrl, diff_row_has_bg, dump, esc, git, git_env,
-    history_select_row, init_repo_with_multi_file_commit, key, mouse, ms, prepare_window, press,
-    render_buffer, rendered_app, row_of, seed_store, strip_header_row, strip_row, tab, window_of,
-    write,
+    head_oid, history_select_row, init_repo_with_history, init_repo_with_multi_file_commit, key,
+    mouse, ms, prepare_window, press, render_buffer, rendered_app, row_of, seed_store,
+    strip_header_row, strip_row, tab, window_of, write,
 };
 use strix::app::{
     App, CursorAddress, FileId, HeaderPart, HistoryFocus, LayoutRow, RowContent, RowTarget,
@@ -1394,4 +1395,232 @@ fn an_in_window_scroll_reads_nothing() {
     assert_eq!(app.repo.spec_diff_count() - spec, 0);
     assert_eq!(app.repo.object_read_count() - obj, 0);
     assert_eq!(app.repo.subprocess_count() - sub, 0);
+}
+
+// --- C4 (plan 003 §3.4): the History refresh's walk skip --------------------
+//
+// A refresh re-walks only when the walk's inputs — HEAD, the refs, the shallow
+// boundary — moved. Same convention as the counters above: before/after deltas
+// around one isolated action.
+
+/// Commit walks attempted so far, for before/after deltas.
+fn walks(app: &App) -> u64 {
+    app.repo.history_walk_count()
+}
+
+#[test]
+fn an_unchanged_repository_refreshes_without_walking() {
+    let repo = init_repo_with_history();
+    let mut app = history_app(&repo, true, H);
+    let before = app.graph_rows().to_vec();
+    assert_eq!(before.len(), 3);
+
+    let walked = walks(&app);
+    app.reload();
+    let _ = dump(&app, W, H);
+    assert_eq!(
+        walks(&app) - walked,
+        0,
+        "nothing moved, so the walk is skipped entirely"
+    );
+    assert_eq!(
+        app.graph_rows(),
+        before.as_slice(),
+        "the graph is untouched"
+    );
+}
+
+#[test]
+fn a_commit_made_outside_strix_walks_once_and_reaches_the_graph() {
+    let repo = init_repo_with_history();
+    let mut app = history_app(&repo, true, H);
+
+    write(repo.path(), "outside.txt", "from outside\n");
+    git(repo.path(), &["add", "outside.txt"]);
+    // Short enough to survive the graph pane's ~30-column width beside the tip's
+    // `HEAD main` decoration.
+    commit_at(repo.path(), "outside", "2021-01-04T00:00:00");
+
+    let walked = walks(&app);
+    app.reload();
+    let frame = dump(&app, W, H);
+    assert_eq!(walks(&app) - walked, 1, "HEAD moved, so exactly one walk");
+    assert_eq!(app.graph_rows().len(), 4);
+    assert!(
+        frame.contains("outside"),
+        "expected the new commit in the graph:\n{frame}"
+    );
+}
+
+#[test]
+fn a_branch_created_outside_strix_rebadges_the_graph_without_walking() {
+    let repo = init_repo_with_history();
+    let mut app = history_app(&repo, true, H);
+    assert!(!dump(&app, W, H).contains("sidecar"));
+
+    git(repo.path(), &["branch", "sidecar"]);
+
+    let walked = walks(&app);
+    app.reload();
+    let frame = dump(&app, W, H);
+    assert_eq!(
+        walks(&app) - walked,
+        0,
+        "the same commits, only differently badged — no walk"
+    );
+    assert!(
+        app.graph_rows()[0].labels.iter().any(|l| l == "sidecar"),
+        "labels: {:?}",
+        app.graph_rows()[0].labels
+    );
+    assert!(
+        frame.contains("sidecar"),
+        "expected the new branch badged on the tip:\n{frame}"
+    );
+}
+
+/// A commit object's path under `.git/objects`.
+fn loose_object(repo: &TempDir, oid: &str) -> PathBuf {
+    repo.path()
+        .join(".git/objects")
+        .join(&oid[..2])
+        .join(&oid[2..])
+}
+
+#[test]
+fn an_unreadable_head_stores_no_key_so_the_next_refresh_recovers() {
+    let repo = init_repo_with_history();
+    let mut app = history_app(&repo, true, H);
+    assert_eq!(app.graph_rows().len(), 3);
+
+    // Deleting HEAD's own object breaks the *key* read (peeling HEAD loads it),
+    // which is the "walk as today" branch; the walk it falls back to then fails
+    // too. A stale key left behind here would compare equal once the object is
+    // back, and History would never recover.
+    let object = loose_object(&repo, &head_oid(repo.path()));
+    let bytes = std::fs::read(&object).expect("the fixture's commits are loose objects");
+    std::fs::remove_file(&object).unwrap();
+
+    app.reload();
+    let _ = dump(&app, W, H);
+    assert!(
+        app.graph_rows().is_empty(),
+        "the broken walk emptied the graph"
+    );
+
+    std::fs::write(&object, &bytes).unwrap();
+
+    let walked = walks(&app);
+    app.reload();
+    let frame = dump(&app, W, H);
+    assert_eq!(
+        walks(&app) - walked,
+        1,
+        "the failure stored no key, so the next refresh retried"
+    );
+    assert_eq!(app.graph_rows().len(), 3, "the graph is back");
+    assert!(
+        frame.contains("edit readme"),
+        "expected the restored history in the graph:\n{frame}"
+    );
+}
+
+#[test]
+fn a_failed_walk_under_a_readable_key_stores_no_key_and_recovers() {
+    let repo = init_repo_with_history();
+    let mut app = history_app(&repo, true, H);
+    let orphaned = loose_object(&repo, &head_oid(repo.path()));
+    let bytes = std::fs::read(&orphaned).expect("the fixture's commits are loose objects");
+
+    // A new tip moves the key (so a walk is attempted at all) while its parent —
+    // the old tip — goes missing, so HEAD, the refs and the shallow boundary all
+    // still read cleanly and it is the walk alone that fails. That is the case a
+    // key stored outside the success arm would strand: the key here is the same
+    // one the recovering walk computes.
+    write(repo.path(), "outside.txt", "from outside\n");
+    git(repo.path(), &["add", "outside.txt"]);
+    commit_at(repo.path(), "outside", "2021-01-04T00:00:00");
+    std::fs::remove_file(&orphaned).unwrap();
+
+    app.reload();
+    let _ = dump(&app, W, H);
+    assert!(
+        app.graph_rows().is_empty(),
+        "the broken walk emptied the graph"
+    );
+
+    std::fs::write(&orphaned, &bytes).unwrap();
+
+    let walked = walks(&app);
+    app.reload();
+    let frame = dump(&app, W, H);
+    assert_eq!(
+        walks(&app) - walked,
+        1,
+        "the failed walk stored no key, so the unchanged key still retries"
+    );
+    assert_eq!(app.graph_rows().len(), 4, "the graph is back");
+    assert!(
+        frame.contains("edit readme"),
+        "expected the restored history in the graph:\n{frame}"
+    );
+}
+
+#[test]
+fn entering_history_after_an_outside_commit_shows_it_rather_than_a_stale_graph() {
+    let repo = init_repo_with_history();
+    let mut app = history_app(&repo, true, H);
+    assert_eq!(app.graph_rows().len(), 3);
+
+    // Back to Status, so the watcher's refreshes land on Status's arm and the
+    // History walk goes untouched while the repo moves under it.
+    press(&mut app, 'i');
+    assert_eq!(app.view, ViewMode::Status);
+    write(repo.path(), "outside.txt", "from another shell\n");
+    git(repo.path(), &["add", "outside.txt"]);
+    commit_at(repo.path(), "landed while away", "2021-01-04T00:00:00");
+    app.reload();
+
+    press(&mut app, 'i');
+    let frame = dump(&app, W, H);
+    assert_eq!(app.view, ViewMode::History);
+    assert_eq!(app.graph_rows().len(), 4, "entry re-walked the moved key");
+    assert!(
+        frame.contains("landed while away"),
+        "expected the commit made while Status was up:\n{frame}"
+    );
+}
+
+#[test]
+fn deepening_a_shallow_clone_walks_and_lists_the_older_commit() {
+    let origin = init_repo_with_history();
+    let clone = tempfile::tempdir().expect("tempdir");
+    // `--depth` is only honoured over a transport, so the local origin has to be
+    // spelled as a `file://` URL.
+    let url = format!("file://{}", origin.path().display());
+    git(clone.path(), &["clone", "-q", "--depth", "1", &url, "."]);
+
+    let mut app = history_app(&clone, true, H);
+    assert_eq!(
+        app.graph_rows().len(),
+        1,
+        "a depth-1 clone walks one commit"
+    );
+    assert!(!dump(&app, W, H).contains("add a"));
+
+    git(clone.path(), &["fetch", "-q", "--deepen", "1"]);
+
+    let walked = walks(&app);
+    app.reload();
+    let frame = dump(&app, W, H);
+    assert_eq!(
+        walks(&app) - walked,
+        1,
+        "the shallow boundary moved even though no ref did"
+    );
+    assert_eq!(app.graph_rows().len(), 2);
+    assert!(
+        frame.contains("add a"),
+        "expected the deepened commit in the graph:\n{frame}"
+    );
 }
