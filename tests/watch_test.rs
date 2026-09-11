@@ -1,6 +1,7 @@
+use std::sync::mpsc::RecvTimeoutError;
 use std::time::Duration;
 
-use strix::comments::{self, Branch};
+use strix::comments::{self, Branch, Comment, Scope, Side, Source};
 use strix::git::Repo;
 use strix::watch;
 use tempfile::tempdir;
@@ -145,4 +146,76 @@ fn watcher_signals_on_a_comment_store_write() {
     .expect("mutate comment store");
 
     common::expect_signal(&rx, "a comment-store write");
+}
+
+// --- The read side must stay silent (plan 003 §3.2, C2) ----------------------
+
+/// strix reading the repo must not wake strix. On Linux, inotify reports the
+/// app's own `.git` reads back to it as `Access(Open)`, so before the kind
+/// filter every refresh scheduled the next one and an idle session never
+/// settled. This drives strix's whole read set — the calls one `App::reload`
+/// makes across Status, History and Review, plus the comment store — and then
+/// requires silence.
+///
+/// One theoretical false red: an inotify queue overflow during the read set is
+/// forwarded as `Err` (we may have missed a real change) and would signal. It
+/// takes thousands of unread events to provoke; this fixture is a handful of
+/// files.
+#[test]
+fn strixs_own_reads_produce_no_signal() {
+    // HEAD is `feature`, diverged from `main`, so `resolve_range("main")` is a
+    // real three-dot range with files on both sides.
+    let repo = common::init_repo_with_diverged_branches();
+    let path = repo.path();
+    let base = common::head_oid(path);
+    // A modified tracked file, so `status()` has real work and the diff paths
+    // are exercised rather than short-circuited on a clean tree.
+    common::write(path, "README.md", "# test\nshared\nworking-tree edit\n");
+    common::seed_store(
+        path,
+        "feature",
+        Some("main"),
+        vec![Comment {
+            scope: Scope::WorkTree,
+            id: 1,
+            source: Source::Agent,
+            file: "README.md".to_string(),
+            side: Side::New,
+            line: 3,
+            text: "seeded before the watch".to_string(),
+            context: Some("working-tree edit".to_string()),
+            orphaned: false,
+            created_at: 1_700_000_000,
+            base: Some(base),
+            stale: false,
+        }],
+    );
+
+    let rx = common::spawn_and_drain(path);
+
+    let handle = Repo::open(path).expect("open repo");
+    let _status = handle.status().expect("status");
+    let history = handle.history(500).expect("history");
+    let _labels = handle.ref_labels().expect("ref labels");
+    let head = history.first().expect("history has a HEAD commit");
+    let _files = handle.commit_files(head).expect("commit files");
+    let spec = handle.resolve_range("main").expect("resolve range");
+    let _range = handle.range_files(&spec).expect("range files");
+    let _store = comments::load(&handle.strix_dir()).expect("load comment store");
+
+    match rx.recv_timeout(Duration::from_secs(2)) {
+        Err(RecvTimeoutError::Timeout) => {}
+        Ok(()) => panic!("strix's own reads produced a refresh signal"),
+        Err(RecvTimeoutError::Disconnected) => {
+            panic!("watch channel disconnected: the watcher thread died")
+        }
+    }
+
+    // The silence above only counts if the watcher was still alive through it.
+    common::write(
+        path,
+        "README.md",
+        "# test\nshared\nedited after the reads\n",
+    );
+    common::expect_signal(&rx, "a worktree edit after the read set");
 }
