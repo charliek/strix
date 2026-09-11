@@ -21,9 +21,9 @@ use std::ops::Range;
 use std::time::Instant;
 
 use common::{
-    app_for, click, config, ctrl, diff_row_has_bg, dump, git, head_oid, init_repo, pane_title,
-    prepare_window, press, render_buffer, seed_store, staged, strix_dir, tab, unstaged, window_of,
-    write,
+    app_for, click, commit_file, config, ctrl, diff_row_has_bg, dump, git, head_oid, init_repo,
+    pane_title, prepare_window, press, render_buffer, seed_store, staged, strix_dir, tab, unstaged,
+    window_of, write,
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -336,10 +336,10 @@ type Trigger = (&'static str, fn(&mut App));
 fn every_normalization_trigger_clears_divergence() {
     // One case per trigger in plan 007 §3.3(b). Each starts from the same parked
     // divergent state and asserts only that the cursor came home — the trigger's
-    // own behaviour is pinned by its own suite.
+    // own behaviour is pinned by its own suite. Refresh / reload / relist are
+    // deliberately absent: there the sweep decides per file (plan 003 §3.3), and
+    // the keep/drop matrix below is what pins them.
     let triggers: &[Trigger] = &[
-        ("refresh (r)", |app| press(app, 'r')),
-        ("reload (watcher)", |app| app.reload()),
         ("resize", |app| app.on_resize(W + 10, H)),
         ("wrap toggle (w)", |app| press(app, 'w')),
         ("line-number toggle (n)", |app| press(app, 'n')),
@@ -373,7 +373,7 @@ fn every_normalization_trigger_clears_divergence() {
 }
 
 #[test]
-fn a_review_relist_clears_divergence() {
+fn a_reload_on_an_unmoved_range_keeps_the_cursor() {
     let repo = common::init_repo_with_diverged_branches();
     let mut app = App::for_review(repo.path().to_path_buf(), &config(true, false), "main").unwrap();
     dump(&app, W, H);
@@ -382,14 +382,264 @@ fn a_review_relist_clears_divergence() {
     let file = FileId::Review {
         path: "feature2.txt".to_string(),
     };
+    let placed = address(file, RowTarget::FileHeader);
     assert!(
-        app.place_cursor(address(file, RowTarget::FileHeader)),
+        app.place_cursor(placed.clone()),
         "the second review file is in the prepared window"
     );
 
     app.reload();
 
-    assert!(!app.cursor_divergent(), "a relist snaps the cursor home");
+    assert_eq!(
+        app.cursor_address(),
+        Some(placed),
+        "the range never moved, so the sweep has nothing to drop the cursor for"
+    );
+    assert!(app.cursor_divergent());
+}
+
+// --- the refresh keep/drop matrix (plan 003 §3.3) ---------------------------
+//
+// A refresh is not on the sweep's trigger list above: `normalize_cursor` compares
+// the rebuilt section against what the address last resolved against, so an
+// agent's save only costs the reader the cursor when it touched the file the
+// cursor is in. History already behaved this way; these pin Status and Review.
+
+/// A short anchor, a tall strip file for the cursor to park in, and a third file
+/// the window never reaches — so a change to `c.txt` is provably off-window.
+fn short_anchor_tall_strip() -> TempDir {
+    let repo = init_repo();
+    write(repo.path(), "a.txt", "a one\na two\n");
+    write(repo.path(), "b.txt", &beta(40, None));
+    write(repo.path(), "c.txt", "c one\n");
+    repo
+}
+
+/// `count` `beta N` lines, with line `edit` (if any) rewritten so the file's diff
+/// differs without changing its row count.
+fn beta(count: usize, edit: Option<usize>) -> String {
+    (0..count)
+        .map(|i| {
+            if Some(i) == edit {
+                format!("beta {i} edited\n")
+            } else {
+                format!("beta {i}\n")
+            }
+        })
+        .collect()
+}
+
+fn review_file(path: &str) -> FileId {
+    FileId::Review {
+        path: path.to_string(),
+    }
+}
+
+/// Whether the prepared window draws any of `file`'s rows — the precondition a
+/// divergent address lives under, read from the outside.
+fn window_holds(app: &App, file: &FileId) -> bool {
+    window_of(app)
+        .segments
+        .iter()
+        .any(|segment| segment.id.as_ref() == Some(file))
+}
+
+/// A review of `main` over `repo`, diff-focused, with the cursor parked on
+/// `b.txt`'s second code row.
+fn review_diverged_on_b(repo: &TempDir) -> App {
+    let mut app = App::for_review(repo.path().to_path_buf(), &config(true, false), "main").unwrap();
+    dump(&app, W, H);
+    prepare_window(&mut app);
+    press(&mut app, 'l');
+    assert!(
+        app.place_cursor(address(review_file("b.txt"), RowTarget::Code(2))),
+        "the second review file is in the prepared window"
+    );
+    assert!(app.cursor_divergent());
+    app
+}
+
+/// A review range of `a.txt`, `b.txt` (content given by `b`), `c.txt`, each its
+/// own commit on `feature`.
+fn review_repo_with_b(b: &str) -> TempDir {
+    let repo = init_repo();
+    git(repo.path(), &["checkout", "-q", "-b", "feature"]);
+    commit_file(repo.path(), "a.txt", "a one\na two\n", "add a");
+    commit_file(repo.path(), "b.txt", b, "add b");
+    commit_file(repo.path(), "c.txt", "c one\n", "add c");
+    repo
+}
+
+/// A review range whose files are a short anchor, a tall second file, and a third
+/// the window never reaches.
+fn tall_review_repo() -> TempDir {
+    review_repo_with_b(&beta(40, None))
+}
+
+/// The same range with all three files short, so the whole stream fits one
+/// viewport and `c.txt` has a strip file above it.
+fn short_review_repo() -> TempDir {
+    review_repo_with_b("b one\n")
+}
+
+#[test]
+fn a_status_reload_that_changes_nothing_keeps_the_divergent_cursor() {
+    let repo = two_tall_files();
+    let mut app = diverged_on_b(&repo);
+    let before = app.cursor_address();
+
+    app.reload();
+
+    assert_eq!(
+        app.cursor_address(),
+        before,
+        "nothing on disk moved, so the rebuilt section matches the outgoing one"
+    );
+    assert!(app.cursor_divergent());
+}
+
+#[test]
+fn a_status_reload_after_the_cursors_file_changed_drops_it() {
+    let repo = two_tall_files();
+    let mut app = diverged_on_b(&repo);
+
+    write(repo.path(), "b.txt", &beta(40, Some(3)));
+    app.reload();
+
+    assert!(
+        !app.cursor_divergent(),
+        "a rebuilt `Code(2)` names a different line, so the address cannot hold"
+    );
+}
+
+#[test]
+fn a_status_reload_after_the_cursors_file_was_staged_drops_it() {
+    let repo = two_tall_files();
+    let mut app = diverged_on_b(&repo);
+
+    git(repo.path(), &["add", "b.txt"]);
+    app.reload();
+
+    assert!(
+        !app.cursor_divergent(),
+        "the same path in the index is a different `FileId`, so nothing resolves"
+    );
+}
+
+#[test]
+fn a_status_reload_after_an_off_window_file_changed_keeps_it() {
+    let repo = short_anchor_tall_strip();
+    let mut app = diverged_on_b(&repo);
+    let before = app.cursor_address();
+    assert!(
+        !window_holds(&app, &unstaged("c.txt")),
+        "the tall strip fills the viewport, so c.txt is off-window"
+    );
+
+    write(repo.path(), "c.txt", "c one\nc two\n");
+    app.reload();
+
+    assert!(
+        window_holds(&app, &unstaged("b.txt")),
+        "the cursor's file is still drawn — survival can't be read from an \
+         address that simply left the window"
+    );
+    assert_eq!(
+        app.cursor_address(),
+        before,
+        "an unrelated save costs nothing"
+    );
+}
+
+#[test]
+fn a_status_reload_that_grows_a_strip_file_above_the_cursor_drops_it() {
+    let repo = three_short_files();
+    let mut app = diff_focused_app(&repo);
+    assert!(
+        app.place_cursor(address(unstaged("c.txt"), RowTarget::Code(1))),
+        "the whole stream fits one viewport"
+    );
+
+    // b.txt sits between the anchor and the cursor's file, so growing it pushes
+    // c.txt past the viewport. Plan 003 §4: that eviction is accepted — the row
+    // the cursor names is genuinely no longer on screen.
+    write(repo.path(), "b.txt", &beta(40, None));
+    app.reload();
+
+    assert!(!window_holds(&app, &unstaged("c.txt")));
+    assert!(!app.cursor_divergent());
+}
+
+#[test]
+fn a_review_reload_that_changes_nothing_keeps_the_divergent_cursor() {
+    let repo = tall_review_repo();
+    let mut app = review_diverged_on_b(&repo);
+    let before = app.cursor_address();
+
+    // The common watcher event during an agent run: a worktree save, which can't
+    // move a committed range.
+    write(repo.path(), "scratch.txt", "work in progress\n");
+    app.reload();
+
+    assert_eq!(app.cursor_address(), before);
+    assert!(app.cursor_divergent());
+}
+
+#[test]
+fn a_review_reload_after_the_cursors_file_changed_drops_it() {
+    let repo = tall_review_repo();
+    let mut app = review_diverged_on_b(&repo);
+
+    commit_file(repo.path(), "b.txt", &beta(40, Some(3)), "edit b");
+    app.reload();
+
+    assert!(
+        !app.cursor_divergent(),
+        "the range moved and rebuilt b.txt's section from new content"
+    );
+}
+
+#[test]
+fn a_review_reload_after_an_off_window_file_changed_keeps_it() {
+    let repo = tall_review_repo();
+    let mut app = review_diverged_on_b(&repo);
+    let before = app.cursor_address();
+    assert!(
+        !window_holds(&app, &review_file("c.txt")),
+        "the tall strip fills the viewport, so c.txt is off-window"
+    );
+
+    commit_file(repo.path(), "c.txt", "c one\nc two\n", "edit c");
+    app.reload();
+
+    assert!(
+        window_holds(&app, &review_file("b.txt")),
+        "the cursor's file is still drawn"
+    );
+    assert_eq!(
+        app.cursor_address(),
+        before,
+        "a relist that left b.txt's diff alone keeps the cursor in it"
+    );
+}
+
+#[test]
+fn a_review_reload_that_grows_a_strip_file_above_the_cursor_drops_it() {
+    let repo = short_review_repo();
+    let mut app = App::for_review(repo.path().to_path_buf(), &config(true, false), "main").unwrap();
+    dump(&app, W, H);
+    prepare_window(&mut app);
+    press(&mut app, 'l');
+    assert!(
+        app.place_cursor(address(review_file("c.txt"), RowTarget::Code(1))),
+        "the whole range fits one viewport"
+    );
+
+    commit_file(repo.path(), "b.txt", &beta(40, None), "grow b");
+    app.reload();
+
+    assert!(!window_holds(&app, &review_file("c.txt")));
+    assert!(!app.cursor_divergent());
 }
 
 #[test]

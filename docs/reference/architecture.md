@@ -167,7 +167,11 @@ watch already covers it); in a linked worktree the private git dir and the
 shared common dir both live outside `workdir` (its `.git` is a file pointing
 elsewhere), so the result is the common dir alone — which subsumes both the
 per-worktree git dir and the store — letting a commit or a `strix comment`
-write from another linked worktree wake this session.
+write from another linked worktree wake this session. It also drops
+non-mutating access notifications and forwards only create, modify, remove,
+close-after-write, unknown and error events, because inotify reports strix's
+own `.git` reads back to it as `Access(Open)` — without that filter an idle
+session refreshes itself forever.
 
 ### Skill distribution
 

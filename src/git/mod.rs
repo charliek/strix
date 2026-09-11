@@ -11,7 +11,7 @@ use std::process::Command;
 use anyhow::{Context, Result};
 
 pub use diff::{DiffLine, FileDiff, LineKind};
-pub use history::{ChangeKind, CommitFile, CommitInfo, CommitStat, RefKind, RefLabel};
+pub use history::{ChangeKind, CommitFile, CommitInfo, CommitStat, HistoryKey, RefKind, RefLabel};
 pub use review::ReviewSpec;
 pub use status::{Change, FileEntry, Section, Status};
 
@@ -28,6 +28,8 @@ pub struct Repo {
     object_read_count: Cell<u64>,
     /// History/review spec-diff requests via `file_diff_from_specs`.
     spec_diff_count: Cell<u64>,
+    /// Commit walks via [`Repo::history`], including failed ones.
+    history_walk_count: Cell<u64>,
 }
 
 impl Repo {
@@ -45,6 +47,7 @@ impl Repo {
             subprocess_count: Cell::new(0),
             object_read_count: Cell::new(0),
             spec_diff_count: Cell::new(0),
+            history_walk_count: Cell::new(0),
         })
     }
 
@@ -176,6 +179,14 @@ impl Repo {
     #[doc(hidden)]
     pub fn spec_diff_count(&self) -> u64 {
         self.spec_diff_count.get()
+    }
+
+    /// Commit walks attempted via [`Repo::history`], including failed ones — the
+    /// observable the History refresh's walk-skip is asserted on (plan 003 §3.4).
+    /// Test-only.
+    #[doc(hidden)]
+    pub fn history_walk_count(&self) -> u64 {
+        self.history_walk_count.get()
     }
 
     /// Run a `git` subcommand in the working directory, returning its stdout.

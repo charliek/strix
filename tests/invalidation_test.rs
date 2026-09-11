@@ -202,7 +202,7 @@ fn a_failed_status_refresh_still_retires_the_stream() {
     // Pull the working tree out from under `git status`, so the snapshot read
     // fails and the previous one is kept.
     std::fs::remove_dir_all(repo.path()).unwrap();
-    app.refresh();
+    app.reload();
 
     assert_eq!(
         app.stream_generation() - generation,
