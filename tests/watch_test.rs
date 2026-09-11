@@ -1,6 +1,6 @@
-use std::sync::mpsc::RecvTimeoutError;
 use std::time::Duration;
 
+use strix::comments::{self, Branch};
 use strix::git::Repo;
 use strix::watch;
 use tempfile::tempdir;
@@ -18,11 +18,7 @@ fn watcher_signals_on_a_file_change() {
     std::thread::sleep(Duration::from_millis(300));
     std::fs::write(dir.path().join("hello.txt"), "hi").expect("write");
 
-    match rx.recv_timeout(Duration::from_secs(5)) {
-        Ok(()) => {}
-        Err(RecvTimeoutError::Timeout) => panic!("watcher sent no signal within 5s"),
-        Err(err) => panic!("watch channel error: {err}"),
-    }
+    common::expect_signal(&rx, "a file change");
 }
 
 /// A commit made in a *linked* worktree updates refs / the reflog under the
@@ -53,13 +49,7 @@ fn watcher_signals_on_a_linked_worktree_commit() {
     common::git(&wt, &["add", "feature.txt"]);
     common::git(&wt, &["commit", "-q", "-m", "wt commit"]);
 
-    match rx.recv_timeout(Duration::from_secs(5)) {
-        Ok(()) => {}
-        Err(RecvTimeoutError::Timeout) => {
-            panic!("no signal for a linked-worktree commit within 5s")
-        }
-        Err(err) => panic!("watch channel error: {err}"),
-    }
+    common::expect_signal(&rx, "a linked-worktree commit");
 }
 
 /// A primary checkout keeps all its state under `.git` inside the working tree,
@@ -74,4 +64,85 @@ fn primary_checkout_needs_no_extra_watch_roots() {
         extra.is_empty(),
         "a primary checkout's state lives under the watched workdir: {extra:?}"
     );
+}
+
+// --- Coverage per change class (plan 003 §3.1, C1) ---------------------------
+//
+// Each test prepares its precondition before spawning, spawns, waits for the
+// watch to register, drains any setup noise until quiet, performs exactly one
+// mutation, and asserts the signal arrives. Timing-generous (5s) but never
+// racing: the drain means the awaited signal can only be the mutation's own.
+
+#[test]
+fn watcher_signals_on_a_worktree_edit_of_a_tracked_file() {
+    let repo = common::init_repo(); // README.md is already tracked.
+    let rx = common::spawn_and_drain(repo.path());
+
+    common::write(repo.path(), "README.md", "# test\nedited\n");
+
+    common::expect_signal(&rx, "a worktree edit");
+}
+
+#[test]
+fn watcher_signals_on_git_add() {
+    let repo = common::init_repo();
+    // Precondition: an unstaged change already present before the watcher spawns.
+    common::write(repo.path(), "README.md", "# test\nunstaged\n");
+    let rx = common::spawn_and_drain(repo.path());
+
+    common::git(repo.path(), &["add", "README.md"]);
+
+    common::expect_signal(&rx, "`git add`");
+}
+
+#[test]
+fn watcher_signals_on_git_commit() {
+    let repo = common::init_repo();
+    // Precondition: a staged change already present before the watcher spawns.
+    common::write(repo.path(), "README.md", "# test\nstaged\n");
+    common::git(repo.path(), &["add", "README.md"]);
+    let rx = common::spawn_and_drain(repo.path());
+
+    common::git(repo.path(), &["commit", "-q", "-m", "edit readme"]);
+
+    common::expect_signal(&rx, "`git commit`");
+}
+
+#[test]
+fn watcher_signals_on_a_head_write_from_checkout_b() {
+    let repo = common::init_repo();
+    let rx = common::spawn_and_drain(repo.path());
+
+    common::git(repo.path(), &["checkout", "-q", "-b", "other"]);
+
+    common::expect_signal(&rx, "`git checkout -b other`");
+}
+
+#[test]
+fn watcher_signals_on_a_comment_store_write() {
+    let repo = common::init_repo();
+    let handle = Repo::open(repo.path()).expect("open repo");
+    let dir = handle.strix_dir();
+    // Precondition: a valid v2 store already on disk before the watcher spawns.
+    comments::mutate(&dir, |store| {
+        store.branches.insert(
+            "main".to_string(),
+            Branch {
+                active_range: None,
+                comments: Vec::new(),
+            },
+        );
+    })
+    .expect("seed comment store");
+
+    let rx = common::spawn_and_drain(repo.path());
+
+    // The real atomic path: tmp file + rename over the existing store, exactly
+    // as the agent-facing `strix comment` CLI and the TUI's own writes do it.
+    comments::mutate(&dir, |store| {
+        store.next_id += 1;
+    })
+    .expect("mutate comment store");
+
+    common::expect_signal(&rx, "a comment-store write");
 }

@@ -5,7 +5,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::time::{Duration, Instant};
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -18,6 +19,7 @@ use strix::crossterm::event::{
 };
 use strix::git::Section;
 use strix::terminal::dump_frame;
+use strix::watch;
 use tempfile::TempDir;
 
 /// Press a plain character key on `app`, as if typed at the keyboard.
@@ -63,6 +65,61 @@ pub fn click(col: u16, row: u16) -> MouseEvent {
 
 pub fn ms(n: u64) -> Duration {
     Duration::from_millis(n)
+}
+
+// --- Watch-channel draining ---------------------------------------------------
+
+/// 3 × `watch::DEBOUNCE` (250ms, private to `watch.rs`): the quiet window
+/// [`drain_until_quiet`] waits out before a test's own mutation runs.
+const DRAIN: Duration = Duration::from_millis(750);
+
+/// Drain `rx` until it goes quiet for a full `interval` with no signal, so a
+/// test's own mutation is never confused with leftover noise from setup (e.g.
+/// the watch's own registration). Restarts the interval after every signal
+/// received; panics on disconnect, since that means the watcher thread died.
+///
+/// The interval restarts (rather than running against one flat deadline)
+/// because only an uninterrupted quiet window proves the backlog is gone — a
+/// flat deadline can expire mid-burst and hand the caller a channel that still
+/// has setup noise in it, which the next `expect_signal` would then consume
+/// instead of the mutation's own signal. `CAP` keeps that unbounded by turning
+/// a watcher that never settles into a loud failure rather than a hang.
+pub fn drain_until_quiet(rx: &Receiver<()>, interval: Duration) {
+    const CAP: Duration = Duration::from_secs(30);
+    let start = Instant::now();
+    loop {
+        match rx.recv_timeout(interval) {
+            Ok(()) => {}
+            Err(RecvTimeoutError::Timeout) => return,
+            Err(RecvTimeoutError::Disconnected) => {
+                panic!("watch channel disconnected while draining")
+            }
+        }
+        assert!(
+            start.elapsed() < CAP,
+            "watcher never went quiet: still signalling after {CAP:?} of draining"
+        );
+    }
+}
+
+/// Spawn the watcher over `repo` with no extra roots, let it register, then
+/// drain any setup noise (e.g. the registration itself) until quiet — so the
+/// signal a test later awaits can only be its own mutation.
+pub fn spawn_and_drain(repo: &Path) -> Receiver<()> {
+    let rx = watch::spawn(repo.to_path_buf(), Vec::new()).expect("spawn watcher");
+    std::thread::sleep(Duration::from_millis(300));
+    drain_until_quiet(&rx, DRAIN);
+    rx
+}
+
+/// Wait up to 5s for one signal on `rx`, panicking with a message naming
+/// `what` on timeout or on a channel error.
+pub fn expect_signal(rx: &Receiver<()>, what: &str) {
+    match rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(()) => {}
+        Err(RecvTimeoutError::Timeout) => panic!("no signal for {what} within 5s"),
+        Err(err) => panic!("watch channel error waiting for {what}: {err}"),
+    }
 }
 
 // --- Frame rendering ---------------------------------------------------------
