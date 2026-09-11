@@ -62,7 +62,7 @@ fallbacks still work either way.
 | Status (staged/unstaged/untracked) | Shell out to `git status --porcelain=v2 --branch -z`, parsed in `git/status.rs`. gix *can* compute status, but its iterator API is far less ergonomic than the stable porcelain format for a read that runs once per refresh, not on the hot path. |
 | Blob contents (HEAD / index / worktree) | gix object database + the working tree.        |
 | Commit walk + refs (history view) | gix `rev_walk` from HEAD (full DAG), commit objects decoded only. |
-| Per-commit changed files      | `git diff-tree -z --name-status` (parsed in `git/history.rs`).  |
+| Per-commit changed files      | Two `git diff-tree -z` runs (`--name-status`, `--numstat`) joined by path (parsed in `git/history.rs`). |
 | Branch-range resolution (review view) | gix `merge_base`, `rev_parse_single` + tag-peeling (`git/review.rs`). |
 | Branch-range file listing (review view) | Two `git diff-tree -z` runs (`--name-status`, `--numstat`) joined by path — no in-process diffing while listing a range that can span hundreds of files. |
 | Diff computation              | [`similar`](https://github.com/mitsuhiko/similar) over blob bytes, producing structured hunks; computed lazily, per selected file. |
