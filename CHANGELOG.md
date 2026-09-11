@@ -10,8 +10,55 @@ Release notes.
 
 ## Unreleased
 
-### Changed
+History becomes a full review surface — a commit's files flow past as one
+continuous stream with their own cursor — the diff stream's file headers get the
+polish issue #20 asked for, and auto-refresh becomes a feature worth leaving on
+rather than one to switch off. Merged via #21, #23, #24, #29, #31, #32, #33
+and #38.
 
+### Added
+- **History joins the cross-file scroll stream** — with cross-file scroll (`f`)
+  on, reading a commit's files top to bottom no longer clamps at each file's
+  edge: they flow past continuously, each led by its own inline header, exactly
+  as Status and Review already did. The commit's `●` details row stays
+  deliberately *outside* the stream and keeps its plain paragraph scrolling, so
+  the message still scrolls with `j`/`k`, `g`/`G` and the wheel in the state the
+  view opens in.
+- **History's diff pane has a cursor** — all three views now share one input
+  model instead of History reusing the rendering alone. With the diff focused,
+  `j`/`k` walk the cursor (across files, when a strip is drawn), `g`/`G` jump to
+  the current file's first and last target, Ctrl-d/Ctrl-u move a half page, a
+  click places it, and a double-click on a neighbouring file's header converges
+  on that file.
+- **A rule row separates files in the stream** — every file below the first now
+  leads with a `─` rule above its header band, so a boundary reads while
+  scrolling instead of relying on the band alone. The first file keeps the band
+  only; it separates nothing.
+- **`Docs PR Build` workflow.** Docs previously built only on push to `main`,
+  and without `--strict`, so a broken link or heading anchor could land on
+  `main` and be caught at deploy time or not at all. Both workflows now build
+  `--strict` and watch `uv.lock`.
+
+### Changed
+- **The diff stream's file-header band is restyled** — still one physical row,
+  but now a bar in the file's marker tone at column 0, the bold marker, the
+  directory prefix dimmed, the basename bold on its own chip, and the `+a −d`
+  counts flush right. Binary files put `(binary)` in the same slot. An over-long
+  directory prefix is now cut from the *left*, so the directory nearest the name
+  survives. The review and history file lists are deliberately unchanged — a
+  chip reads as noise in a 30-column list. Two new theme tokens
+  (`file_header_bg`, `file_header_chip_bg`) back it, with every preset's values
+  constraint-solved so the band and chip stay distinguishable from the pane
+  background, the filler and the cursor row on all five presets.
+- **Selecting a large commit is no longer slow** — listing a commit's changed
+  files ran a full in-process diff per file just to get its `+/-` counts. It is
+  now two `git diff-tree` passes joined by path. A synthetic 1500-file commit
+  went from roughly 211ms to 35ms.
+- **A refresh that changes nothing no longer re-walks the commit graph** —
+  History reads a cheap key (HEAD, the refs, the shallow boundary) first and
+  walks only when it actually moved. Refs moving on their own just re-badge the
+  graph. Entering History also picks up a commit made while another view was up,
+  which it previously missed.
 - **Docs site migrated from Material for MkDocs to
   [Zensical](https://zensical.org)**, the successor from the same team.
   Material entered maintenance mode in November 2025 and now warns on every
@@ -31,19 +78,52 @@ Release notes.
   `<title>` now derives from the page `<h1>` rather than the nav label, which
   is the one intentional difference.
 
-### Added
-
-- **`Docs PR Build` workflow.** Docs previously built only on push to `main`,
-  and without `--strict`, so a broken link or heading anchor could land on
-  `main` and be caught at deploy time or not at all. Both workflows now build
-  `--strict` and watch `uv.lock`.
-
+### Fixed
+- **The file watcher no longer wakes itself** — on Linux, inotify reported
+  strix's own `.git` reads back to it as open events, so every refresh scheduled
+  the next one and an idle session reloaded several times a second, forever.
+  Events are now filtered by kind before the debounce window. An idle release
+  binary logs **zero** refresh signals over ten seconds, where it previously
+  logged a steady stream. This is what made `auto_refresh = false` the
+  recommended setting; it no longer is.
+- **A no-op refresh no longer drops the diff cursor** — walking the cursor into
+  a following file in Status or Review, then having anything at all touch the
+  working tree, used to snap it back to the selected file. The cursor now
+  survives unless its *own* file changed, was staged, or was pushed out of the
+  window — which is how History already behaved. A divergent cursor holds its
+  row through a sustained stream of unrelated file saves.
+- **Toggling the Changes panel no longer swallows the first keypress** — hiding
+  or showing the panel (`b`), and dragging the divider, changed the diff pane's
+  width before any frame recorded it, so the section cache was keyed with a
+  width the next frame did not draw. The pane width now derives from the panel
+  state rather than the last frame, so the first frame after a toggle draws the
+  full strip and the first `j` moves.
+- **History no longer crashes on a very short terminal** — the committed pane's
+  height clamped against a floor that could sit above its own ceiling once the
+  left column was too short for both panes, and any terminal of five rows or
+  fewer panicked the view. It now renders degraded instead.
 - **Fixed the docs header lockup overlapping the site title in the mobile
   drawer.** Behind the hamburger menu on a phone, the divider and project icon
   painted on top of the site name. Zensical sizes that drawer slot for a single
   glyph, so the wider lockup overflowed it. Fixed upstream in
   [stridelabs-docs-theme](https://github.com/charliek/stridelabs-docs-theme)
   v0.2.2; this bumps the pin. Desktop was never affected.
+
+### Internal
+- **Toolchain tracks Rust 1.97.1**, up from 1.96.0, pinned in
+  `rust-toolchain.toml` and `.mise.toml` with `Cargo.toml`'s `rust-version`
+  raised to match. `Cargo.lock` is unchanged, so the bump did not shift
+  dependency resolution.
+- **Git-layer cost counters** — `Repo` now counts subprocess attempts,
+  object-lookup attempts, spec-diff requests and commit walks, so per-action
+  cost is asserted by regression tests rather than measured by hand. Selecting a
+  commit is pinned at zero diffs and zero blob reads; a no-op refresh is pinned
+  at one `git status` in Status and no diff work at all in Review.
+- **Coverage that every class of change reaches the screen** — a watcher filter
+  is exactly the kind of change that can silently stop an edit, a stage, a
+  commit, a branch switch or an agent's comment from showing up. Each now has a
+  test joining the filesystem event to the rendered frame, and they caught a
+  deliberately over-aggressive filter during development.
 
 ## v0.0.7 — 2026-07-26
 
