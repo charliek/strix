@@ -30,7 +30,7 @@ pub fn render(frame: &mut Frame, body: Rect, app: &App) {
     let width = app.changes_pane_width(body.width);
     let [left, right] =
         Layout::horizontal([Constraint::Length(width), Constraint::Min(0)]).areas(body);
-    app.set_split_geometry(body, right.x);
+    app.set_divider_x(right.x);
 
     render_files(frame, left, app);
     diff_view::render(frame, right, app);

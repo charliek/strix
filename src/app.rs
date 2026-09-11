@@ -1945,8 +1945,7 @@ impl App {
         if self.show_changes {
             self.show_changes = false;
             self.set_review_focus(ReviewFocus::Diff);
-            self.clear_divergent_cursor();
-            self.prepare_post_toggle_window();
+            self.reprepare_diff_window();
         } else {
             self.reveal_review_panel();
         }
@@ -1956,7 +1955,7 @@ impl App {
         self.show_changes = true;
         self.set_review_focus(ReviewFocus::List);
         self.clear_divergent_cursor();
-        self.prepare_post_toggle_window();
+        self.reprepare_diff_window();
     }
 
     fn review_toggle_focus(&mut self) {
@@ -2419,11 +2418,16 @@ impl App {
         true
     }
 
-    /// The pane inner width of the last render, the key the physical layout is
-    /// built for. The cursor seam reads it so an input event handled before the
-    /// next render sees the same width-keyed layout the last frame drew.
+    /// The diff pane's inner width for the *next* frame — the key the physical
+    /// layout is built for — derived from the panel state rather than read back
+    /// from the last frame's pane rect. The two agree after every render; they
+    /// differ between a split change (panel toggle, divider drag) and the frame
+    /// that records it, and that gap is exactly when the cursor seam, the trailing
+    /// `sync_active` and the window assembly must all already agree on the new
+    /// width: the section cache discards an entry on any key mismatch, so one
+    /// stale-width read wipes what a fresh-width prepare just built (issue 28).
     fn diff_pane_width(&self) -> u16 {
-        self.diff_area.get().width
+        self.diff_pane_width_for(self.body_area.get().width)
     }
 
     /// The number of physical rows the active diff renders for the selected file
@@ -3656,8 +3660,7 @@ impl App {
         if self.show_changes {
             self.show_changes = false;
             self.history_focus = HistoryFocus::Diff;
-            self.clear_divergent_cursor();
-            self.prepare_post_toggle_window();
+            self.reprepare_diff_window();
         } else {
             self.reveal_history_panel();
         }
@@ -3667,7 +3670,7 @@ impl App {
         self.show_changes = true;
         self.history_focus = HistoryFocus::Graph;
         self.clear_divergent_cursor();
-        self.prepare_post_toggle_window();
+        self.reprepare_diff_window();
     }
 
     fn half_page(&self) -> u16 {
@@ -3964,59 +3967,42 @@ impl App {
         // and the section cache, so preparing against it would tag every section
         // for a geometry the next frame no longer draws — a short window until
         // some later event happens to re-prepare. Derive the new pane instead.
-        let (width, height) = self.diff_geometry_for(cols, rows);
-        self.ensure_diff_window(width, height);
+        self.ensure_diff_window(self.diff_pane_width_for(cols), rows);
     }
 
-    /// The recorded pane rect is still the *pre-toggle* one, so prepare against
-    /// the derived post-toggle width instead (the stale width would tag every
-    /// section for a geometry the next frame no longer draws).
-    fn prepare_post_toggle_window(&mut self) {
-        let body = self.body_area.get().width;
-        if body == 0 {
-            return;
-        }
-        let list = if self.show_changes {
-            self.changes_pane_width(body)
-        } else {
-            0
-        };
-        self.ensure_diff_window(
-            body.saturating_sub(list).saturating_sub(2),
-            self.diff_viewport.get(),
-        );
-    }
-
-    /// The diff pane's geometry for a terminal `cols` × `rows`, derived the way
-    /// [`crate::ui::draw`] lays the Status and Review bodies out: the file list
-    /// takes [`App::changes_pane_width`] off the left when shown, and the pane's
-    /// block borders take a column on each side — so the width returned is exactly
-    /// what the renderer passes to [`App::diff_layout`], which is what makes the
-    /// sections prepared here match the key the next frame reads them under.
-    ///
-    /// The height is only a fill target, so the whole terminal height stands in
-    /// for the pane's: overshooting prepares at most a section the frame won't
-    /// draw, while undershooting would leave the shortfall this is here to
-    /// prevent. History's diff pane sits in the same place, so the derivation
-    /// serves it too.
-    fn diff_geometry_for(&self, cols: u16, rows: u16) -> (u16, u16) {
+    /// The diff pane's inner width for a body `cols` wide, derived the way
+    /// [`crate::ui::draw`] lays every view's body out: the file list takes
+    /// [`App::changes_pane_width`] off the left when shown, and the pane's block
+    /// borders take a column on each side — so the result is exactly what the
+    /// renderer passes to [`App::diff_layout`], which is what makes the sections
+    /// prepared for it match the key the next frame reads them under. The body
+    /// spans the full terminal width, so `on_resize` passes the terminal's
+    /// columns and everything else the recorded body's.
+    fn diff_pane_width_for(&self, cols: u16) -> u16 {
         let list = if self.show_changes {
             self.changes_pane_width(cols)
         } else {
             0
         };
-        (cols.saturating_sub(list).saturating_sub(2), rows)
+        cols.saturating_sub(list).saturating_sub(2)
     }
 
-    /// Re-prepare the window for the pane's recorded geometry. The seam every
-    /// change to the layout key ends with: sections are tagged with the key they
-    /// were built for, so a wrap / line-number / diff-mode / cross-file toggle
-    /// invalidates all of them at once, and the render path never computes. The
-    /// toggles hold that invariant themselves rather than leaning on the trailing
-    /// `sync_active` of whichever path dispatched them.
+    /// Re-prepare the window for the geometry the *next* frame will draw. The
+    /// seam every change to the layout key ends with: sections are tagged with
+    /// the key they were built for, so a wrap / line-number / diff-mode /
+    /// cross-file toggle invalidates all of them at once, and the render path
+    /// never computes. The toggles hold that invariant themselves rather than
+    /// leaning on the trailing `sync_active` of whichever path dispatched them.
+    ///
+    /// The width is [`App::diff_pane_width`], derived from the panel state: a
+    /// panel toggle or a divider drag changes the split before any frame records
+    /// it, and preparing against the last frame's rect would tag every section
+    /// for a width the next frame no longer draws. The height only ever changes
+    /// through `on_resize`, which takes it from the terminal itself; the height
+    /// here is only a fill target, so the recorded one serves between resizes.
     fn reprepare_diff_window(&mut self) {
-        let area = self.diff_area.get();
-        self.ensure_diff_window(area.width, area.height);
+        let height = self.diff_area.get().height;
+        self.ensure_diff_window(self.diff_pane_width(), height);
     }
 
     /// Handle a mouse event at logical time `now` (the injectable double-click
@@ -4921,8 +4907,7 @@ impl App {
             // the "hidden ⇒ focus Diff" invariant.
             self.show_changes = false;
             self.focus = Focus::Diff;
-            self.clear_divergent_cursor();
-            self.prepare_post_toggle_window();
+            self.reprepare_diff_window();
         } else {
             self.reveal_changes();
         }
@@ -4934,7 +4919,7 @@ impl App {
         self.show_changes = true;
         self.focus = Focus::Staging;
         self.clear_divergent_cursor();
-        self.prepare_post_toggle_window();
+        self.reprepare_diff_window();
     }
 
     fn select_next(&mut self) {
@@ -5064,8 +5049,7 @@ impl App {
         // leave a short anchor with an unfilled strip, and the render path may
         // never compute (plan 006 §3.3). A no-op with cross-file scroll off, with
         // no anchor, or before the first frame (the pane has no geometry yet).
-        let area = self.diff_area.get();
-        self.ensure_diff_window(area.width, area.height);
+        self.reprepare_diff_window();
     }
 
     /// Re-read the active view's data: status re-reads the working tree; history
@@ -7107,7 +7091,7 @@ impl App {
     }
 
     /// Record the left column's body rect and the horizontal divider row for this
-    /// frame, so a drag on it can be hit-tested (mirrors `set_split_geometry`).
+    /// frame, so a drag on it can be hit-tested (mirrors `set_divider_x`).
     pub fn set_hsplit_geometry(&self, left: Rect, hdivider_y: u16) {
         self.left_col_area.set(left);
         self.hdivider_y.set(hdivider_y);
@@ -7122,7 +7106,10 @@ impl App {
             .saturating_sub(MIN_GRAPH_HEIGHT)
             .max(MIN_COMMITTED_HEIGHT)
             .min(left_height);
-        self.committed_height.clamp(MIN_COMMITTED_HEIGHT, max)
+        // `max` drops below the minimum once both panes can no longer fit;
+        // `clamp` panics on an inverted range, so the floor follows it down.
+        self.committed_height
+            .clamp(MIN_COMMITTED_HEIGHT.min(max), max)
     }
 
     /// Whether the horizontal divider shows its active affordance.
@@ -7228,10 +7215,16 @@ impl App {
         self.diff_area.set(area);
     }
 
-    /// Record the body rect and split-bar column for this frame, so a drag on
-    /// the divider can be hit-tested against where it was actually drawn.
-    pub fn set_split_geometry(&self, body: Rect, divider_x: u16) {
+    /// Record the body rect for this frame — every frame, panel shown or hidden,
+    /// so the width the next window is prepared for is never stale (see
+    /// [`App::reprepare_diff_window`]).
+    pub fn set_body_area(&self, body: Rect) {
         self.body_area.set(body);
+    }
+
+    /// Record the split-bar column for this frame, so a drag on the divider can
+    /// be hit-tested against where it was actually drawn.
+    pub fn set_divider_x(&self, divider_x: u16) {
         self.divider_x.set(divider_x);
     }
 

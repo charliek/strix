@@ -7,19 +7,16 @@
 //! peeled through annotated tags to a commit.
 //!
 //! Like the rest of the git layer, the file *list* is read via `git diff-tree`
-//! (`--name-status` for change kinds joined with `--numstat` for +/- counts) and
-//! diff *content* is computed lazily, per selected file, over blob bytes. Listing
-//! never diffs in-process: a branch range can span hundreds of files and the list
-//! is rebuilt on every real refresh.
-
-use std::collections::HashMap;
+//! (`Repo::diff_tree_files`, shared with the history listing) and diff *content*
+//! is computed lazily, per selected file, over blob bytes. Listing never diffs
+//! in-process: a branch range can span hundreds of files and the list is rebuilt
+//! on every real refresh.
 
 use anyhow::{anyhow, Result};
 use gix::bstr::BStr;
 use gix::ObjectId;
 
-use crate::git::history::parse_name_status;
-use crate::git::{ChangeKind, CommitFile, CommitStat, FileDiff, Repo};
+use crate::git::{ChangeKind, CommitFile, FileDiff, Repo};
 
 /// A resolved review range: two concrete commits plus the strings used to build
 /// and label it.
@@ -84,49 +81,10 @@ impl Repo {
         })
     }
 
-    /// The files that differ between `spec.base` and `spec.head`, with +/- counts.
-    ///
-    /// Two `git diff-tree` passes joined by path: `--name-status` for the change
-    /// kind (rename source included) and `--numstat` for line counts (a `-` count
-    /// marks a binary change). No in-process diffing while listing.
+    /// The files that differ between `spec.base` and `spec.head`, with +/- counts
+    /// (see [`Repo::diff_tree_files`]).
     pub fn range_files(&self, spec: &ReviewSpec) -> Result<Vec<CommitFile>> {
-        let base = spec.base.to_string();
-        let head = spec.head.to_string();
-        let name_status = self.run(&[
-            "diff-tree",
-            "--no-commit-id",
-            "-r",
-            "-M",
-            "-z",
-            "--name-status",
-            &base,
-            &head,
-        ])?;
-        let numstat = self.run(&[
-            "diff-tree",
-            "--no-commit-id",
-            "-r",
-            "-M",
-            "-z",
-            "--numstat",
-            &base,
-            &head,
-        ])?;
-        let stats = parse_numstat(&numstat);
-
-        let files = parse_name_status(&name_status)
-            .into_iter()
-            .map(|(change, path, orig_path)| {
-                let stat = stats.get(&path).copied().unwrap_or_default();
-                CommitFile {
-                    path,
-                    orig_path,
-                    change,
-                    stat,
-                }
-            })
-            .collect();
-        Ok(files)
+        self.diff_tree_files(&[&spec.base.to_string(), &spec.head.to_string()])
     }
 
     /// The diff for one range file, computed lazily over blob bytes. Mirrors the
@@ -183,39 +141,4 @@ fn operand(side: &str) -> &str {
     } else {
         side
     }
-}
-
-/// Parse `git diff-tree -z --numstat` into per-path stats keyed by the new path.
-///
-/// Records are NUL-separated `added\tdeleted\t<path>`; a `-` count marks a binary
-/// change. For a rename/copy the path portion is empty and the two following
-/// NUL fields are the old then new path (we key on the new path, matching
-/// `CommitFile::path`).
-pub(crate) fn parse_numstat(bytes: &[u8]) -> HashMap<String, CommitStat> {
-    let mut out = HashMap::new();
-    let mut fields = bytes.split(|&b| b == 0).filter(|f| !f.is_empty());
-    while let Some(field) = fields.next() {
-        let record = String::from_utf8_lossy(field);
-        let mut parts = record.splitn(3, '\t');
-        let added = parts.next().unwrap_or("");
-        let deleted = parts.next().unwrap_or("");
-        let path_part = parts.next().unwrap_or("");
-        let stat = CommitStat {
-            added: added.parse().unwrap_or(0),
-            deleted: deleted.parse().unwrap_or(0),
-            binary: added == "-" || deleted == "-",
-        };
-        let path = if path_part.is_empty() {
-            // Rename/copy: consume old then new path; key on the new path.
-            let _old = fields.next();
-            match fields.next() {
-                Some(new) => String::from_utf8_lossy(new).into_owned(),
-                None => break,
-            }
-        } else {
-            path_part.to_string()
-        };
-        out.insert(path, stat);
-    }
-    out
 }

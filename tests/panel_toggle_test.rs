@@ -1,12 +1,17 @@
-//! Plan 002 U1: hiding or revealing the Changes panel (`b`) must clear a
-//! divergent diff cursor, and the first `j` after the toggle must move over a
-//! full frame — one test per view (Status, Review, History).
+//! Changing the split — hiding or revealing the Changes panel (`b`), or
+//! dragging the divider — re-keys every prepared section by width before any
+//! frame records the new geometry (issue 28). The first frame after the change
+//! must still draw a full strip, and a divergent cursor must never swallow the
+//! next `j`: hiding and dragging keep the cursor (its file is still in the
+//! window), revealing drops it (focus leaves the diff pane).
 //!
-//! Each test parks a divergent cursor on a strip file, hides the panel, and
-//! requires the clear plus a moving first `j`; it then re-diverges while
-//! hidden and requires the same of the reveal. The `press` → `dump` → `j`
-//! order is load-bearing: the dump records the retoggled width before the
-//! first step reads it.
+//! Each toggle test parks a divergent cursor on a strip file, hides the panel,
+//! and requires a full first frame, the kept cursor, and a moving first `j`; it
+//! then re-diverges while hidden and requires a full first frame, the drop, and
+//! a moving first `j` of the reveal. The `press` → `dump` → `j` order is
+//! load-bearing: the dump records the retoggled width before the first step
+//! reads it, and the window is inspected under *that* width — sections
+//! prepared for the old one do not count.
 
 mod common;
 
@@ -15,8 +20,9 @@ use common::{
     init_repo_with_multi_file_commit, mouse, press, rendered_app, selected_path, strip_row, tab,
     window_of, write,
 };
+use std::time::Instant;
 use strix::app::{App, CursorAddress, FileId, RowTarget};
-use strix::crossterm::event::MouseEventKind;
+use strix::crossterm::event::{MouseButton, MouseEventKind};
 use tempfile::TempDir;
 
 const W: u16 = 120;
@@ -51,13 +57,15 @@ fn assert_first_j_moves(app: &mut App, what: &str) {
     );
 }
 
-fn assert_strip_drawn(app: &App, needle: &str, what: &str) -> String {
+/// Render the first frame after a split change and require the window it drew
+/// to reach past the anchor: the strip sections must already be prepared under
+/// the width that frame recorded, not left for a later event to repair.
+fn assert_first_frame_full(app: &App, what: &str) {
     let frame = dump(app, W, H);
     assert!(
-        frame.contains(needle),
-        "the first frame after {what} still draws the strip file:\n{frame}"
+        window_of(app).segments.len() > 1,
+        "the first frame after {what} draws a full strip:\n{frame}"
     );
-    frame
 }
 
 /// Wheel until the prepared window draws a strip below the anchor.
@@ -91,7 +99,7 @@ fn status_hide_and_reveal_keep_the_first_j_moving() {
     assert!(app.diff_focused(), "the diff pane has focus");
     assert_eq!(selected_path(&app), "a.txt", "a.txt anchors the stream");
     wheel_to_boundary(&mut app);
-    let (strip, needle) = strip_code_address(&app);
+    let (strip, _) = strip_code_address(&app);
     assert!(
         app.place_cursor(strip.clone()),
         "the strip row is in the window, so the cursor lands"
@@ -102,13 +110,13 @@ fn status_hide_and_reveal_keep_the_first_j_moving() {
     );
 
     press(&mut app, 'b');
-    let _ = dump(&app, W, H);
-    assert!(
-        !app.cursor_divergent(),
-        "hiding the panel clears the divergent cursor"
+    assert_first_frame_full(&app, "hiding");
+    assert_eq!(
+        app.cursor_address(),
+        Some(strip),
+        "the strip row is still in the wider window, so the cursor stays"
     );
     assert_first_j_moves(&mut app, "hiding");
-    assert_strip_drawn(&app, needle.as_str(), "hiding");
 
     let _ = dump(&app, W, H);
     wheel_to_boundary(&mut app);
@@ -119,19 +127,19 @@ fn status_hide_and_reveal_keep_the_first_j_moving() {
     );
     assert!(app.cursor_divergent(), "diverged again while hidden");
     press(&mut app, 'b');
-    let _ = dump(&app, W, H);
+    assert_first_frame_full(&app, "revealing");
     assert!(
         !app.cursor_divergent(),
-        "revealing the panel clears the divergent cursor"
+        "focus leaves the diff pane on reveal, so the cursor drops"
     );
     assert_first_j_moves(&mut app, "revealing");
-    assert_strip_drawn(&app, needle.as_str(), "revealing");
 }
 
 // --- Review ---------------------------------------------------------------
 
-#[test]
-fn review_hide_and_reveal_keep_the_first_j_moving() {
+/// A rendered review with the diff focused and the cursor parked on a strip
+/// row below the anchor, returned with that row's address.
+fn diverged_review() -> (TempDir, App, CursorAddress) {
     let repo = init_repo_with_diverged_branches();
     let mut app = App::for_review(
         repo.path().to_path_buf(),
@@ -149,7 +157,7 @@ fn review_hide_and_reveal_keep_the_first_j_moving() {
         "the first file anchors the stream"
     );
     wheel_to_boundary(&mut app);
-    let (strip, needle) = strip_code_address(&app);
+    let (strip, _) = strip_code_address(&app);
     assert!(
         app.place_cursor(strip.clone()),
         "the strip row is in the window, so the cursor lands"
@@ -158,15 +166,21 @@ fn review_hide_and_reveal_keep_the_first_j_moving() {
         app.cursor_divergent(),
         "the cursor names the file below the anchor"
     );
+    (repo, app, strip)
+}
+
+#[test]
+fn review_hide_and_reveal_keep_the_first_j_moving() {
+    let (_repo, mut app, strip) = diverged_review();
 
     press(&mut app, 'b');
-    let _ = dump(&app, W, H);
-    assert!(
-        !app.cursor_divergent(),
-        "hiding the panel clears the divergent cursor"
+    assert_first_frame_full(&app, "hiding");
+    assert_eq!(
+        app.cursor_address(),
+        Some(strip),
+        "the strip row is still in the wider window, so the cursor stays"
     );
     assert_first_j_moves(&mut app, "hiding");
-    assert_strip_drawn(&app, needle.as_str(), "hiding");
 
     let _ = dump(&app, W, H);
     wheel_to_boundary(&mut app);
@@ -177,13 +191,12 @@ fn review_hide_and_reveal_keep_the_first_j_moving() {
     );
     assert!(app.cursor_divergent(), "diverged again while hidden");
     press(&mut app, 'b');
-    let _ = dump(&app, W, H);
+    assert_first_frame_full(&app, "revealing");
     assert!(
         !app.cursor_divergent(),
-        "revealing the panel clears the divergent cursor"
+        "focus leaves the diff pane on reveal, so the cursor drops"
     );
     assert_first_j_moves(&mut app, "revealing");
-    assert_strip_drawn(&app, needle.as_str(), "revealing");
 }
 
 // --- History ---------------------------------------------------------------
@@ -211,13 +224,13 @@ fn history_hide_and_reveal_keep_the_first_j_moving() {
     );
 
     press(&mut app, 'b');
-    let _ = dump(&app, W, H);
-    assert!(
-        !app.cursor_divergent(),
-        "hiding the panel clears the divergent cursor"
+    assert_first_frame_full(&app, "hiding");
+    assert_eq!(
+        app.cursor_address(),
+        Some(strip),
+        "the strip row is still in the wider window, so the cursor stays"
     );
     assert_first_j_moves(&mut app, "hiding");
-    assert_strip_drawn(&app, needle.as_str(), "hiding");
 
     let _ = dump(&app, W, H);
     wheel_to_boundary(&mut app);
@@ -228,11 +241,39 @@ fn history_hide_and_reveal_keep_the_first_j_moving() {
     );
     assert!(app.cursor_divergent(), "diverged again while hidden");
     press(&mut app, 'b');
-    let _ = dump(&app, W, H);
+    assert_first_frame_full(&app, "revealing");
     assert!(
         !app.cursor_divergent(),
-        "revealing the panel clears the divergent cursor"
+        "focus leaves the diff pane on reveal, so the cursor drops"
     );
     assert_first_j_moves(&mut app, "revealing");
-    assert_strip_drawn(&app, needle.as_str(), "revealing");
+}
+
+// --- Divider drag -----------------------------------------------------------
+
+/// A drag re-keys the sections by width exactly like a toggle, but between two
+/// mouse events rather than around a key: every dragged frame must still draw
+/// a full strip, and the cursor — whose file is still in the window — survives.
+#[test]
+fn dragging_the_divider_keeps_the_strip_full_and_the_cursor_moving() {
+    let (_repo, mut app, strip) = diverged_review();
+    let diff = app.diff_area();
+    let (x, y) = (diff.x - 1, diff.y + 2);
+    let t = Instant::now();
+    app.on_mouse_at(mouse(x, y, MouseEventKind::Down(MouseButton::Left)), t);
+    app.on_mouse_at(mouse(x + 12, y, MouseEventKind::Drag(MouseButton::Left)), t);
+    let narrower = app.diff_area().width;
+    assert_first_frame_full(&app, "dragging");
+    assert!(
+        app.diff_area().width < narrower,
+        "the drag narrowed the diff pane"
+    );
+    assert_eq!(
+        app.cursor_address(),
+        Some(strip),
+        "the strip row is still in the narrower window, so the cursor stays"
+    );
+    app.on_mouse_at(mouse(x + 12, y, MouseEventKind::Up(MouseButton::Left)), t);
+    assert_first_frame_full(&app, "releasing");
+    assert_first_j_moves(&mut app, "dragging");
 }
