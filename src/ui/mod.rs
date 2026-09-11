@@ -37,6 +37,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     .areas(area);
 
     render_header(frame, header, app);
+    app.set_body_area(body);
 
     match app.view {
         ViewMode::Status => draw_status_body(frame, body, app),
@@ -66,7 +67,7 @@ fn draw_status_body(frame: &mut Frame, body: Rect, app: &App) {
             Layout::horizontal([Constraint::Length(width), Constraint::Min(0)]).areas(body);
         staging::render(frame, left, app);
         diff_view::render(frame, right, app);
-        app.set_split_geometry(body, right.x);
+        app.set_divider_x(right.x);
         if app.divider_engaged() {
             highlight_divider(frame, body, right.x, theme);
         }

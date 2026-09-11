@@ -40,7 +40,7 @@ pub fn render(frame: &mut Frame, body: Rect, app: &App) {
     let width = app.changes_pane_width(body.width);
     let [left, right] =
         Layout::horizontal([Constraint::Length(width), Constraint::Min(0)]).areas(body);
-    app.set_split_geometry(body, right.x);
+    app.set_divider_x(right.x);
 
     // Split the left column into the committed-changes pane (top) and the graph
     // (bottom), divided by the draggable horizontal bar.
