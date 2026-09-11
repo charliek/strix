@@ -9,9 +9,10 @@
 //! ergonomics-driven CLI fallback `status` uses); and diff *content* reuses the
 //! in-process `similar` path over blob bytes.
 
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 
-use crate::git::review::parse_numstat;
 use crate::git::{FileDiff, Repo};
 
 fn bstr_string(bytes: &[u8]) -> String {
@@ -186,77 +187,43 @@ impl Repo {
     }
 
     /// The files changed in `commit` relative to its first parent (root commit:
-    /// relative to the empty tree).
+    /// relative to the empty tree). See [`Repo::diff_tree_files`].
+    pub fn commit_files(&self, commit: &CommitInfo) -> Result<Vec<CommitFile>> {
+        let id = commit.id.to_string();
+        match commit.first_parent() {
+            Some(parent) => self.diff_tree_files(&[&parent.to_string(), &id]),
+            None => self.diff_tree_files(&["--root", &id]),
+        }
+    }
+
+    /// The files that differ between the trees `revs` name — `[base, head]`, or
+    /// `["--root", commit]` for a parentless commit — with +/- counts. Shared by
+    /// the history and review listings.
     ///
     /// Two `git diff-tree` passes joined by path: `--name-status` for the change
     /// kind (rename source included) and `--numstat` for line counts (a `-` count
-    /// marks a binary change). No in-process diffing while listing.
-    pub fn commit_files(&self, commit: &CommitInfo) -> Result<Vec<CommitFile>> {
-        let id = commit.id.to_string();
-        let (name_status, numstat) = match commit.first_parent() {
-            Some(parent) => {
-                let parent = parent.to_string();
-                (
-                    self.run(&[
-                        "diff-tree",
-                        "--no-commit-id",
-                        "-r",
-                        "-M",
-                        "-z",
-                        "--name-status",
-                        &parent,
-                        &id,
-                    ])?,
-                    self.run(&[
-                        "diff-tree",
-                        "--no-commit-id",
-                        "-r",
-                        "-M",
-                        "-z",
-                        "--numstat",
-                        &parent,
-                        &id,
-                    ])?,
-                )
-            }
-            None => (
-                self.run(&[
-                    "diff-tree",
-                    "--no-commit-id",
-                    "--root",
-                    "-r",
-                    "-M",
-                    "-z",
-                    "--name-status",
-                    &id,
-                ])?,
-                self.run(&[
-                    "diff-tree",
-                    "--no-commit-id",
-                    "--root",
-                    "-r",
-                    "-M",
-                    "-z",
-                    "--numstat",
-                    &id,
-                ])?,
-            ),
-        };
+    /// marks a binary change). No in-process diffing while listing: a branch
+    /// range can span hundreds of files, and a commit's list is rebuilt on every
+    /// selection.
+    pub(crate) fn diff_tree_files(&self, revs: &[&str]) -> Result<Vec<CommitFile>> {
+        let name_status = self.diff_tree(revs, "--name-status")?;
+        let numstat = self.diff_tree(revs, "--numstat")?;
         let stats = parse_numstat(&numstat);
-
-        let files = parse_name_status(&name_status)
+        Ok(parse_name_status(&name_status)
             .into_iter()
-            .map(|(change, path, orig_path)| {
-                let stat = stats.get(&path).copied().unwrap_or_default();
-                CommitFile {
-                    path,
-                    orig_path,
-                    change,
-                    stat,
-                }
+            .map(|(change, path, orig_path)| CommitFile {
+                stat: stats.get(&path).copied().unwrap_or_default(),
+                path,
+                orig_path,
+                change,
             })
-            .collect();
-        Ok(files)
+            .collect())
+    }
+
+    fn diff_tree(&self, revs: &[&str], format: &str) -> Result<Vec<u8>> {
+        let mut args = vec!["diff-tree", "--no-commit-id", "-r", "-M", "-z", format];
+        args.extend_from_slice(revs);
+        self.run(&args)
     }
 
     /// The diff for one of a commit's files, against its first parent. Reuses the
@@ -330,7 +297,7 @@ fn decode_commit(commit: &gix::Commit<'_>) -> Result<CommitInfo> {
 
 /// Parse `git diff-tree -z --name-status` output: NUL-separated fields where a
 /// status token is followed by one path (or two, `orig` then `new`, for R/C).
-pub(crate) fn parse_name_status(bytes: &[u8]) -> Vec<(ChangeKind, String, Option<String>)> {
+fn parse_name_status(bytes: &[u8]) -> Vec<(ChangeKind, String, Option<String>)> {
     let mut out = Vec::new();
     let mut fields = bytes.split(|&b| b == 0).filter(|f| !f.is_empty());
     while let Some(raw_status) = fields.next() {
@@ -353,6 +320,41 @@ pub(crate) fn parse_name_status(bytes: &[u8]) -> Vec<(ChangeKind, String, Option
             let Some(path) = fields.next() else { break };
             out.push((change, String::from_utf8_lossy(path).into_owned(), None));
         }
+    }
+    out
+}
+
+/// Parse `git diff-tree -z --numstat` into per-path stats keyed by the new path.
+///
+/// Records are NUL-separated `added\tdeleted\t<path>`; a `-` count marks a binary
+/// change. For a rename/copy the path portion is empty and the two following
+/// NUL fields are the old then new path (we key on the new path, matching
+/// `CommitFile::path`).
+fn parse_numstat(bytes: &[u8]) -> HashMap<String, CommitStat> {
+    let mut out = HashMap::new();
+    let mut fields = bytes.split(|&b| b == 0).filter(|f| !f.is_empty());
+    while let Some(field) = fields.next() {
+        let record = String::from_utf8_lossy(field);
+        let mut parts = record.splitn(3, '\t');
+        let added = parts.next().unwrap_or("");
+        let deleted = parts.next().unwrap_or("");
+        let path_part = parts.next().unwrap_or("");
+        let stat = CommitStat {
+            added: added.parse().unwrap_or(0),
+            deleted: deleted.parse().unwrap_or(0),
+            binary: added == "-" || deleted == "-",
+        };
+        let path = if path_part.is_empty() {
+            // Rename/copy: consume old then new path; key on the new path.
+            let _old = fields.next();
+            match fields.next() {
+                Some(new) => String::from_utf8_lossy(new).into_owned(),
+                None => break,
+            }
+        } else {
+            path_part.to_string()
+        };
+        out.insert(path, stat);
     }
     out
 }
