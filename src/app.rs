@@ -1945,6 +1945,8 @@ impl App {
         if self.show_changes {
             self.show_changes = false;
             self.set_review_focus(ReviewFocus::Diff);
+            self.clear_divergent_cursor();
+            self.prepare_post_toggle_window();
         } else {
             self.reveal_review_panel();
         }
@@ -1953,6 +1955,8 @@ impl App {
     fn reveal_review_panel(&mut self) {
         self.show_changes = true;
         self.set_review_focus(ReviewFocus::List);
+        self.clear_divergent_cursor();
+        self.prepare_post_toggle_window();
     }
 
     fn review_toggle_focus(&mut self) {
@@ -3652,6 +3656,8 @@ impl App {
         if self.show_changes {
             self.show_changes = false;
             self.history_focus = HistoryFocus::Diff;
+            self.clear_divergent_cursor();
+            self.prepare_post_toggle_window();
         } else {
             self.reveal_history_panel();
         }
@@ -3660,6 +3666,8 @@ impl App {
     fn reveal_history_panel(&mut self) {
         self.show_changes = true;
         self.history_focus = HistoryFocus::Graph;
+        self.clear_divergent_cursor();
+        self.prepare_post_toggle_window();
     }
 
     fn half_page(&self) -> u16 {
@@ -3958,6 +3966,25 @@ impl App {
         // some later event happens to re-prepare. Derive the new pane instead.
         let (width, height) = self.diff_geometry_for(cols, rows);
         self.ensure_diff_window(width, height);
+    }
+
+    /// The recorded pane rect is still the *pre-toggle* one, so prepare against
+    /// the derived post-toggle width instead (the stale width would tag every
+    /// section for a geometry the next frame no longer draws).
+    fn prepare_post_toggle_window(&mut self) {
+        let body = self.body_area.get().width;
+        if body == 0 {
+            return;
+        }
+        let list = if self.show_changes {
+            self.changes_pane_width(body)
+        } else {
+            0
+        };
+        self.ensure_diff_window(
+            body.saturating_sub(list).saturating_sub(2),
+            self.diff_viewport.get(),
+        );
     }
 
     /// The diff pane's geometry for a terminal `cols` × `rows`, derived the way
@@ -4894,6 +4921,8 @@ impl App {
             // the "hidden ⇒ focus Diff" invariant.
             self.show_changes = false;
             self.focus = Focus::Diff;
+            self.clear_divergent_cursor();
+            self.prepare_post_toggle_window();
         } else {
             self.reveal_changes();
         }
@@ -4904,6 +4933,8 @@ impl App {
     fn reveal_changes(&mut self) {
         self.show_changes = true;
         self.focus = Focus::Staging;
+        self.clear_divergent_cursor();
+        self.prepare_post_toggle_window();
     }
 
     fn select_next(&mut self) {
