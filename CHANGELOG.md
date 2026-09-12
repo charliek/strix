@@ -8,7 +8,7 @@ Each release below is headed by a `## vX.Y.Z` entry added by
 `/release-workflows:release`; `release.yml` turns that section into the GitHub
 Release notes.
 
-## Unreleased
+## v0.1.0 — 2026-09-11
 
 History becomes a full review surface — a commit's files flow past as one
 continuous stream with their own cursor — the diff stream's file headers get the
