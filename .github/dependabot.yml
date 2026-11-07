@@ -1,0 +1,49 @@
+# Dependabot, written by Nocturn's onboarding: every package ecosystem and
+# directory in the repository in one pull request, on the 1st and 15th of
+# each month. Majors are left out except for GitHub Actions (Nocturn's major
+# work items take them), and a cooldown holds new releases back. Security
+# updates arrive when they're published, grouped per ecosystem.
+version: 2
+multi-ecosystem-groups:
+  dependencies:
+    schedule:
+      interval: cron
+      cronjob: "0 11 1,15 * *"
+    open-pull-requests-limit: 5
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    multi-ecosystem-group: dependencies
+    patterns: ["*"]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+    cooldown:
+      default-days: 7
+    groups:
+      security:
+        applies-to: security-updates
+        patterns: ["*"]
+  - package-ecosystem: github-actions
+    directory: /
+    multi-ecosystem-group: dependencies
+    patterns: ["*"]
+    cooldown:
+      default-days: 7
+    groups:
+      security:
+        applies-to: security-updates
+        patterns: ["*"]
+  - package-ecosystem: uv
+    directory: /
+    multi-ecosystem-group: dependencies
+    patterns: ["*"]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+    cooldown:
+      default-days: 7
+    groups:
+      security:
+        applies-to: security-updates
+        patterns: ["*"]
