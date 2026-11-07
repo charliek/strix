@@ -1,0 +1,13 @@
+version: 1
+targets:
+  cli:
+    kind: cli
+    # release.yml on v* tags: cargo build --locked per target, the GitHub
+    # release, Formula/strix.rb pushed to the tap, and the apt-charliek
+    # dispatch.
+    released: { tag_pattern: '^v\d+\.\d+\.\d+$', homebrew: strix }
+    ships: [Cargo.lock]
+lockfiles:
+  # pyproject.toml has only the docs group (zensical and the docs theme): it
+  # builds the documentation site, which no release artifact contains.
+  uv.lock: { role: build-tool }
